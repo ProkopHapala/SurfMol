@@ -1,0 +1,10 @@
+[package]
+name = "surfmol-apps"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macroquad = "0.4"
+surfmol-forcefields = { path = "../forcefields" }
+surfmol-common = { path = "../common" }
+surfmol-topology = { path = "../topology" }
