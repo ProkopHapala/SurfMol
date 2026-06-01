@@ -33,20 +33,36 @@ struct MolBrowserApp {
 impl MolBrowserApp {
     fn new(folder: PathBuf, params: Params, renderer: MolThumbnailer, thumb_size: u32) -> Self {
         let mut entries = Vec::new();
+        println!("DEBUG: folder path = {:?}", folder);
+        println!("DEBUG: folder.exists() = {}", folder.exists());
+        println!("DEBUG: folder.is_dir() = {}", folder.is_dir());
         if folder.is_dir() {
-            let mut paths: Vec<PathBuf> = std::fs::read_dir(&folder)
-                .unwrap()
+            let dir_iter = match std::fs::read_dir(&folder) {
+                Ok(it) => it,
+                Err(e) => {
+                    println!("ERROR: cannot read_dir {:?}: {}", folder, e);
+                    return Self { entries, params, renderer, thumb_size, next_to_render: 0, folder };
+                }
+            };
+            let mut paths: Vec<PathBuf> = dir_iter
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .filter(|p| p.extension().map_or(false, |ext| ext == "xyz"))
                 .collect();
             paths.sort();
+            println!("DEBUG: found {} .xyz files", paths.len());
+            for path in &paths {
+                println!("DEBUG:   {:?}", path);
+            }
             for path in paths {
                 let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
                 let natoms = read_xyz(&path).map(|s| s.apos.len()).unwrap_or(0);
                 entries.push(MolEntry { path, name, natoms, thumbnail: None, texture: None });
             }
+        } else {
+            println!("ERROR: folder {:?} is not a directory", folder);
         }
+        println!("DEBUG: created {} entries", entries.len());
         Self { entries, params, renderer, thumb_size, next_to_render: 0, folder }
     }
 
@@ -157,6 +173,7 @@ impl eframe::App for MolBrowserApp {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let workspace_root = PathBuf::from(std::env!("CARGO_MANIFEST_DIR")).join("../..");
     let folder = args.get(1).map(PathBuf::from).unwrap_or_else(|| {
         // Try to find data/xyz relative to executable or workspace
         let exe = std::env::current_exe().unwrap();
@@ -168,12 +185,29 @@ fn main() {
         }
         PathBuf::from("data/xyz")
     });
+    // If provided path doesn't exist, try relative to workspace root
+    let folder = if folder.exists() {
+        folder
+    } else {
+        let candidate = workspace_root.join(&folder);
+        if candidate.exists() {
+            println!("DEBUG: resolved folder to workspace root: {:?}", candidate);
+            candidate
+        } else {
+            println!("DEBUG: folder {:?} not found; using as-is", folder);
+            folder
+        }
+    };
 
     // Load params
+    let manifest_dir = PathBuf::from(std::env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.join("../..");
     let dat_dir = if folder.join("../AtomTypes.dat").exists() {
         folder.join("..")
+    } else if workspace_root.join("data/AtomTypes.dat").exists() {
+        workspace_root.join("data")
     } else {
-        // Try workspace root
+        // Try workspace root from executable
         let mut p = std::env::current_exe().unwrap();
         for _ in 0..5 {
             let candidate = p.join("data");
