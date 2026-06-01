@@ -893,7 +893,7 @@ async fn main() {
     let xyz_path: PathBuf = args.iter().skip(1).find(|s| !s.starts_with("--")).map(|s| {
         let p = PathBuf::from(s);
         if p.is_absolute() { p } else { workspace_root.join(p) }
-    }).unwrap_or_else(|| workspace_root.join("../data/xyz/H2O.xyz"));
+    }).unwrap_or_else(|| workspace_root.join("../data/xyz/pentacene.xyz"));
 
     println!("Loading XYZ: {:?}", xyz_path);
     let sys = xyz::read_xyz(&xyz_path).expect("read_xyz failed");
@@ -955,24 +955,25 @@ async fn main() {
     world.nonbonded.as_mut().unwrap().set_cutoff(8.0);
 
     {
+        let neighs: Vec<[i32; 4]> = world.dyn_atoms.atoms.neighs.as_slice().iter().map(|q| q.as_array()).collect();
+        let uff_types = assign_uff::assign_uff_types(&elems, &neighs);
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for t in &uff_types { *counts.entry(t.clone()).or_insert(0) += 1; }
+        let mut kv: Vec<(String, usize)> = counts.into_iter().collect();
+        kv.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        println!("=== UFF type histogram ===");
+        for (t, c) in kv.iter() { println!("{:6}  {}", t, c); }
+
+        let has_sp2 = uff_types.iter().any(|t| matches!(t.as_str(), "C_R"|"C_2"|"N_R"|"O_2"|"O_R"));
+        if has_sp2 {
+            world.bonded_mode = BondedFFMode::Uff;
+            println!("Detected sp2/aromatic types -> default bonded_mode = Uff");
+        }
+
+        world.rigid_sp3.set_port_geometry_from_types(&uff_types);
+
         if have_params {
-            let neighs: Vec<[i32; 4]> = world.dyn_atoms.atoms.neighs.as_slice().iter().map(|q| q.as_array()).collect();
-            let uff_types = assign_uff::assign_uff_types(&elems, &neighs);
-
-            let mut counts: HashMap<String, usize> = HashMap::new();
-            for t in &uff_types { *counts.entry(t.clone()).or_insert(0) += 1; }
-            let mut kv: Vec<(String, usize)> = counts.into_iter().collect();
-            kv.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-            println!("=== UFF type histogram ===");
-            for (t, c) in kv.iter() { println!("{:6}  {}", t, c); }
-
-            let has_sp2 = uff_types.iter().any(|t| matches!(t.as_str(), "C_R"|"C_2"|"N_R"|"O_2"|"O_R"));
-            if has_sp2 {
-                world.bonded_mode = BondedFFMode::Uff;
-                println!("Detected sp2/aromatic types -> default bonded_mode = Uff");
-            }
-
-            world.rigid_sp3.set_port_geometry_from_types(&uff_types);
 
             for i in 0..world.natoms() {
                 let t = uff_types[i].as_str();

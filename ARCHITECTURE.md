@@ -44,6 +44,15 @@ Planned applications include:
    - **3rd-Person (God) View:** For editing and layout (like a city-builder).
    - **1st-Person (Fly) View:** For immersive navigation and interaction within complex molecular structures (like a flight simulator).
 
+### CLI Tooling Plan (Topology → Forcefield Assignment Pipeline)
+To separate topology construction and forcefield parameter assignment from the MD runtime, a lightweight CLI tool will generate pre-processed forcefield inputs:
+- **Input:** `.xyz` files (geometry + elements)
+- **Pipeline:** Read XYZ → Build bonds by cutoff → Enumerate angles/dihedrals/inversions → Assign UFF atom types (using octet-rule hybridization) → Output
+- **Output formats:**
+  - **JSON:** Human-readable topology + UFF types + parameters for debugging and version control.
+  - **Binary flat arrays (`.npy` or custom):** Dense, data-oriented arrays (apos, atypes, bond indices, params) for zero-copy ingestion by the MD engine. Matches the `AlignedVec` layout used by `Uff` and `MolWorld`.
+- **Rationale:** Decouples expensive topology analysis from the hot MD loop; enables batch processing of molecule libraries; makes forcefield assignments inspectable and reproducible.
+
 ### 5. `libs` (Future)
 Will provide wrappers and Python bindings mapping Python calls to the underlying Rust modules. This is treated as a subsequent layer built atop a stable Rust foundation.
 

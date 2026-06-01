@@ -1,6 +1,38 @@
 use surfmol_common::math::quat4::Quat4i;
 use surfmol_common::math::vec3::Vec3d;
 
+/// Number of lone electron pairs for common main-group elements.
+/// Based on valence shell configuration: C=4, N=5, O=6, F=7 → lone_pairs = (8 - valence)/2 for period-2.
+/// H is a special case: 1 electron, no lone pairs when bonded.
+pub fn ne_pairs(element: &str) -> i32 {
+    match element {
+        "H"  => 0,  // 1 valence e⁻, no lone pairs in bonded state
+        "C"  => 0,  // 4 valence e⁻
+        "N"  => 1,  // 5 valence e⁻
+        "O"  => 2,  // 6 valence e⁻
+        "F"  => 3,  // 7 valence e⁻
+        "Si" => 0,  // 4 valence e⁻ (like C)
+        "P"  => 1,  // 5 valence e⁻ (like N)
+        "S"  => 2,  // 6 valence e⁻ (like O)
+        "Cl" => 3,  // 7 valence e⁻ (like F)
+        _    => 0,  // default: assume no lone pairs (e.g. metals)
+    }
+}
+
+/// Hybridization from octet rule: 4 = nepair + nsigma + npi
+/// nsigma = number of neighbors (each bond contributes one sigma bond)
+/// npi    = 4 - nepair - nsigma
+///   npi=0 → sp3 (tetrahedral)
+///   npi=1 → sp2 (trigonal planar)
+///   npi=2 → sp  (linear)
+pub fn hybridization(element: &str, n_neigh: i32) -> i32 {
+    if element == "H" { return 1; }  // H is effectively s-orbital, report as 1
+    let np = ne_pairs(element);
+    let npi = 4 - np - n_neigh;
+    if npi < 0 { return 1; }  // hypervalent: default to sp3-like
+    if npi == 0 { 3 } else if npi == 1 { 2 } else { 1 }  // sp3=3, sp2=2, sp=1
+}
+
 pub struct Topology {
     pub apos: Vec<Vec3d>,
     pub bonds: Vec<[i32; 2]>,
@@ -11,6 +43,17 @@ pub struct Topology {
 
 impl Topology {
     #[inline(always)] pub fn natoms(&self) -> i32 { self.apos.len() as i32 }
+
+    /// Compute hybridization (1=sp, 2=sp2, 3=sp3) for each atom from element + neighbor count.
+    /// Requires `elems` in the same order as `self.apos`.
+    pub fn hybridizations(&self, elems: &[String]) -> Vec<i32> {
+        let mut neigh_count = vec![0i32; self.apos.len()];
+        for b in &self.bonds {
+            neigh_count[b[0] as usize] += 1;
+            neigh_count[b[1] as usize] += 1;
+        }
+        elems.iter().enumerate().map(|(i, el)| hybridization(el, neigh_count[i])).collect()
+    }
 
     // ================== MM::Builder diagnostic prints (parity with C++ MMFFBuilderBase.h) ==================
 
