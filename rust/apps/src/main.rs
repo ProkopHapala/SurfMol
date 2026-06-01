@@ -23,9 +23,10 @@ const ATOM_SCALE: f32 = 0.25;
 const K_PICK: f64 = 30.0;
 const PER_FRAME: i32 = 100;
 const PICK_RAY_R: f32 = 0.5;
-const LATTICE_A: f64 = 3.5;
+const LATTICE_A: f64 = 5.66;  // NaCl conventional cell, Na-Cl = a/2 = 2.83 Å
 const SURFACE_Z0: f32 = 0.0;
-const BETA_VDW: f64 = 0.5;
+const BETA_CHARGE: f64 = 0.3;      // electrostatics z-decay (slower)
+const BETA_MORSE_RATIO: f64 = 2.0; // Morse decay = ratio * charge decay (steeper vdW)
 const Q_AMP: f64 = 1.0;
 const PLQ_AMP: f64 = 1.0;
 const SURFACE_GRID_N: i32 = 256;
@@ -65,7 +66,7 @@ impl TrackballCam {
     }
     fn rotate(&mut self, prev: Vec2, curr: Vec2, w: f32, h: f32) {
         let a = self.mouse_to_sphere(prev, w, h); let b = self.mouse_to_sphere(curr, w, h);
-        let q = Quat::from_rotation_arc(a, b); self.target_rotation = (q * self.target_rotation).normalize();
+        let q = Quat::from_rotation_arc(b, a); self.target_rotation = (self.target_rotation * q).normalize();
     }
     fn update(&mut self, dt: f32) {
         let t = (self.lerp_speed * dt).clamp(0.0, 1.0);
@@ -133,7 +134,7 @@ struct App {
     world: MolWorld, elems: Vec<String>, params: Params, uff_types: Vec<String>, charges: Vec<f64>,
     cam: TrackballCam, selected: Option<usize>, pinned: Vec<bool>, pick_k: f64,
     show_bonds: bool, show_surface: bool, show_help: bool, show_groups: bool, show_ports: bool, show_labels: bool, show_debug_cursor: bool, label_mode: LabelMode,
-    run_relax: bool, dt: f64, flim: f64, cdamp: f64, per_frame: i32,
+    run_relax: bool, dt: f64, flim: f64, damping: f64, zero_v_on_opposition: bool, per_frame: i32,
     dirty: Dirty,
     device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, config: wgpu::SurfaceConfiguration,
     renderer: ImpostorRenderer, instances: Vec<AtomInstance>, line_renderer: LineRenderer, surface_renderer: SurfaceRenderer,
@@ -226,7 +227,7 @@ impl App {
         }
         for i in 0..world.natoms() { world.dyn_atoms.atoms.apos.as_mut_slice()[i].z += 2.0; }
         world.update_hneigh();
-        world.setup_nacl_surface(LATTICE_A, SURFACE_Z0 as f64, BETA_VDW, Q_AMP, PLQ_AMP);
+        world.setup_nacl_surface(LATTICE_A, SURFACE_Z0 as f64, BETA_CHARGE, BETA_MORSE_RATIO, Q_AMP, PLQ_AMP);
         println!("Surface setup complete (NaCl lattice a={} Å)", LATTICE_A);
 
         let mut cam = TrackballCam::new(Vec3::new(0.0, 1.0, 0.0), 6.0);
@@ -263,7 +264,7 @@ impl App {
         renderer.set_atoms(&instances);
         let mut dirty = Dirty::default(); dirty.atoms = false; dirty.camera = true; dirty.bonds = false; dirty.surface = false; dirty.groups = false;
         println!("App initialized. Controls: H=help  SPACE=relax  S=surface  B=bonds  P=pin  ESC=deselect");
-        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: true, show_help: true, show_groups: false, show_ports: false, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, cdamp: 0.95, per_frame, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0 };
+        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: true, show_help: true, show_groups: false, show_ports: false, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: 0.0, zero_v_on_opposition: true, per_frame, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0 };
         app.rebuild_surface_cache();
         app
     }
@@ -306,7 +307,15 @@ impl App {
                 let fapos = self.world.dyn_atoms.fapos.as_mut_slice();
                 fapos[idx].x += f_spring.x as f64; fapos[idx].y += f_spring.y as f64; fapos[idx].z += f_spring.z as f64;
             }
-            for ia in 0..self.world.natoms() { if self.pinned[ia] { continue; } self.world.move_atom_md(ia, self.dt, self.flim, self.cdamp); }
+            if self.zero_v_on_opposition {
+                let f = self.world.dyn_atoms.fapos.as_slice();
+                let v = self.world.dyn_atoms.vapos.as_slice();
+                let mut fv = 0.0;
+                for i in 0..self.world.natoms() { fv += f[i].dot(v[i]); }
+                if fv < 0.0 { self.world.dyn_atoms.clean_velocity(); }
+            }
+            let cdamp = 1.0 - self.damping;
+            for ia in 0..self.world.natoms() { if self.pinned[ia] { continue; } self.world.move_atom_md(ia, self.dt, self.flim, cdamp); }
         }
         self.sync_pos_from_engine();
     }
@@ -467,7 +476,7 @@ impl App {
                         "l" | "L" => { self.label_mode = match self.label_mode { LabelMode::None => LabelMode::AtomNumber, LabelMode::AtomNumber => LabelMode::AtomType, LabelMode::AtomType => LabelMode::Charge, LabelMode::Charge => LabelMode::ElementName, LabelMode::ElementName => LabelMode::None }; println!("label_mode = {:?}", self.label_mode); needs_redraw = true; }
                         "f" | "F" => { self.world.bonded_mode = match self.world.bonded_mode { BondedFFMode::Uff => BondedFFMode::RigidSp3, BondedFFMode::RigidSp3 => BondedFFMode::Uff }; println!("bonded_mode = {:?}", self.world.bonded_mode); needs_redraw = true; }
                         "n" | "N" => { if self.world.nonbonded.is_some() { self.world.nonbonded = None; println!("nonbonded = None"); } else { let mut nb = NonBondedFF::new(self.world.natoms()); nb.set_cutoff(8.0); self.world.nonbonded = Some(nb); println!("nonbonded = LJ+Coulomb"); } needs_redraw = true; }
-                        "m" | "M" => { if self.world.surface.is_some() { self.world.surface = None; println!("surface = None"); } else { self.world.setup_nacl_surface(LATTICE_A, SURFACE_Z0 as f64, BETA_VDW, Q_AMP, PLQ_AMP); println!("surface = NaCl"); } self.rebuild_surface_cache(); needs_redraw = true; }
+                        "m" | "M" => { if self.world.surface.is_some() { self.world.surface = None; println!("surface = None"); } else { self.world.setup_nacl_surface(LATTICE_A, SURFACE_Z0 as f64, BETA_CHARGE, BETA_MORSE_RATIO, Q_AMP, PLQ_AMP); println!("surface = NaCl"); } self.rebuild_surface_cache(); needs_redraw = true; }
                         "[" => { self.pick_k *= 0.8; println!("pick_k = {}", self.pick_k); }
                         "]" => { self.pick_k *= 1.25; println!("pick_k = {}", self.pick_k); }
                         "-" => { self.per_frame = (self.per_frame / 2).max(1); println!("per_frame = {}", self.per_frame); }
@@ -610,7 +619,8 @@ impl App {
 
         // --- egui overlay ---
         let raw_input = self.egui_state.take_egui_input(&self.window);
-        let full_output = self.egui_ctx.run(raw_input, |ctx| { self.draw_egui(ctx); });
+        let egui_ctx = self.egui_ctx.clone();
+        let full_output = egui_ctx.run(raw_input, |ctx| { self.draw_egui(ctx); });
         self.egui_state.handle_platform_output(&self.window, full_output.platform_output);
         let tris = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         for (id, image_delta) in &full_output.textures_delta.set { self.egui_renderer.update_texture(&*self.device, &self.queue, *id, image_delta); }
@@ -638,7 +648,7 @@ impl App {
         surface_texture.present();
     }
 
-    fn draw_egui(&self, ctx: &egui::Context) {
+    fn draw_egui(&mut self, ctx: &egui::Context) {
         let w = ctx.screen_rect().width();
         let h = ctx.screen_rect().height();
 
@@ -681,14 +691,59 @@ impl App {
             .title_bar(true)
             .frame(egui::Frame::window(&ctx.style()))
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(format!("Label (L): {:?}", self.label_mode)).size(14.0).color(egui::Color32::YELLOW));
-                ui.label(egui::RichText::new(format!("Bonded (F): {:?}", self.world.bonded_mode)).size(14.0).color(egui::Color32::YELLOW));
+                ui.heading("Physics");
+                ui.horizontal(|ui| {
+                    ui.label("Iters/frame:");
+                    ui.add(egui::DragValue::new(&mut self.per_frame).speed(1).clamp_range(1..=2000));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Time step dt:");
+                    ui.add(egui::DragValue::new(&mut self.dt).speed(0.001).clamp_range(0.0001..=0.5));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Damping:");
+                    ui.add(egui::DragValue::new(&mut self.damping).speed(0.01).clamp_range(0.0..=1.0));
+                });
+                ui.checkbox(&mut self.zero_v_on_opposition, "Zero V when F·V < 0 (3N)");
+                ui.separator();
+                ui.heading("Display");
+                ui.horizontal(|ui| {
+                    ui.label("Labels:");
+                    egui::ComboBox::from_id_source("label_mode_combo")
+                        .width(120.0)
+                        .selected_text(match self.label_mode {
+                            LabelMode::None => "None",
+                            LabelMode::AtomNumber => "Atom Number",
+                            LabelMode::AtomType => "Atom Type",
+                            LabelMode::Charge => "Charge",
+                            LabelMode::ElementName => "Element Name",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.label_mode, LabelMode::None, "None");
+                            ui.selectable_value(&mut self.label_mode, LabelMode::AtomNumber, "Atom Number");
+                            ui.selectable_value(&mut self.label_mode, LabelMode::AtomType, "Atom Type");
+                            ui.selectable_value(&mut self.label_mode, LabelMode::Charge, "Charge");
+                            ui.selectable_value(&mut self.label_mode, LabelMode::ElementName, "Element Name");
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Bonded FF:");
+                    egui::ComboBox::from_id_source("bonded_mode_combo")
+                        .width(120.0)
+                        .selected_text(match self.world.bonded_mode {
+                            BondedFFMode::Uff => "UFF",
+                            BondedFFMode::RigidSp3 => "Rigid sp3",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.world.bonded_mode, BondedFFMode::Uff, "UFF");
+                            ui.selectable_value(&mut self.world.bonded_mode, BondedFFMode::RigidSp3, "Rigid sp3");
+                        });
+                });
+                ui.separator();
                 let nb_str = if self.world.nonbonded.is_some() { "LJ+Coulomb" } else { "None" };
                 ui.label(egui::RichText::new(format!("Non-bonded (N): {}", nb_str)).size(14.0).color(egui::Color32::YELLOW));
                 let sf_str = if self.world.surface.is_some() { "NaCl" } else { "None" };
                 ui.label(egui::RichText::new(format!("Surface (M): {}", sf_str)).size(14.0).color(egui::Color32::YELLOW));
-                let sl = if self.show_labels { "ON" } else { "OFF" };
-                ui.label(egui::RichText::new(format!("Labels (K): {}", sl)).size(14.0).color(egui::Color32::YELLOW));
             });
 
         // Help (bottom-left)
@@ -773,7 +828,7 @@ impl App {
                 egui::Area::new(egui::Id::new(("atom_label", i)))
                     .fixed_pos(egui::pos2(sp.x, sp.y + 5.0))
                     .show(ctx, |ui| {
-                        ui.label(egui::RichText::new(&txt).size(12.0).color(egui::Color32::WHITE));
+                        ui.add(egui::Label::new(egui::RichText::new(&txt).size(12.0).color(egui::Color32::WHITE)).extend());
                     });
             }
         }
@@ -804,6 +859,11 @@ fn main() {
                 if app.run_relax { app.do_relax_step(); }
                 app.prepare();
                 app.render();
+                // If egui animations/widgets still need frames, keep redrawing
+                if app.egui_ctx.has_requested_repaint() {
+                    pending_redraw = true;
+                    app.window.request_redraw();
+                }
             }
             Event::WindowEvent { event, .. } => {
                 let egui_response = app.egui_state.on_window_event(&app.window, &event);
@@ -815,9 +875,9 @@ fn main() {
                 }
             }
             Event::AboutToWait => {
-                // Always request redraw when simulating so the loop keeps ticking.
-                // When idle, only redraw if something changed.
-                if app.run_relax || pending_redraw {
+                // Always request redraw when simulating or when egui needs animation frames.
+                // This ensures combo boxes, hover effects, and cursor animations stay smooth.
+                if app.run_relax || pending_redraw || app.egui_ctx.has_requested_repaint() {
                     app.window.request_redraw();
                 }
             }

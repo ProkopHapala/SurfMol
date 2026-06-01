@@ -75,9 +75,8 @@ impl MolWorld {
 
         // Surface interaction: borrows PLQH coefficients from NonBondedFF
         if let (Some(ref surf), Some(ref nb)) = (&self.surface, &self.nonbonded) {
-            let mut scratch = SurfaceScratch::new(surf);
             let plqs = nb.plqs.as_slice();
-            es = surf.eval_all_scratch(&apos[0..natoms], &plqs[0..natoms], &mut fapos[0..natoms], &mut scratch);
+            es = surf.eval_all_clamped(&apos[0..natoms], &plqs[0..natoms], &mut fapos[0..natoms], 100.0);
         }
 
         (eb, ea, ed, ei, enb, es)
@@ -134,7 +133,7 @@ impl MolWorld {
     pub fn update_hneigh(&mut self) { self.uff.update_hneigh(self.dyn_atoms.apos(), self.dyn_atoms.neighs()); }
 
     // === Convenience: attach surface ===
-    pub fn setup_nacl_surface(&mut self, a: f64, z0: f64, beta_vdw: f64, q_amp: f64, plq_amp: f64) {
-        self.surface = Some(crate::surface::setup_nacl_surface(a, z0, beta_vdw, q_amp, plq_amp));
+    pub fn setup_nacl_surface(&mut self, a: f64, z0: f64, beta_charge: f64, beta_morse_ratio: f64, q_amp: f64, plq_amp: f64) {
+        self.surface = Some(crate::surface::setup_nacl_surface(a, z0, beta_charge, beta_morse_ratio, q_amp, plq_amp));
     }
 }

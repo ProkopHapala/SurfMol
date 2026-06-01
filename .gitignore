@@ -25,3 +25,7 @@ Thumbs.db
 
 # Temporary data directory
 tmp/
+
+# Generated test outputs
+*.svg
+*.csv

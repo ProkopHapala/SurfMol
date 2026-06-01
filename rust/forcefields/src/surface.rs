@@ -114,10 +114,10 @@ impl SurfaceScratch {
 
     // --- Z decay (exponential, each independent) ---
     for i in 0..nz {
-        let dz = (z - z0[i]).max(0.0);
+        let dz = z - z0[i];
         let bz_i = (-kz[i] * dz).exp();
         bz[i] = bz_i;
-        dbz[i] = if z > z0[i] { -kz[i] * bz_i } else { 0.0 };
+        dbz[i] = -kz[i] * bz_i;
     }
 }
 
@@ -225,10 +225,10 @@ impl SurfaceFolded {
         }
 
         for i in 0..nz {
-            let dz = (z - self.z0[i]).max(0.0);
+            let dz = z - self.z0[i];
             let bz_i = (-self.kz[i] * dz).exp();
             s.bz[i] = bz_i;
-            s.dbz[i] = if z > self.z0[i] { -self.kz[i] * bz_i } else { 0.0 };
+            s.dbz[i] = -self.kz[i] * bz_i;
         }
     }
 
@@ -238,6 +238,18 @@ impl SurfaceFolded {
         self.coeffs_q[ioff] = q;
         self.coeffs_p[ioff] = p;
         self.coeffs_l[ioff] = l;
+    }
+
+    /// Clamp force magnitude to prevent numerical blowup when atom penetrates surface.
+    /// Returns (energy, clamped_force).
+    #[inline(always)] fn clamp_force(&self, e: f64, f: Vec3d, fmax: f64) -> (f64, Vec3d) {
+        let f2 = f.x*f.x + f.y*f.y + f.z*f.z;
+        if f2 > fmax*fmax {
+            let s = fmax / f2.sqrt();
+            (e, Vec3d::new(f.x*s, f.y*s, f.z*s))
+        } else {
+            (e, f)
+        }
     }
 
     /// Convert REQ [RvdW, EvdW, Q, H] → PLQ [Pauli, London, Q, H]
@@ -252,6 +264,12 @@ impl SurfaceFolded {
     #[inline(always)] pub fn eval_atom(&self, pos: Vec3d, plq: [f64; 4]) -> (f64, Vec3d) {
         let mut scratch = SurfaceScratch::new(self);
         self.eval_atom_scratch(pos, plq, &mut scratch)
+    }
+
+    /// Evaluate with force clamping (default fmax=100 eV/Å).
+    #[inline(always)] pub fn eval_atom_clamped(&self, pos: Vec3d, plq: [f64; 4], fmax: f64) -> (f64, Vec3d) {
+        let (e, f) = self.eval_atom(pos, plq);
+        self.clamp_force(e, f, fmax)
     }
 
     /// Evaluate energy and force for one atom using reusable scratch buffers (no per-atom allocations).
@@ -317,56 +335,75 @@ impl SurfaceFolded {
         }
         etot
     }
+
+    /// Evaluate with force clamping for all atoms.
+    pub fn eval_all_clamped(&self, apos: &[Vec3d], plqs: &[[f64; 4]], fapos: &mut [Vec3d], fmax: f64) -> f64 {
+        let mut scratch = SurfaceScratch::new(self);
+        let mut etot = 0.0;
+        for ia in 0..apos.len() {
+            let (e, f) = self.eval_atom_scratch(apos[ia], plqs[ia], &mut scratch);
+            let (_, fc) = self.clamp_force(e, f, fmax);
+            etot += e;
+            fapos[ia].add(fc);
+        }
+        etot
+    }
 }
 
-/// Create a NaCl-like substrate surface with:
-/// - Electrostatics: checkerboard of alternating charges using cos(2π*x/a)*cos(2π*y/a)
-/// - VdW: exponentially decaying attraction above surface (z > z0)
-/// - Lattice: square a×a (ax=a, bx=0, ay=0, by=a)
-pub fn setup_nacl_surface(a: f64, z0: f64, beta_vdw: f64, q_amp: f64, plq_amp: f64) -> SurfaceFolded {
-    // Basis: [kx=1.0 (cos 2πx/a), ky=1.0 (cos 2πy/a)], z-decay [beta_vdw], z0
-    // k=1.0 because TAU*1.0*x/a = 2π*x/a  -> period a/2, matching Na-Cl spacing
+/// Create a NaCl-like substrate surface with separable Morse + electrostatics basis:
+///
+/// Z-basis structure (Morse exponent > charge exponent):
+///   iz=0: kz = 2*β_morse  → Pauli repulsion  (square of attractive = exp(-2β_morse z))
+///   iz=1: kz = β_morse    → London attraction (attractive Morse = exp(-β_morse z))
+///   iz=2: kz = β_charge   → Electrostatics   (slower decay than Morse)
+///
+/// X/Y harmonics: k=1.0 gives period a/2, matching Na-Cl spacing.
+///
+/// Charge/element assignment:
+///   (1,1,2) checkerboard: +1 at Na sites, -1 at Cl sites.
+pub fn setup_nacl_surface(a: f64, z0: f64, beta_charge: f64, beta_morse_ratio: f64, q_amp: f64, plq_amp: f64) -> SurfaceFolded {
+    let beta_morse = beta_charge * beta_morse_ratio;   // steeper than charge
+
     let kx = vec![0.0, 1.0];  // 0: constant, 1.0: cos(2π*x/a)
     let ky = vec![0.0, 1.0];  // 0: constant, 1.0: cos(2π*y/a)
-    let kz = vec![beta_vdw];
-    let z0s = vec![z0];
+    let kz = vec![2.0 * beta_morse, beta_morse, beta_charge];
+    let z0s = vec![z0, z0, z0];
     let nx = kx.len();
     let ny = ky.len();
     let nz = kz.len();
 
     let mut surf = SurfaceFolded::new(a, 0.0, 0.0, a, kx, ky, kz, z0s, 1);
 
-    // Basis index mapping: ib = ix + nx*(iy + ny*iz)
-    // ix=0,iy=0,iz=0: constant (all ones)
-    // ix=1,iy=0,iz=0: cos(2πx/a)
-    // ix=0,iy=1,iz=0: cos(2πy/a)
-    // ix=1,iy=1,iz=0: cos(2πx/a)*cos(2πy/a)  <- checkerboard pattern
+    // Basis index: ib = ix + nx*(iy + ny*iz)
+    for iz in 0..nz {
+        let iz_off = iz * nx * ny;
+        let i_const = iz_off + 0 + nx * (0 + ny * 0);  // (0,0,iz)
+        let i_cos_x = iz_off + 1 + nx * (0 + ny * 0);  // (1,0,iz)
+        let i_cos_y = iz_off + 0 + nx * (1 + ny * 0);  // (0,1,iz)
+        let i_check = iz_off + 1 + nx * (1 + ny * 0);  // (1,1,iz)
 
-    let i_const = 0 + nx * (0 + ny * 0);    // (0,0,0)
-    let i_cos_x = 1 + nx * (0 + ny * 0);    // (1,0,0)
-    let i_cos_y = 0 + nx * (1 + ny * 0);    // (0,1,0)
-    let i_check = 1 + nx * (1 + ny * 0);    // (1,1,0) checkerboard
-
-    // Type 0: generic atom interacting with NaCl surface
-    // Electrostatics: checkerboard pattern (alternating + and -)
-    surf.set_coeffs(0, i_const, 0.0, 0.0, 0.0);      // no constant electrostatic
-    surf.set_coeffs(0, i_cos_x, 0.0, 0.0, 0.0);      // no pure x-cos
-    surf.set_coeffs(0, i_cos_y, 0.0, 0.0, 0.0);      // no pure y-cos
-    surf.set_coeffs(0, i_check, q_amp, 0.0, 0.0);    // checkerboard charges
-
-    // Pauli/London: smooth vdW wall (attractive above, repulsive when penetrating)
-    // NOTE: set_coeffs overwrites (q,p,l) at once, so we must preserve q_amp on i_check.
-    // Pauli (repulsive): dominates when close to surface / penetrating
-    surf.set_coeffs(0, i_const, 0.0, plq_amp, 0.0);       // constant Pauli repulsion
-    surf.set_coeffs(0, i_cos_x, 0.0, 0.0, 0.0);
-    surf.set_coeffs(0, i_cos_y, 0.0, 0.0, 0.0);
-    surf.set_coeffs(0, i_check, q_amp, 0.0, 0.0);         // keep electrostatics
-
-    // London (attractive): decays above surface
-    surf.set_coeffs(0, i_const, 0.0, 0.0, -plq_amp);      // attractive constant
-    surf.set_coeffs(0, i_cos_x, 0.0, 0.0, 0.0);
-    surf.set_coeffs(0, i_cos_y, 0.0, 0.0, 0.0);
-    surf.set_coeffs(0, i_check, q_amp, 0.0, 0.0);         // keep electrostatics
+        if iz == 0 {
+            // Pauli repulsion on short-range z-decay (square of attractive)
+            // Prefactor must overcome atomic P<<L ratio from req2plq to create
+            // a proper minimum.  ~40x gives equilibrium ~1.5Å above surface.
+            surf.set_coeffs(0, i_const, 0.0,  plq_amp * 40.0,  0.0);
+            surf.set_coeffs(0, i_cos_x, 0.0, 0.0,      0.0);
+            surf.set_coeffs(0, i_cos_y, 0.0, 0.0,      0.0);
+            surf.set_coeffs(0, i_check, 0.0, 0.0,      0.0);
+        } else if iz == 1 {
+            // London attraction on medium-range z-decay
+            surf.set_coeffs(0, i_const, 0.0,  0.0,     -plq_amp);
+            surf.set_coeffs(0, i_cos_x, 0.0,  0.0,      0.0);
+            surf.set_coeffs(0, i_cos_y, 0.0,  0.0,      0.0);
+            surf.set_coeffs(0, i_check, 0.0,  0.0,      0.0);
+        } else {
+            // Electrostatics on slow z-decay (checkerboard only)
+            surf.set_coeffs(0, i_const, 0.0,  0.0,      0.0);
+            surf.set_coeffs(0, i_cos_x, 0.0,  0.0,      0.0);
+            surf.set_coeffs(0, i_cos_y, 0.0,  0.0,      0.0);
+            surf.set_coeffs(0, i_check, q_amp, 0.0,     0.0);
+        }
+    }
 
     surf
 }
