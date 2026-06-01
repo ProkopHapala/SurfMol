@@ -1,10 +1,13 @@
-use surfmol_molrender::impostor::{ImpostorRenderer, AtomInstance, CameraData, look_at, ortho, mul4x4, normalize3, sub3, cross3};
+use surfmol_molrender::impostor::{ImpostorRenderer, AtomInstance, CameraData, look_at, ortho, mul4x4, transpose4x4, normalize3, sub3, cross3};
 
 #[test]
 fn impostor_single_atom() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        display: None,
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -18,7 +21,9 @@ fn impostor_single_atom() {
             required_limits: wgpu::Limits::default(),
             label: Some("test_device"),
             memory_hints: wgpu::MemoryHints::Performance,
-        }, None,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            trace: wgpu::Trace::Off,
+        },
     )).expect("no device");
 
     let device = std::sync::Arc::new(device);
@@ -40,7 +45,7 @@ fn impostor_single_atom() {
     let up = [0.0, 1.0, 0.0];
     let view = look_at(eye, target, up);
     let proj = ortho(-3.0, 3.0, -3.0, 3.0, 0.1, 100.0);
-    let vp = mul4x4(view, proj);
+    let vp = transpose4x4(mul4x4(view, proj));
 
     let z = normalize3(sub3(eye, target));
     let right = normalize3(cross3([0.0, 1.0, 0.0], z));
@@ -54,6 +59,9 @@ fn impostor_single_atom() {
         _pad2: 0.0,
         up: upv,
         _pad3: 0.0,
+        forward: normalize3(sub3(target, eye)),
+        ortho: 0.0,
+        ray_shift: [0.0, 0.0, 0.0, 0.0],
     };
 
     let out_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -80,15 +88,15 @@ fn impostor_single_atom() {
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback_enc") });
     encoder.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture { texture: &out_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        wgpu::ImageCopyBuffer { buffer: &readback, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(128 * 4), rows_per_image: Some(128) } },
+        wgpu::TexelCopyTextureInfo { texture: &out_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(128 * 4), rows_per_image: Some(128) } },
         wgpu::Extent3d { width: 128, height: 128, depth_or_array_layers: 1 },
     );
     queue.submit(std::iter::once(encoder.finish()));
 
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
     let data = slice.get_mapped_range();
     let mut non_bg = 0;
     for i in (0..data.len()).step_by(4) {

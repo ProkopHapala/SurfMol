@@ -21,3 +21,5 @@ egui-winit = { workspace = true }
 egui-wgpu = { workspace = true }
 egui_extras = "0.29"
 glam = { workspace = true }
+nalgebra = { workspace = true }
+image = "0.25"

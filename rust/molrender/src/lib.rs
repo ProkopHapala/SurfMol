@@ -1,5 +1,6 @@
 pub mod impostor;
 pub mod line_renderer;
+pub mod surface_renderer;
 
 use std::sync::Arc;
 use surfmol_common::math::vec3::Vec3d;
@@ -88,6 +89,7 @@ impl ThumbnailRenderer {
         let z = impostor::normalize3(impostor::sub3(eye, center));
         let x = impostor::normalize3(impostor::cross3([0.0, 1.0, 0.0], z));
         let y = impostor::cross3(z, x);
+        let fwd = impostor::normalize3(impostor::sub3(center, eye));
 
         let camera = impostor::CameraData {
             view_proj: impostor::transpose4x4(vp),
@@ -97,6 +99,9 @@ impl ThumbnailRenderer {
             _pad2: 0.0,
             up: y,
             _pad3: 0.0,
+            forward: fwd,
+            ortho: 0.0,
+            ray_shift: [0.0, 0.0, 0.0, 0.0],
         };
 
         // Offscreen color texture
