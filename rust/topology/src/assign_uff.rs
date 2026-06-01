@@ -81,7 +81,9 @@ pub fn assign_uff_types(elems: &[String], neighs: &[[i32; 4]]) -> Vec<String> {
         // --- General case: map hybridization to UFF suffix ---
         let suffix = match h {
             3 => "3",   // sp3
-            2 => "2",   // sp2 (non-aromatic default; aromatic override below)
+            2 => {      // sp2: default to aromatic _R for C/N/O, _2 for others
+                if matches!(name.as_str(), "C" | "N" | "O") { "R" } else { "2" }
+            }
             1 => "1",   // sp
             _ => "3",
         };
@@ -95,23 +97,6 @@ pub fn assign_uff_types(elems: &[String], neighs: &[[i32; 4]]) -> Vec<String> {
                 if j < 0 { break; }
                 bond_orders[ia * 4 + in_] = 1;
                 set_bond[ia * 4 + in_] = true;
-            }
-            // For sp2 C and N in all-carbon/sp2 rings, aromatic _R is more accurate.
-            // Simple heuristic: if all neighbors are also sp2 C/N/O, treat as aromatic.
-            if h == 2 && (name == "C" || name == "N") {
-                let all_sp2 = (0..nbond as usize).all(|in_| {
-                    let ja = neighs[ia][in_];
-                    if ja < 0 { return false; }
-                    let je = &elems[ja as usize];
-                    let jbond = neighs[ja as usize].iter().take_while(|&&n| n >= 0).count() as i32;
-                    hybridization(je, jbond) == 2
-                });
-                if all_sp2 {
-                    let rname = format!("{}_R", name);
-                    if type_exists(&rname) {
-                        types[ia] = rname;
-                    }
-                }
             }
         } else {
             // Fallback: try unprefixed element name (e.g. "F", "Cl")
