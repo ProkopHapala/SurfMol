@@ -29,6 +29,9 @@ pub struct CameraData {
     pub _pad2: f32,
     pub up: [f32; 3],              // 96
     pub _pad3: f32,
+    pub forward: [f32; 3],         // 112
+    pub ortho: f32,                // 124  1.0 => orthographic ray mode
+    pub ray_shift: [f32; 4],       // 128  ray_shift[0] = shift ray origin along -forward (world units)
 }
 
 // ------------------------------------------------------------------
@@ -41,6 +44,8 @@ struct Camera {
     eye: vec3<f32>, _pad1: f32,
     right: vec3<f32>, _pad2: f32,
     up: vec3<f32>, _pad3: f32,
+    forward: vec3<f32>, ortho: f32,
+    ray_shift: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 
@@ -78,8 +83,10 @@ fn vs_main(@location(0) q: vec2<f32>, @builtin(instance_index) ii: u32) -> Verte
 
 @fragment
 fn fs_main(v: VertexOut) -> FragOut {
-    let ray_dir = normalize(v.world - cam.eye);
-    let oc = cam.eye - v.center;
+    let ray_dir = -cam.forward;
+    let shift = v.radius + 1.0;
+    let ray_origin = v.world + cam.forward * shift;
+    let oc = ray_origin - v.center;
     let a = dot(ray_dir, ray_dir);
     let b = 2.0 * dot(oc, ray_dir);
     let c = dot(oc, oc) - v.radius * v.radius;
@@ -87,7 +94,7 @@ fn fs_main(v: VertexOut) -> FragOut {
     if (disc < 0.0) { discard; }
     let t = (-b - sqrt(disc)) / (2.0 * a);
     if (t < 0.0) { discard; }
-    let hit = cam.eye + ray_dir * t;
+    let hit = ray_origin + ray_dir * t;
     let n = normalize(hit - v.center);
     let light = normalize(vec3<f32>(0.3, 0.5, 0.8));
     let ndotl = max(dot(n, light), 0.0);
