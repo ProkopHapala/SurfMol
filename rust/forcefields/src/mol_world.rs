@@ -27,6 +27,7 @@ impl MolWorld {
         let natoms = uff.natoms;
         let mut dyn_atoms = DynamicAtoms::new(natoms);
         dyn_atoms.atoms.apos.as_mut_slice().copy_from_slice(&top.apos);
+        dyn_atoms.atoms.make_neigh_bs(uff.bon_atoms.as_slice());
         Self {
             dyn_atoms,
             uff,

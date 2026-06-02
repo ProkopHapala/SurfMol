@@ -84,8 +84,28 @@ impl KekuleEditor {
             }
             EditMode::AtomDraw => {
                 let el = self.atom_type.as_str();
-                builder.add_atom(pos_ws, el);
-                true
+                // 1. Check if we're near an existing atom
+                if let Some((ah, _)) = builder.find_nearest_atom(pos_ws, self.pick_radius) {
+                    builder.set_atom_element(ah, el);
+                    true
+                } else if self.grid_mode {
+                    // 2. Grid mode: snap to nearest grid node
+                    let pin = Builder::snap_to_grid(pos_ws.x, pos_ws.y);
+                    if let Some(&ah) = builder.pin_to_atom.get(&pin) {
+                        if builder.is_atom_alive(ah) {
+                            builder.set_atom_element(ah, el);
+                            return true;
+                        }
+                    }
+                    // No atom at this grid node: add new one at grid position
+                    let snapped_pos = Vec3d::new(pin.0 as f64, pin.1 as f64, 0.0);
+                    builder.add_atom(snapped_pos, el);
+                    true
+                } else {
+                    // 3. Free mode: add atom at exact click position
+                    builder.add_atom(pos_ws, el);
+                    true
+                }
             }
             _ => false,
         }
@@ -98,6 +118,12 @@ impl KekuleEditor {
                 let (q, r) = Builder::snap_to_ring(pos_ws.x, pos_ws.y, self.a_cc);
                 builder.remove_hex_ring(q, r, false, self.a_cc);
                 true
+            }
+            EditMode::AtomDraw => {
+                if let Some((ah, _)) = builder.find_nearest_atom(pos_ws, self.pick_radius) {
+                    builder.remove_atom(ah);
+                    true
+                } else { false }
             }
             _ => false,
         }
@@ -229,6 +255,36 @@ pub fn builder_summary(builder: &Builder) -> String {
         }
     }
     format!("C={} N={} O={} H={} other={}", n_c, n_n, n_o, n_h, n_other)
+}
+
+/// RGBA color for an element (for visualization).
+pub fn element_color(el: &str) -> [f32; 4] {
+    match el {
+        "C" => [0.5f32, 0.5, 0.5, 1.0],
+        "N" => [0.2f32, 0.2, 1.0, 1.0],
+        "O" => [1.0f32, 0.2, 0.2, 1.0],
+        "H" => [0.9f32, 0.9, 0.9, 1.0],
+        _   => [0.7f32, 0.7, 0.7, 1.0],
+    }
+}
+
+/// Collect hex grid reference points (2D lattice of dots) for empty neighbors of existing tiles.
+pub fn collect_hex_grid_points(hex_tiles: &std::collections::HashSet<(i32, i32)>, a_cc: f64) -> Vec<Vec3d> {
+    let mut points = std::collections::HashSet::new();
+    let dirs = [(1,0), (1,-1), (0,-1), (-1,0), (-1,1), (0,1)];
+    for &(q, r) in hex_tiles {
+        for &(dq, dr) in &dirs {
+            let nq = q + dq; let nr = r + dr;
+            if !hex_tiles.contains(&(nq, nr)) {
+                let nodes = Builder::honeycomb_ring_nodes(nq, nr, a_cc);
+                for node in nodes {
+                    let key = ((node.0 * 1e6).round() as i64, (node.1 * 1e6).round() as i64);
+                    points.insert(key);
+                }
+            }
+        }
+    }
+    points.into_iter().map(|(x, y)| Vec3d::new(x as f64 / 1e6, y as f64 / 1e6, 0.0)).collect()
 }
 
 /// Collect hex grid lines for visualization.

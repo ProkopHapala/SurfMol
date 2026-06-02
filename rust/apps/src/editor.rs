@@ -14,7 +14,7 @@ use surfmol_topology::assign_uff;
 use surfmol_topology::builder;
 use surfmol_topology::params::{Params, get_reqh};
 use surfmol_apps::gui::trackball::TrackballCam;
-use surfmol_apps::gui::kekule_editor::{KekuleEditor, EditMode, AtomType, collect_hex_lines, collect_ghost_hexes, collect_builder_bonds, collect_builder_atoms, export_xyz, builder_summary};
+use surfmol_apps::gui::kekule_editor::{KekuleEditor, EditMode, AtomType, collect_hex_grid_points, collect_builder_bonds, collect_builder_atoms, export_xyz, builder_summary, element_color};
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -224,18 +224,32 @@ impl App {
         best_i
     }
 
+    /// Ray-sphere pick against builder atoms. Returns dense index (0..n_live_atoms).
+    fn pick_builder_atom(&self, mouse: Vec2) -> Option<usize> {
+        let (ro, rd) = self.cam.screen_ray(mouse, self.window_size.0, self.window_size.1);
+        let mut best_t = f32::MAX; let mut best_i = None;
+        for (i, (_, ad)) in self.builder.iter_atoms().enumerate() {
+            let p = Vec3::new(ad.pos.x as f32, ad.pos.y as f32, ad.pos.z as f32);
+            if let Some(t) = ray_sphere(ro, rd, p, 0.25f32) { if t < best_t { best_t = t; best_i = Some(i); } }
+        }
+        best_i
+    }
+
     fn do_relax_step(&mut self) {
         if !self.run_relax { return; }
         for _ in 0..self.per_frame {
             let (eb, ea, ed, ei, enb, es) = self.world.eval_forces();
             self.eb = eb; self.ea = ea; self.ed = ed; self.ei = ei; self.enb = enb; self.es = es;
             self.etot = eb + ea + ed + ei + enb + es;
-            if let Some(idx) = self.selected {
-                let atom_pos = Vec3::new(self.world.dyn_atoms.atoms.apos.as_slice()[idx].x as f32, self.world.dyn_atoms.atoms.apos.as_slice()[idx].y as f32, self.world.dyn_atoms.atoms.apos.as_slice()[idx].z as f32);
-                let (ray0, hray) = self.cam.screen_ray(self.prev_mouse, self.window_size.0, self.window_size.1);
-                let f_spring = get_force_spring_ray(atom_pos, hray, ray0, self.pick_k as f32);
-                let fapos = self.world.dyn_atoms.fapos.as_mut_slice();
-                fapos[idx].x += f_spring.x as f64; fapos[idx].y += f_spring.y as f64; fapos[idx].z += f_spring.z as f64;
+            // Atom dragging via spring force: only in sim mode (not edit mode)
+            if !self.show_kekule_editor {
+                if let Some(idx) = self.selected {
+                    let atom_pos = Vec3::new(self.world.dyn_atoms.atoms.apos.as_slice()[idx].x as f32, self.world.dyn_atoms.atoms.apos.as_slice()[idx].y as f32, self.world.dyn_atoms.atoms.apos.as_slice()[idx].z as f32);
+                    let (ray0, hray) = self.cam.screen_ray(self.prev_mouse, self.window_size.0, self.window_size.1);
+                    let f_spring = get_force_spring_ray(atom_pos, hray, ray0, self.pick_k as f32);
+                    let fapos = self.world.dyn_atoms.fapos.as_mut_slice();
+                    fapos[idx].x += f_spring.x as f64; fapos[idx].y += f_spring.y as f64; fapos[idx].z += f_spring.z as f64;
+                }
             }
             if self.zero_v_on_opposition {
                 let f = self.world.dyn_atoms.fapos.as_slice();
@@ -253,64 +267,114 @@ impl App {
     fn collect_lines(&self) -> Vec<LineVertex> {
         use surfmol_apps::gui::gizmos::{make_bond_segments, make_ring, make_axes, make_crosshair};
         let mut lines = Vec::new();
-        let ps = self.world.dyn_atoms.atoms.apos.as_slice();
-        let natoms = self.world.natoms();
 
-        // --- Bonds ---
-        if self.show_bonds {
-            const BOND_SEG: i32 = 10;
-            let col: [f32; 4] = [0.7, 0.7, 0.7, 1.0];
-            for ib in 0..self.world.uff.nbonds as usize {
-                let b = self.world.uff.bon_atoms.as_slice()[ib];
-                let i0 = b[0] as usize; let i1 = b[1] as usize;
-                let p0 = Vec3::new(ps[i0].x as f32, ps[i0].y as f32, ps[i0].z as f32);
-                let p1 = Vec3::new(ps[i1].x as f32, ps[i1].y as f32, ps[i1].z as f32);
-                lines.extend(make_bond_segments(p0, p1, BOND_SEG, col));
+        if !self.show_kekule_editor {
+            // ===== SIMULATION MODE =====
+            let ps = self.world.dyn_atoms.atoms.apos.as_slice();
+            let natoms = self.world.natoms();
+
+            // --- Bonds ---
+            if self.show_bonds {
+                const BOND_SEG: i32 = 10;
+                let col: [f32; 4] = [0.7, 0.7, 0.7, 1.0];
+                for ib in 0..self.world.uff.nbonds as usize {
+                    let b = self.world.uff.bon_atoms.as_slice()[ib];
+                    let i0 = b[0] as usize; let i1 = b[1] as usize;
+                    let p0 = Vec3::new(ps[i0].x as f32, ps[i0].y as f32, ps[i0].z as f32);
+                    let p1 = Vec3::new(ps[i1].x as f32, ps[i1].y as f32, ps[i1].z as f32);
+                    lines.extend(make_bond_segments(p0, p1, BOND_SEG, col));
+                }
             }
-        }
 
-        // --- Surface grid removed: textured quad rendered separately ---
+            // --- Ports ---
+            if self.show_ports {
+                let rr = &self.world.rigid_sp3;
+                let neigh_bs = self.world.dyn_atoms.atoms.neigh_bs.as_slice();
+                let port_col = [1.0f32, 0.5, 0.0, 1.0];
+                for i in 0..natoms {
+                    let pi = Vec3::new(ps[i].x as f32, ps[i].y as f32, ps[i].z as f32);
+                    let bs = neigh_bs[i].as_array();
+                    let np = rr.nport[i] as usize;
+                    for s in 0..np {
+                        let ib = bs[s];
+                        if ib < 0 { continue; }
+                        let l0 = self.world.uff.bon_params.as_slice()[ib as usize][1];
+                        let tip = rr.get_port_tip(ps, i, s, l0);
+                        let pt = Vec3::new(tip.x as f32, tip.y as f32, tip.z as f32);
+                        lines.push(LineVertex { pos: [pi.x, pi.y, pi.z], col: port_col });
+                        lines.push(LineVertex { pos: [pt.x, pt.y, pt.z], col: port_col });
+                    }
+                }
+            }
 
-        // --- Axes ---
-        lines.extend(make_axes([0.0, 0.0, 0.0], 1.0));
+            // --- Picking highlight ring ---
+            if let Some(idx) = self.selected {
+                let pos = Vec3::new(ps[idx].x as f32, ps[idx].y as f32, ps[idx].z as f32);
+                let r = if self.show_ports { 0.03 } else { self.params.element_radius_vdw(&self.elems[idx]) * ATOM_SCALE };
+                let ring_col: [f32; 4] = if self.pinned[idx] { [1.0, 1.0, 0.0, 1.0] } else { [0.0, 1.0, 0.4, 1.0] };
+                lines.extend(make_ring(pos, r * 1.6, 16, ring_col));
+            }
 
-        // --- Ports ---
-        if self.show_ports {
-            let rr = &self.world.rigid_sp3;
-            let neigh_bs = self.world.dyn_atoms.atoms.neigh_bs.as_slice();
-            let port_col = [1.0f32, 0.5, 0.0, 1.0];
-            for i in 0..natoms {
-                let pi = Vec3::new(ps[i].x as f32, ps[i].y as f32, ps[i].z as f32);
-                let bs = neigh_bs[i].as_array();
-                let np = rr.nport[i] as usize;
-                for s in 0..np {
-                    let ib = bs[s];
-                    if ib < 0 { continue; }
-                    let l0 = self.world.uff.bon_params.as_slice()[ib as usize][1];
-                    let tip = rr.get_port_tip(ps, i, s, l0);
-                    let pt = Vec3::new(tip.x as f32, tip.y as f32, tip.z as f32);
-                    lines.push(LineVertex { pos: [pi.x, pi.y, pi.z], col: port_col });
-                    lines.push(LineVertex { pos: [pt.x, pt.y, pt.z], col: port_col });
+            // --- Ray from picked atom to cursor ---
+            if let Some(idx) = self.selected {
+                let atom_pos = Vec3::new(ps[idx].x as f32, ps[idx].y as f32, ps[idx].z as f32);
+                let (ray0, _) = self.cam.screen_ray(self.prev_mouse, self.window_size.0, self.window_size.1);
+                let red = [1.0f32, 0.0, 0.0, 1.0];
+                lines.push(LineVertex { pos: [atom_pos.x, atom_pos.y, atom_pos.z], col: red });
+                lines.push(LineVertex { pos: [ray0.x, ray0.y, ray0.z], col: red });
+            }
+        } else {
+            // ===== EDIT MODE =====
+            // --- Hex grid reference points (2D lattice dots) ---
+            if self.show_hex_grid {
+                let grid_col = [0.4f32, 0.4, 0.4, 0.4];
+                for p in collect_hex_grid_points(&self.builder.hex_tiles, self.kekule_editor.a_cc) {
+                    let sz = 0.03f32;
+                    let pos = Vec3::new(p.x as f32, p.y as f32, p.z as f32);
+                    lines.extend(make_crosshair(pos, sz, grid_col));
+                }
+            }
+
+            // --- Ghost hex reference points ---
+            if self.show_ghost_hexes {
+                let ghost_col = [0.3f32, 0.3, 0.3, 0.3];
+                for p in collect_hex_grid_points(&self.builder.hex_tiles, self.kekule_editor.a_cc) {
+                    let sz = 0.02f32;
+                    let pos = Vec3::new(p.x as f32, p.y as f32, p.z as f32);
+                    lines.extend(make_crosshair(pos, sz, ghost_col));
+                }
+            }
+
+            // --- Builder bonds ---
+            let bbond_col = [0.9f32, 0.7, 0.3, 0.8];
+            for (a, b) in collect_builder_bonds(&self.builder) {
+                lines.push(LineVertex { pos: [a.x as f32, a.y as f32, a.z as f32], col: bbond_col });
+                lines.push(LineVertex { pos: [b.x as f32, b.y as f32, b.z as f32], col: bbond_col });
+            }
+
+            // --- Builder atoms as colored crosses (larger, element-colored) ---
+            for (pos, el) in collect_builder_atoms(&self.builder) {
+                let sz = 0.12f32;
+                let col = element_color(&el);
+                let p = Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32);
+                lines.extend(make_crosshair(p, sz, col));
+            }
+
+            // --- Picking highlight ring for builder atoms ---
+            if let Some(idx) = self.selected {
+                if let Some((ah, _)) = self.builder.iter_atoms().nth(idx) {
+                    if self.builder.is_atom_alive(ah) {
+                        let ad = self.builder.atom(ah);
+                        let pos = Vec3::new(ad.pos.x as f32, ad.pos.y as f32, ad.pos.z as f32);
+                        let ring_col: [f32; 4] = [0.0, 1.0, 0.4, 1.0];
+                        lines.extend(make_ring(pos, 0.25, 16, ring_col));
+                    }
                 }
             }
         }
 
-        // --- Picking highlight ring ---
-        if let Some(idx) = self.selected {
-            let pos = Vec3::new(ps[idx].x as f32, ps[idx].y as f32, ps[idx].z as f32);
-            let r = if self.show_ports { 0.03 } else { self.params.element_radius_vdw(&self.elems[idx]) * ATOM_SCALE };
-            let ring_col: [f32; 4] = if self.pinned[idx] { [1.0, 1.0, 0.0, 1.0] } else { [0.0, 1.0, 0.4, 1.0] };
-            lines.extend(make_ring(pos, r * 1.6, 16, ring_col));
-        }
-
-        // --- Ray from picked atom to cursor ---
-        if let Some(idx) = self.selected {
-            let atom_pos = Vec3::new(ps[idx].x as f32, ps[idx].y as f32, ps[idx].z as f32);
-            let (ray0, _) = self.cam.screen_ray(self.prev_mouse, self.window_size.0, self.window_size.1);
-            let red = [1.0f32, 0.0, 0.0, 1.0];
-            lines.push(LineVertex { pos: [atom_pos.x, atom_pos.y, atom_pos.z], col: red });
-            lines.push(LineVertex { pos: [ray0.x, ray0.y, ray0.z], col: red });
-        }
+        // --- Axes (always visible) ---
+        lines.extend(make_axes([0.0, 0.0, 0.0], 1.0));
 
         // --- Debug cursor: mouse ray origin + direction ---
         if self.show_debug_cursor {
@@ -321,39 +385,6 @@ impl App {
             let r_end = ro + rd * 20.0;
             lines.push(LineVertex { pos: [ro.x, ro.y, ro.z], col: yellow });
             lines.push(LineVertex { pos: [r_end.x, r_end.y, r_end.z], col: yellow });
-        }
-
-        // --- Builder visualization (when in edit mode) ---
-        if self.show_kekule_editor {
-            // Hex tile outlines
-            if self.show_hex_grid {
-                let hex_col = [0.0f32, 1.0, 1.0, 0.6];
-                for (a, b) in collect_hex_lines(&self.builder.hex_tiles, self.kekule_editor.a_cc) {
-                    lines.push(LineVertex { pos: [a.x as f32, a.y as f32, a.z as f32], col: hex_col });
-                    lines.push(LineVertex { pos: [b.x as f32, b.y as f32, b.z as f32], col: hex_col });
-                }
-            }
-            // Ghost hex outlines for empty neighbors
-            if self.show_ghost_hexes {
-                let ghost_col = [0.3f32, 0.3, 0.3, 0.3];
-                for (a, b) in collect_ghost_hexes(&self.builder.hex_tiles, self.kekule_editor.a_cc) {
-                    lines.push(LineVertex { pos: [a.x as f32, a.y as f32, a.z as f32], col: ghost_col });
-                    lines.push(LineVertex { pos: [b.x as f32, b.y as f32, b.z as f32], col: ghost_col });
-                }
-            }
-            // Builder bonds
-            let bbond_col = [0.9f32, 0.7, 0.3, 0.8];
-            for (a, b) in collect_builder_bonds(&self.builder) {
-                lines.push(LineVertex { pos: [a.x as f32, a.y as f32, a.z as f32], col: bbond_col });
-                lines.push(LineVertex { pos: [b.x as f32, b.y as f32, b.z as f32], col: bbond_col });
-            }
-            // Builder atoms as small crosses
-            let atom_col = [1.0f32, 0.0, 0.0, 0.8];
-            for (pos, _el) in collect_builder_atoms(&self.builder) {
-                let sz = 0.05f32;
-                let p = Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32);
-                lines.extend(make_crosshair(p, sz, atom_col));
-            }
         }
 
         lines
@@ -382,20 +413,26 @@ impl App {
                     if !egui_consumed {
                         let dpix = (self.mouse_now - self.mouse_down).length();
                         if dpix < 5.0 {
-                            // In hex/atom edit mode, click modifies builder
-                            match self.kekule_editor.edit_mode {
-                                EditMode::Select => {
-                                    self.selected = if self.selected == self.pick_atom(self.mouse_now) { None } else { self.pick_atom(self.mouse_now) };
-                                }
-                                EditMode::HexPaint | EditMode::HexToggle | EditMode::AtomDraw => {
-                                    if let Some(pos_ws) = self.mouse_ray_z0(self.mouse_now) {
-                                        if self.kekule_editor.on_click(&mut self.builder, pos_ws) {
-                                            self.edit_from_builder = true;
-                                            println!("Builder modified: {}", builder_summary(&self.builder));
+                            if self.show_kekule_editor {
+                                // ===== EDIT MODE =====
+                                match self.kekule_editor.edit_mode {
+                                    EditMode::Select => {
+                                        let picked = self.pick_builder_atom(self.mouse_now);
+                                        self.selected = if self.selected == picked { None } else { picked };
+                                    }
+                                    EditMode::HexPaint | EditMode::HexToggle | EditMode::AtomDraw => {
+                                        if let Some(pos_ws) = self.mouse_ray_z0(self.mouse_now) {
+                                            if self.kekule_editor.on_click(&mut self.builder, pos_ws) {
+                                                self.edit_from_builder = true;
+                                                println!("Builder modified: {}", builder_summary(&self.builder));
+                                            }
                                         }
                                     }
+                                    _ => {}
                                 }
-                                _ => {}
+                            } else {
+                                // ===== SIMULATION MODE =====
+                                self.selected = if self.selected == self.pick_atom(self.mouse_now) { None } else { self.pick_atom(self.mouse_now) };
                             }
                             needs_redraw = true;
                         }
@@ -408,16 +445,21 @@ impl App {
                 } else {
                     self.trackballing = false;
                     if !egui_consumed {
-                        match self.kekule_editor.edit_mode {
-                            EditMode::HexPaint | EditMode::HexToggle => {
-                                if let Some(pos_ws) = self.mouse_ray_z0(self.mouse_now) {
-                                    if self.kekule_editor.on_right_click(&mut self.builder, pos_ws) {
-                                        self.edit_from_builder = true;
-                                        println!("Builder modified (right-click): {}", builder_summary(&self.builder));
+                        if self.show_kekule_editor {
+                            match self.kekule_editor.edit_mode {
+                                EditMode::HexPaint | EditMode::HexToggle => {
+                                    if let Some(pos_ws) = self.mouse_ray_z0(self.mouse_now) {
+                                        if self.kekule_editor.on_right_click(&mut self.builder, pos_ws) {
+                                            self.edit_from_builder = true;
+                                            println!("Builder modified (right-click): {}", builder_summary(&self.builder));
+                                        }
                                     }
                                 }
+                                EditMode::Select | EditMode::AtomDraw => { self.selected = None; }
+                                _ => {}
                             }
-                            _ => { self.selected = None; }
+                        } else {
+                            self.selected = None;
                         }
                     }
                     needs_redraw = true;
@@ -477,12 +519,41 @@ impl App {
         Some(Vec3d::new(ro.x + rd.x * t, ro.y + rd.y * t, 0.0))
     }
 
+    /// Rebuild full instance array (pos, radius, color) from current world + elems.
+    /// Needed after Bake to Sim when natoms or element types change.
+    fn rebuild_instances(&mut self) {
+        let natoms = self.world.natoms();
+        if natoms > self.renderer.max_atoms() {
+            let w = self.config.width;
+            let h = self.config.height;
+            let mut renderer = ImpostorRenderer::new(self.device.clone(), self.queue.clone(), natoms.max(1), self.config.format);
+            renderer.set_target_size(w, h);
+            self.renderer = renderer;
+        }
+        self.instances.clear();
+        self.instances.reserve(natoms);
+        let ps = self.world.dyn_atoms.atoms.apos.as_slice();
+        for i in 0..natoms {
+            let el = self.elems.get(i).map(|s| s.as_str()).unwrap_or("C");
+            let col = self.params.element_color_f32(el);
+            let r = self.params.element_radius_vdw(el) * ATOM_SCALE;
+            let p = &ps[i];
+            self.instances.push(AtomInstance { pos: [p.x as f32, p.y as f32, p.z as f32], radius: r, color: col, _pad: 0.0 });
+        }
+        self.renderer.set_atoms(&self.instances);
+    }
+
     /// Upload GPU data only when dirty. Called before render.
     fn prepare(&mut self) {
         if self.dirty.atoms {
-            let ps = self.world.dyn_atoms.atoms.apos.as_slice();
-            for i in 0..self.world.natoms() { let p = &ps[i]; self.instances[i].pos = [p.x as f32, p.y as f32, p.z as f32]; }
-            self.renderer.set_atoms(&self.instances);
+            let natoms = self.world.natoms();
+            if self.instances.len() != natoms {
+                self.rebuild_instances();
+            } else {
+                let ps = self.world.dyn_atoms.atoms.apos.as_slice();
+                for i in 0..natoms { let p = &ps[i]; self.instances[i].pos = [p.x as f32, p.y as f32, p.z as f32]; }
+                self.renderer.set_atoms(&self.instances);
+            }
             self.dirty.atoms = false;
         }
         if self.dirty.camera {
@@ -583,7 +654,13 @@ impl App {
         };
         let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let cam = self.cam.camera_data(self.config.width, self.config.height);
-        self.renderer.render(&view, wgpu::Color { r: 0.08, g: 0.08, b: 0.12, a: 1.0 }, &cam);
+        if self.show_kekule_editor {
+            self.renderer.set_atoms(&[]);
+        }
+        self.renderer.render(&view, wgpu::Color { r: 0.08, g: 0.08, b: 0.08, a: 1.0 }, &cam);
+        if self.show_kekule_editor {
+            self.renderer.set_atoms(&self.instances);
+        }
 
         // --- Surface potential textured quad ---
         if self.show_surface {
@@ -658,13 +735,25 @@ impl App {
                 .title_bar(false)
                 .frame(egui::Frame::none().fill(egui::Color32::from_rgba_premultiplied(0, 0, 0, 180)))
                 .show(ctx, |ui| {
-                    ui.label(egui::RichText::new(format!("Atom {}: {}", idx, self.elems[idx])).size(18.0).color(egui::Color32::YELLOW));
-                    let pin_text = if self.pinned[idx] { "[PINNED]  Press P to unpin" } else { "Press P to pin" };
-                    ui.label(egui::RichText::new(pin_text).size(14.0).color(if self.pinned[idx] { egui::Color32::from_rgb(255, 160, 0) } else { egui::Color32::GRAY }));
-                    let pos = self.world.dyn_atoms.atoms.apos.as_slice()[idx];
-                    ui.label(egui::RichText::new(format!("pos: {:.3} {:.3} {:.3}", pos.x, pos.y, pos.z)).size(14.0).color(egui::Color32::GRAY));
-                    let r = self.params.element_radius_vdw(&self.elems[idx]);
-                    ui.label(egui::RichText::new(format!("RvdW = {:.3} Å", r)).size(14.0).color(egui::Color32::GRAY));
+                    if self.show_kekule_editor {
+                        // Builder atom info
+                        if let Some((_, ad)) = self.builder.iter_atoms().nth(idx) {
+                            ui.label(egui::RichText::new(format!("Atom {}: {}", idx, ad.element)).size(18.0).color(egui::Color32::YELLOW));
+                            ui.label(egui::RichText::new(format!("pos: {:.3} {:.3} {:.3}", ad.pos.x, ad.pos.y, ad.pos.z)).size(14.0).color(egui::Color32::GRAY));
+                            let r = self.params.element_radius_vdw(&ad.element);
+                            ui.label(egui::RichText::new(format!("RvdW = {:.3} Å", r)).size(14.0).color(egui::Color32::GRAY));
+                            if ad.is_h_cap { ui.label(egui::RichText::new("[H-cap]").size(14.0).color(egui::Color32::from_rgb(255, 160, 0))); }
+                        }
+                    } else {
+                        // Sim atom info
+                        ui.label(egui::RichText::new(format!("Atom {}: {}", idx, self.elems[idx])).size(18.0).color(egui::Color32::YELLOW));
+                        let pin_text = if self.pinned[idx] { "[PINNED]  Press P to unpin" } else { "Press P to pin" };
+                        ui.label(egui::RichText::new(pin_text).size(14.0).color(if self.pinned[idx] { egui::Color32::from_rgb(255, 160, 0) } else { egui::Color32::GRAY }));
+                        let pos = self.world.dyn_atoms.atoms.apos.as_slice()[idx];
+                        ui.label(egui::RichText::new(format!("pos: {:.3} {:.3} {:.3}", pos.x, pos.y, pos.z)).size(14.0).color(egui::Color32::GRAY));
+                        let r = self.params.element_radius_vdw(&self.elems[idx]);
+                        ui.label(egui::RichText::new(format!("RvdW = {:.3} Å", r)).size(14.0).color(egui::Color32::GRAY));
+                    }
                 });
         }
 
@@ -768,10 +857,101 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.button("Cleanup Dead").clicked() { self.builder.cleanup_dead(); self.edit_from_builder = true; }
                         if ui.button("Bake to Sim").clicked() {
+                            let had_nonbonded = self.world.nonbonded.is_some();
+                            let had_surface = self.world.surface.is_some();
                             self.builder.cleanup_dead();
                             let top = self.builder.bake();
-                            // TODO: rebuild MolWorld from topology
-                            println!("Baked topology: {} atoms, {} bonds", top.natoms(), top.bonds.len());
+                            let elems = self.builder.bake_elements();
+                            self.world = MolWorld::from_topology(&top);
+                            self.world.make_neigh_bs();
+                            self.world.bake_angle_neighs();
+                            self.world.bake_dihedral_neighs();
+                            self.world.bake_inversion_neighs();
+                            self.world.map_atom_interactions();
+                            self.elems = elems;
+                            let natoms = self.world.natoms();
+                            self.pinned = vec![false; natoms];
+                            let neighs_q4 = self.world.dyn_atoms.neighs();
+                            let neighs: Vec<[i32; 4]> = neighs_q4.iter().map(|n| [n.x, n.y, n.z, n.w]).collect();
+                            self.uff_types = assign_uff::assign_uff_types(&self.elems, &neighs);
+                            self.charges = vec![0.0; natoms];
+                            self.selected = None;
+                            // Forcefield rebuild (MUST be done after every bake)
+                            if had_nonbonded {
+                                self.world.nonbonded = Some(NonBondedFF::new(natoms));
+                                self.world.nonbonded.as_mut().unwrap().make_second_neighs(neighs_q4, natoms);
+                                self.world.nonbonded.as_mut().unwrap().set_cutoff(8.0);
+                            }
+                            let has_sp2 = self.uff_types.iter().any(|t| matches!(t.as_str(), "C_R"|"C_2"|"N_R"|"O_2"|"O_R"));
+                            if has_sp2 { self.world.bonded_mode = BondedFFMode::Uff; }
+                            self.world.rigid_sp3.set_port_geometry_from_types(&self.uff_types);
+                            let have_params = !self.params.elements.is_empty() && !self.params.atom_types.is_empty() && !self.params.bonds.is_empty() && !self.params.angles.is_empty();
+                            if have_params {
+                                if let Some(ref mut nb) = self.world.nonbonded {
+                                    for i in 0..natoms {
+                                        let t = self.uff_types[i].as_str();
+                                        let mut req = get_reqh(&self.params, t);
+                                        if self.charges[i] != 0.0 { req[2] = self.charges[i]; }
+                                        nb.reqs.as_mut_slice()[i] = req;
+                                    }
+                                    nb.make_plqs(2.0);
+                                }
+                                for ib in 0..self.world.uff.nbonds as usize {
+                                    let b = self.world.uff.bon_atoms.as_slice()[ib];
+                                    let ia = b[0] as usize; let ja = b[1] as usize;
+                                    let a = self.elems[ia].as_str();
+                                    let b = self.elems[ja].as_str();
+                                    if let Some(bp) = self.params.get_bond_param(a, b, 1) { self.world.uff.bon_params.as_mut_slice()[ib] = [bp.k, bp.l0]; } else { panic!("missing bond param for {}-{} order=1", a, b); }
+                                }
+                                for ia in 0..self.world.uff.nangles as usize {
+                                    let ang = self.world.uff.ang_atoms.as_slice()[ia];
+                                    let i0 = ang[0] as usize; let i1 = ang[1] as usize; let i2 = ang[2] as usize;
+                                    let a = self.elems[i0].as_str();
+                                    let b = self.elems[i1].as_str();
+                                    let c = self.elems[i2].as_str();
+                                    let ap = self.params.get_angle_param(a, b, c).unwrap_or_else(|| panic!("missing angle param for {}-{}-{}", a, b, c));
+                                    let th0 = ap.a0.to_radians();
+                                    let ct = th0.cos();
+                                    let st2 = 1.0 - ct * ct;
+                                    assert!(st2 > 1e-12, "invalid angle theta0={} deg leads to sin^2(theta0)~0", ap.a0);
+                                    let c2 = 1.0 / (4.0 * st2);
+                                    let c1 = -4.0 * c2 * ct;
+                                    let c0 = c2 * (2.0 * ct * ct + 1.0);
+                                    self.world.uff.ang_params.as_mut_slice()[ia] = [ap.k, c0, c1, c2, 0.0];
+                                }
+                                for id in 0..self.world.uff.ndihedrals as usize {
+                                    let d = self.world.uff.dih_atoms.as_slice()[id];
+                                    let a = self.uff_types[d.x as usize].as_str();
+                                    let b = self.uff_types[d.y as usize].as_str();
+                                    let c = self.uff_types[d.z as usize].as_str();
+                                    let e = self.uff_types[d.w as usize].as_str();
+                                    if let Some(dp) = self.params.get_dihedral_param(a, b, c, e, 1) {
+                                        let a0 = dp.a0.to_radians();
+                                        let n = dp.n as f64;
+                                        let phase = n * a0;
+                                        let s = phase.sin().abs();
+                                        if s > 1e-3 { panic!("dihedral phase not supported by current Uff dihedral form: {}-{}-{}-{} a0={}deg n={} => n*a0={}deg", a, b, c, e, dp.a0, dp.n, phase.to_degrees()); }
+                                        let dsign = if phase.cos() >= 0.0 { 1.0 } else { -1.0 };
+                                        self.world.uff.dih_params.as_mut_slice()[id] = [dp.k, dsign, dp.n as f64];
+                                    } else {
+                                        self.world.uff.dih_params.as_mut_slice()[id] = [0.0, 1.0, 3.0];
+                                    }
+                                }
+                                for ii in 0..self.world.uff.ninversions as usize {
+                                    let inv = self.world.uff.inv_atoms.as_slice()[ii];
+                                    let ic = inv.x as usize;
+                                    let t = self.uff_types[ic].as_str();
+                                    if matches!(t, "C_R"|"C_2"|"N_R"|"O_2"|"O_R") { self.world.uff.inv_params.as_mut_slice()[ii] = [50.0, 1.0, -1.0, 0.0]; } else { self.world.uff.inv_params.as_mut_slice()[ii] = [0.0, 1.0, -1.0, 0.0]; }
+                                }
+                            }
+                            if had_surface {
+                                self.world.setup_nacl_surface(LATTICE_A, SURFACE_Z0 as f64, BETA_CHARGE, BETA_MORSE_RATIO, Q_AMP, PLQ_AMP);
+                            }
+                            self.world.update_hneigh();
+                            self.rebuild_instances();
+                            self.dirty.atoms = true;
+                            println!("Baked to sim: {} atoms, {} bonds", self.world.natoms(), top.bonds.len());
+                            self.show_kekule_editor = false; // switch to sim mode after bake
                         }
                         if ui.button("Export XYZ").clicked() {
                             let xyz = export_xyz(&self.builder);
@@ -871,26 +1051,51 @@ impl App {
             let vp = glam::Mat4::from_cols_array_2d(&cam.view_proj);
             let w = self.config.width as f32;
             let h = self.config.height as f32;
-            for i in 0..self.world.natoms() {
-                let p = self.world.dyn_atoms.atoms.apos.as_slice()[i];
-                let world_pos = glam::Vec4::new(p.x as f32, p.y as f32, p.z as f32, 1.0);
-                let clip = vp * world_pos;
-                if clip.w <= 0.0 { continue; }
-                let ndc = glam::Vec2::new(clip.x / clip.w, clip.y / clip.w);
-                if ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 { continue; }
-                let sp = glam::Vec2::new((ndc.x + 1.0) * 0.5 * w, (1.0 - (ndc.y + 1.0) * 0.5) * h);
-                let txt = match self.label_mode {
-                    LabelMode::None => continue,
-                    LabelMode::AtomNumber => format!("{}", i),
-                    LabelMode::AtomType => self.uff_types.get(i).cloned().unwrap_or_else(|| self.elems[i].clone()),
-                    LabelMode::Charge => format!("{:.2}", self.charges.get(i).unwrap_or(&0.0)),
-                    LabelMode::ElementName => self.elems[i].clone(),
-                };
-                egui::Area::new(egui::Id::new(("atom_label", i)))
-                    .fixed_pos(egui::pos2(sp.x, sp.y + 5.0))
-                    .show(ctx, |ui| {
-                        ui.add(egui::Label::new(egui::RichText::new(&txt).size(12.0).color(egui::Color32::WHITE)).extend());
-                    });
+            if self.show_kekule_editor {
+                // Builder atom labels
+                for (i, (_, ad)) in self.builder.iter_atoms().enumerate() {
+                    let world_pos = glam::Vec4::new(ad.pos.x as f32, ad.pos.y as f32, ad.pos.z as f32, 1.0);
+                    let clip = vp * world_pos;
+                    if clip.w <= 0.0 { continue; }
+                    let ndc = glam::Vec2::new(clip.x / clip.w, clip.y / clip.w);
+                    if ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 { continue; }
+                    let sp = glam::Vec2::new((ndc.x + 1.0) * 0.5 * w, (1.0 - (ndc.y + 1.0) * 0.5) * h);
+                    let txt = match self.label_mode {
+                        LabelMode::None => continue,
+                        LabelMode::AtomNumber => format!("{}", i),
+                        LabelMode::AtomType => ad.element.clone(),
+                        LabelMode::Charge => format!("{:.2}", 0.0),
+                        LabelMode::ElementName => ad.element.clone(),
+                    };
+                    egui::Area::new(egui::Id::new(("builder_label", i)))
+                        .fixed_pos(egui::pos2(sp.x, sp.y + 5.0))
+                        .show(ctx, |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(&txt).size(12.0).color(egui::Color32::WHITE)).extend());
+                        });
+                }
+            } else {
+                // Sim atom labels
+                for i in 0..self.world.natoms() {
+                    let p = self.world.dyn_atoms.atoms.apos.as_slice()[i];
+                    let world_pos = glam::Vec4::new(p.x as f32, p.y as f32, p.z as f32, 1.0);
+                    let clip = vp * world_pos;
+                    if clip.w <= 0.0 { continue; }
+                    let ndc = glam::Vec2::new(clip.x / clip.w, clip.y / clip.w);
+                    if ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 { continue; }
+                    let sp = glam::Vec2::new((ndc.x + 1.0) * 0.5 * w, (1.0 - (ndc.y + 1.0) * 0.5) * h);
+                    let txt = match self.label_mode {
+                        LabelMode::None => continue,
+                        LabelMode::AtomNumber => format!("{}", i),
+                        LabelMode::AtomType => self.uff_types.get(i).cloned().unwrap_or_else(|| self.elems[i].clone()),
+                        LabelMode::Charge => format!("{:.2}", self.charges.get(i).unwrap_or(&0.0)),
+                        LabelMode::ElementName => self.elems[i].clone(),
+                    };
+                    egui::Area::new(egui::Id::new(("atom_label", i)))
+                        .fixed_pos(egui::pos2(sp.x, sp.y + 5.0))
+                        .show(ctx, |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(&txt).size(12.0).color(egui::Color32::WHITE)).extend());
+                        });
+                }
             }
         }
     }

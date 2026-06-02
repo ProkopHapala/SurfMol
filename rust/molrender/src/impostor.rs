@@ -281,6 +281,9 @@ impl ImpostorRenderer {
     /// Access depth view for subsequent render passes (e.g. lines).
     pub fn depth_view(&self) -> &wgpu::TextureView { &self.depth_view }
 
+    #[inline(always)]
+    pub fn max_atoms(&self) -> usize { self.max_atoms }
+
     /// Resize depth buffer to match target dimensions.
     pub fn set_target_size(&mut self, width: u32, height: u32) {
         if self.depth_tex.width() != width || self.depth_tex.height() != height {
@@ -319,8 +322,6 @@ impl ImpostorRenderer {
 
     /// Render all atoms into `target_view`.
     pub fn render(&self, target_view: &wgpu::TextureView, clear: wgpu::Color, camera: &CameraData) {
-        if self.atom_count == 0 { return; }
-
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::cast_slice(&[*camera]));
         let bind_group = self.make_bind_group();
 
@@ -351,11 +352,13 @@ impl ImpostorRenderer {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.set_vertex_buffer(0, self.quad_vb.slice(..));
-            pass.set_index_buffer(self.quad_ib.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..self.num_indices, 0, 0..self.atom_count as u32);
+            if self.atom_count > 0 {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_vertex_buffer(0, self.quad_vb.slice(..));
+                pass.set_index_buffer(self.quad_ib.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..self.num_indices, 0, 0..self.atom_count as u32);
+            }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
     }

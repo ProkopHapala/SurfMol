@@ -131,6 +131,26 @@ impl Builder {
     #[inline(always)] pub fn bond(&self, b: BondH) -> &BondData { Self::slot_get(&self.bonds, b.idx, b.gen) }
     #[inline(always)] pub fn bond_mut(&mut self, b: BondH) -> &mut BondData { Self::slot_get_mut(&mut self.bonds, b.idx, b.gen) }
 
+    /// Find the nearest live atom to `pos` within `radius`. Returns (handle, distance²) or None.
+    pub fn find_nearest_atom(&self, pos: Vec3d, radius: f64) -> Option<(AtomH, f64)> {
+        let r2 = radius * radius;
+        let mut best = None;
+        let mut best_d2 = r2;
+        for (ah, ad) in self.iter_atoms() {
+            let d2 = Vec3d::set_sub(ad.pos, pos).norm2();
+            if d2 < best_d2 { best_d2 = d2; best = Some((ah, d2)); }
+        }
+        best
+    }
+
+    /// Change the element of an existing atom.
+    pub fn set_atom_element(&mut self, a: AtomH, element: &str) {
+        assert!(self.is_atom_alive(a), "set_atom_element: stale or dead handle {:?}", a);
+        let ad = self.atom_mut(a);
+        ad.element = element.to_string();
+        ad.atype = Self::element_to_z(element);
+    }
+
     /// Iterate over all live atoms (handle, data).
     pub fn iter_atoms(&self) -> impl Iterator<Item = (AtomH, &AtomData)> {
         self.atoms.iter().enumerate().filter_map(|(i, slot)| {
@@ -307,6 +327,17 @@ impl Builder {
             }
         }
         println!("}}");
+    }
+
+    /// Return elements for live atoms in the same order as `bake()` produces topology atoms.
+    pub fn bake_elements(&self) -> Vec<String> {
+        let mut elems = Vec::new();
+        for s in &self.atoms {
+            if let Some(a) = &s.val {
+                if a.alive { elems.push(a.element.clone()); }
+            }
+        }
+        elems
     }
 
     pub fn bake(&mut self) -> Topology {
