@@ -125,9 +125,9 @@ fn main() {
     }).collect();
 
     let top = if let Some(r) = rcut {
-        Builder::from_positions_cutoff(&sys.apos, r).bake()
+        Builder::from_positions_cutoff(&sys.apos, &sys.elems, r).bake()
     } else {
-        Builder::from_positions_and_radii(&sys.apos, &radii, tol).bake()
+        Builder::from_positions_and_radii(&sys.apos, &sys.elems, &radii, tol).bake()
     };
 
     println!("Topology: {} atoms, {} bonds, {} angles, {} dihedrals, {} inversions",

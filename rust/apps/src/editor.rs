@@ -14,6 +14,7 @@ use surfmol_topology::assign_uff;
 use surfmol_topology::builder;
 use surfmol_topology::params::{Params, get_reqh};
 use surfmol_apps::gui::trackball::TrackballCam;
+use surfmol_apps::gui::kekule_editor::{KekuleEditor, EditMode, AtomType, collect_hex_lines, collect_ghost_hexes, collect_builder_bonds, collect_builder_atoms, export_xyz, builder_summary};
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -67,6 +68,13 @@ struct App {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     etot: f64, eb: f64, ea: f64, ed: f64, ei: f64, enb: f64, es: f64,
+    // --- Kekule editor state ---
+    kekule_editor: KekuleEditor,
+    builder: builder::Builder,
+    show_kekule_editor: bool,
+    show_hex_grid: bool,
+    show_ghost_hexes: bool,
+    edit_from_builder: bool,
 }
 
 impl App {
@@ -125,7 +133,7 @@ impl App {
         else { println!("WARNING: .dat files not found in {:?}; running with dummy radii/REQs/bond params", dat_dir); }
 
         let radii: Vec<f64> = if have_params { elems.iter().map(|el| params.get_element_type(el).map(|et| et.r_cov).unwrap_or(1.0)).collect() } else { elems.iter().map(|el| match el.as_str() { "H" => 0.31, "C" => 0.76, "N" => 0.71, "O" => 0.66, _ => 1.0 }).collect() };
-        let mut b = builder::Builder::from_positions_and_radii(&apos_v3d, &radii, 0.4);
+        let mut b = builder::Builder::from_positions_and_radii(&apos_v3d, &elems, &radii, 0.4);
         let top = b.bake(); let mut world = MolWorld::from_topology(&top);
         world.make_neigh_bs(); world.bake_angle_neighs(); world.bake_dihedral_neighs(); world.bake_inversion_neighs(); world.map_atom_interactions();
         world.nonbonded = Some(NonBondedFF::new(world.natoms()));
@@ -185,7 +193,8 @@ impl App {
         renderer.set_atoms(&instances);
         let mut dirty = Dirty::default(); dirty.atoms = false; dirty.camera = true; dirty.bonds = false; dirty.surface = false; dirty.groups = false;
         println!("App initialized. Controls: H=help  SPACE=relax  S=surface  B=bonds  P=pin  ESC=deselect");
-        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: true, show_help: true, show_groups: false, show_ports: false, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: 0.0, zero_v_on_opposition: true, per_frame, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0 };
+        let kekule_editor = KekuleEditor::new();
+        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: true, show_help: true, show_groups: false, show_ports: false, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: 0.0, zero_v_on_opposition: true, per_frame, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0, kekule_editor, builder: b, show_kekule_editor: true, show_hex_grid: true, show_ghost_hexes: true, edit_from_builder: false };
         app.rebuild_surface_cache();
         app
     }
@@ -314,6 +323,39 @@ impl App {
             lines.push(LineVertex { pos: [r_end.x, r_end.y, r_end.z], col: yellow });
         }
 
+        // --- Builder visualization (when in edit mode) ---
+        if self.show_kekule_editor {
+            // Hex tile outlines
+            if self.show_hex_grid {
+                let hex_col = [0.0f32, 1.0, 1.0, 0.6];
+                for (a, b) in collect_hex_lines(&self.builder.hex_tiles, self.kekule_editor.a_cc) {
+                    lines.push(LineVertex { pos: [a.x as f32, a.y as f32, a.z as f32], col: hex_col });
+                    lines.push(LineVertex { pos: [b.x as f32, b.y as f32, b.z as f32], col: hex_col });
+                }
+            }
+            // Ghost hex outlines for empty neighbors
+            if self.show_ghost_hexes {
+                let ghost_col = [0.3f32, 0.3, 0.3, 0.3];
+                for (a, b) in collect_ghost_hexes(&self.builder.hex_tiles, self.kekule_editor.a_cc) {
+                    lines.push(LineVertex { pos: [a.x as f32, a.y as f32, a.z as f32], col: ghost_col });
+                    lines.push(LineVertex { pos: [b.x as f32, b.y as f32, b.z as f32], col: ghost_col });
+                }
+            }
+            // Builder bonds
+            let bbond_col = [0.9f32, 0.7, 0.3, 0.8];
+            for (a, b) in collect_builder_bonds(&self.builder) {
+                lines.push(LineVertex { pos: [a.x as f32, a.y as f32, a.z as f32], col: bbond_col });
+                lines.push(LineVertex { pos: [b.x as f32, b.y as f32, b.z as f32], col: bbond_col });
+            }
+            // Builder atoms as small crosses
+            let atom_col = [1.0f32, 0.0, 0.0, 0.8];
+            for (pos, _el) in collect_builder_atoms(&self.builder) {
+                let sz = 0.05f32;
+                let p = Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32);
+                lines.extend(make_crosshair(p, sz, atom_col));
+            }
+        }
+
         lines
     }
 
@@ -334,21 +376,52 @@ impl App {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 if *state == ElementState::Pressed {
-                    // Only start left-click drag if not clicking on an egui widget
                     if !egui_consumed { self.lmb_down = true; self.mouse_down = self.mouse_now; }
                 } else {
                     self.lmb_down = false;
-                    // Only pick atom on click-release if not interacting with egui
                     if !egui_consumed {
                         let dpix = (self.mouse_now - self.mouse_down).length();
-                        if dpix < 5.0 { self.selected = if self.selected == self.pick_atom(self.mouse_now) { None } else { self.pick_atom(self.mouse_now) }; needs_redraw = true; }
+                        if dpix < 5.0 {
+                            // In hex/atom edit mode, click modifies builder
+                            match self.kekule_editor.edit_mode {
+                                EditMode::Select => {
+                                    self.selected = if self.selected == self.pick_atom(self.mouse_now) { None } else { self.pick_atom(self.mouse_now) };
+                                }
+                                EditMode::HexPaint | EditMode::HexToggle | EditMode::AtomDraw => {
+                                    if let Some(pos_ws) = self.mouse_ray_z0(self.mouse_now) {
+                                        if self.kekule_editor.on_click(&mut self.builder, pos_ws) {
+                                            self.edit_from_builder = true;
+                                            println!("Builder modified: {}", builder_summary(&self.builder));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            needs_redraw = true;
+                        }
                     }
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Right, .. } => {
-                // Always allow right-click for camera rotation, never block it
-                if *state == ElementState::Pressed { self.trackballing = true; self.trackball_prev = self.mouse_now; }
-                else { self.trackballing = false; self.selected = None; needs_redraw = true; }
+                if *state == ElementState::Pressed {
+                    self.trackballing = true; self.trackball_prev = self.mouse_now;
+                } else {
+                    self.trackballing = false;
+                    if !egui_consumed {
+                        match self.kekule_editor.edit_mode {
+                            EditMode::HexPaint | EditMode::HexToggle => {
+                                if let Some(pos_ws) = self.mouse_ray_z0(self.mouse_now) {
+                                    if self.kekule_editor.on_right_click(&mut self.builder, pos_ws) {
+                                        self.edit_from_builder = true;
+                                        println!("Builder modified (right-click): {}", builder_summary(&self.builder));
+                                    }
+                                }
+                            }
+                            _ => { self.selected = None; }
+                        }
+                    }
+                    needs_redraw = true;
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Always allow zoom, even when hovering over egui widgets
@@ -369,7 +442,12 @@ impl App {
                         "p" | "P" => { if let Some(idx) = self.selected { self.pinned[idx] = !self.pinned[idx]; } needs_redraw = true; }
                         "c" | "C" => { self.cam = TrackballCam::new(Vec3::new(0.0, 1.0, 0.0), 6.0); self.dirty.camera = true; needs_redraw = true; }
                         "l" | "L" => { self.label_mode = match self.label_mode { LabelMode::None => LabelMode::AtomNumber, LabelMode::AtomNumber => LabelMode::AtomType, LabelMode::AtomType => LabelMode::Charge, LabelMode::Charge => LabelMode::ElementName, LabelMode::ElementName => LabelMode::None }; println!("label_mode = {:?}", self.label_mode); needs_redraw = true; }
+                        "e" | "E" => { self.show_kekule_editor = !self.show_kekule_editor; println!("show_kekule_editor = {}", self.show_kekule_editor); needs_redraw = true; }
                         "f" | "F" => { self.world.bonded_mode = match self.world.bonded_mode { BondedFFMode::Uff => BondedFFMode::RigidSp3, BondedFFMode::RigidSp3 => BondedFFMode::Uff }; println!("bonded_mode = {:?}", self.world.bonded_mode); needs_redraw = true; }
+                        "1" => { self.kekule_editor.set_edit_mode(EditMode::Select); println!("edit_mode = Select"); needs_redraw = true; }
+                        "2" => { self.kekule_editor.set_edit_mode(EditMode::HexPaint); println!("edit_mode = HexPaint"); needs_redraw = true; }
+                        "3" => { self.kekule_editor.set_edit_mode(EditMode::HexToggle); println!("edit_mode = HexToggle"); needs_redraw = true; }
+                        "4" => { self.kekule_editor.set_edit_mode(EditMode::AtomDraw); println!("edit_mode = AtomDraw"); needs_redraw = true; }
                         "n" | "N" => { if self.world.nonbonded.is_some() { self.world.nonbonded = None; println!("nonbonded = None"); } else { let mut nb = NonBondedFF::new(self.world.natoms()); nb.set_cutoff(8.0); self.world.nonbonded = Some(nb); println!("nonbonded = LJ+Coulomb"); } needs_redraw = true; }
                         "m" | "M" => { if self.world.surface.is_some() { self.world.surface = None; println!("surface = None"); } else { self.world.setup_nacl_surface(LATTICE_A, SURFACE_Z0 as f64, BETA_CHARGE, BETA_MORSE_RATIO, Q_AMP, PLQ_AMP); println!("surface = NaCl"); } self.rebuild_surface_cache(); needs_redraw = true; }
                         "[" => { self.pick_k *= 0.8; println!("pick_k = {}", self.pick_k); }
@@ -387,6 +465,17 @@ impl App {
     }
 
     fn is_shift_down(&self) -> bool { false } // TODO: track modifier state if needed
+
+    /// Compute world-space intersection of mouse ray with Z=0 plane.
+    fn mouse_ray_z0(&self, mouse: Vec2) -> Option<Vec3d> {
+        let (ro, rd) = self.cam.screen_ray(mouse, self.window_size.0, self.window_size.1);
+        let ro = Vec3d::new(ro.x as f64, ro.y as f64, ro.z as f64);
+        let rd = Vec3d::new(rd.x as f64, rd.y as f64, rd.z as f64);
+        if rd.z.abs() < 1e-6 { return None; }
+        let t = -ro.z / rd.z;
+        if t < 0.0 { return None; }
+        Some(Vec3d::new(ro.x + rd.x * t, ro.y + rd.y * t, 0.0))
+    }
 
     /// Upload GPU data only when dirty. Called before render.
     fn prepare(&mut self) {
@@ -641,6 +730,80 @@ impl App {
                 ui.label(egui::RichText::new(format!("Surface (M): {}", sf_str)).size(14.0).color(egui::Color32::YELLOW));
             });
 
+        // Kekule Editor panel (left side, below title)
+        if self.show_kekule_editor {
+            egui::Window::new("Kekule Editor")
+                .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 120.0))
+                .resizable(false)
+                .title_bar(true)
+                .frame(egui::Frame::window(&ctx.style()))
+                .show(ctx, |ui| {
+                    ui.heading("Edit Mode");
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(self.kekule_editor.edit_mode == EditMode::Select, "Select (1)").clicked() { self.kekule_editor.set_edit_mode(EditMode::Select); }
+                        if ui.selectable_label(self.kekule_editor.edit_mode == EditMode::HexPaint, "HexPaint (2)").clicked() { self.kekule_editor.set_edit_mode(EditMode::HexPaint); }
+                        if ui.selectable_label(self.kekule_editor.edit_mode == EditMode::HexToggle, "HexToggle (3)").clicked() { self.kekule_editor.set_edit_mode(EditMode::HexToggle); }
+                        if ui.selectable_label(self.kekule_editor.edit_mode == EditMode::AtomDraw, "AtomDraw (4)").clicked() { self.kekule_editor.set_edit_mode(EditMode::AtomDraw); }
+                    });
+                    ui.separator();
+                    ui.heading("Atom Type");
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(self.kekule_editor.atom_type == AtomType::C, "C").clicked() { self.kekule_editor.set_atom_type(AtomType::C); }
+                        if ui.selectable_label(self.kekule_editor.atom_type == AtomType::N, "N").clicked() { self.kekule_editor.set_atom_type(AtomType::N); }
+                        if ui.selectable_label(self.kekule_editor.atom_type == AtomType::O, "O").clicked() { self.kekule_editor.set_atom_type(AtomType::O); }
+                        if ui.selectable_label(self.kekule_editor.atom_type == AtomType::H, "H").clicked() { self.kekule_editor.set_atom_type(AtomType::H); }
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.kekule_editor.auto_h_cap, "Auto H");
+                        ui.checkbox(&mut self.kekule_editor.auto_bonds, "Auto Bonds");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.kekule_editor.grid_mode, "Grid Snap");
+                        ui.checkbox(&mut self.show_hex_grid, "Hex Grid");
+                        ui.checkbox(&mut self.show_ghost_hexes, "Ghost Hexes");
+                    });
+                    ui.separator();
+                    ui.label(format!("Builder: {}", builder_summary(&self.builder)));
+                    ui.horizontal(|ui| {
+                        if ui.button("Cleanup Dead").clicked() { self.builder.cleanup_dead(); self.edit_from_builder = true; }
+                        if ui.button("Bake to Sim").clicked() {
+                            self.builder.cleanup_dead();
+                            let top = self.builder.bake();
+                            // TODO: rebuild MolWorld from topology
+                            println!("Baked topology: {} atoms, {} bonds", top.natoms(), top.bonds.len());
+                        }
+                        if ui.button("Export XYZ").clicked() {
+                            let xyz = export_xyz(&self.builder);
+                            println!("=== XYZ Export ===\n{}", xyz);
+                        }
+                    });
+                    ui.separator();
+                    ui.heading("Ribbon");
+                    ui.horizontal(|ui| {
+                        ui.label("Rows:");
+                        ui.add(egui::DragValue::new(&mut self.kekule_editor.ribbon_rows).speed(1).clamp_range(1..=20));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Bottom:");
+                        ui.text_edit_singleline(&mut self.kekule_editor.ribbon_bottom);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Top:");
+                        ui.text_edit_singleline(&mut self.kekule_editor.ribbon_top);
+                    });
+                    if ui.button("Generate Ribbon").clicked() {
+                        let pass_bottom = surfmol_apps::gui::kekule_editor::parse_passivation_string(&self.kekule_editor.ribbon_bottom);
+                        let pass_top = surfmol_apps::gui::kekule_editor::parse_passivation_string(&self.kekule_editor.ribbon_top);
+                        let a_cc = self.kekule_editor.a_cc;
+                        let scale_x = 1.0;
+                        surfmol_apps::gui::kekule_editor::build_zigzag_ribbon(&mut self.builder, self.kekule_editor.ribbon_rows, pass_bottom.len() as i32, &pass_bottom, &pass_top, a_cc, scale_x);
+                        self.edit_from_builder = true;
+                        println!("Generated ribbon: {}", builder_summary(&self.builder));
+                    }
+                });
+        }
+
         // Help (bottom-left)
         if self.show_help {
             egui::Window::new("Help")
@@ -651,12 +814,15 @@ impl App {
                 .show(ctx, |ui| {
                     ui.label(egui::RichText::new("Controls:").size(16.0).color(egui::Color32::WHITE));
                     let help = [
-                        "LMB click atom     -> pick/unpick",
+                        "LMB click atom     -> pick/unpick (Select mode)",
+                        "LMB click          -> hex paint/toggle/atom (Edit mode)",
+                        "RMB click          -> unpick (Select) / remove hex (Edit)",
                         "Shift+LMB drag     -> pan camera",
                         "RMB drag           -> rotate camera",
-                        "RMB click          -> unpick",
                         "Scroll             -> zoom",
                         "SPACE              -> start/stop relaxation",
+                        "1/2/3/4            -> Select/HexPaint/HexToggle/AtomDraw",
+                        "E                  -> toggle Kekule editor panel",
                         "P                  -> pin/unpin picked atom",
                         "S                  -> toggle surface",
                         "B                  -> toggle bonds",
