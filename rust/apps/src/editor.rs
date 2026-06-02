@@ -13,6 +13,7 @@ use surfmol_common::xyz;
 use surfmol_topology::assign_uff;
 use surfmol_topology::builder;
 use surfmol_topology::params::{Params, get_reqh};
+use surfmol_apps::gui::trackball::TrackballCam;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -32,86 +33,6 @@ const PLQ_AMP: f64 = 1.0;
 const SURFACE_GRID_N: i32 = 256;
 const SURFACE_SIZE: f32 = 10.0;
 const GROUP_SIZE_DEFAULT: usize = 32;
-
-fn element_color_f32(elem: &str, params: &Params) -> [f32; 3] {
-    params.get_element_type(elem)
-        .map(|et| { let c = et.color; [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0] })
-        .unwrap_or([0.78, 0.78, 0.78])
-}
-
-fn element_radius(elem: &str, params: &Params) -> f32 {
-    params.get_element_type(elem).map(|et| et.r_vdw as f32).unwrap_or(1.0)
-}
-
-struct TrackballCam {
-    target: Vec3,
-    rotation: Quat,
-    target_rotation: Quat,
-    dist_cam: f32,
-    zoom: f32,
-    lerp_speed: f32,
-}
-
-impl TrackballCam {
-    fn new(target: Vec3, dist: f32) -> Self { Self { target, rotation: Quat::IDENTITY, target_rotation: Quat::IDENTITY, dist_cam: dist, zoom: dist, lerp_speed: 20.0 } }
-    fn pos(&self) -> Vec3 { self.target + self.rotation * Vec3::new(0.0, 0.0, self.dist_cam) }
-    fn fwd(&self) -> Vec3 { (self.target - self.pos()).normalize() }
-    fn up(&self) -> Vec3 { (self.rotation * Vec3::new(0.0, 1.0, 0.0)).normalize() }
-    fn right(&self) -> Vec3 { self.fwd().cross(self.up()).normalize() }
-    fn zoom(&mut self, delta: f32) { self.zoom *= 1.0 + delta * 0.1; self.zoom = self.zoom.clamp(0.2, 200.0); }
-    fn pan(&mut self, dx: f32, dy: f32) { let s = self.zoom * 0.001; self.target += self.right() * (-dx * s) + self.up() * (dy * s); }
-    fn mouse_to_sphere(&self, mouse: Vec2, w: f32, h: f32) -> Vec3 {
-        let radius = w.min(h) * 0.4; let x = (mouse.x - w * 0.5) / radius; let y = -(mouse.y - h * 0.5) / radius; let r2 = x * x + y * y;
-        if r2 <= 1.0 { Vec3::new(x, y, (1.0f32 - r2).sqrt()) } else { let s = 1.0f32 / r2.sqrt(); Vec3::new(x * s, y * s, 0.0) }
-    }
-    fn rotate(&mut self, prev: Vec2, curr: Vec2, w: f32, h: f32) {
-        let a = self.mouse_to_sphere(prev, w, h); let b = self.mouse_to_sphere(curr, w, h);
-        let q = Quat::from_rotation_arc(b, a); self.target_rotation = (self.target_rotation * q).normalize();
-    }
-    fn update(&mut self, dt: f32) {
-        let t = (self.lerp_speed * dt).clamp(0.0, 1.0);
-        self.rotation = self.rotation.slerp(self.target_rotation, t);
-    }
-    fn screen_ray(&self, mouse: Vec2, w: f32, h: f32) -> (Vec3, Vec3) {
-        let fwd = self.fwd(); let right = self.right(); let up = self.up();
-        let mx = mouse.x; let my = h - mouse.y;
-        let mbx = (2.0 * mx - w) * self.zoom / h; let mby = (2.0 * my - h) * self.zoom / h;
-        (self.pos() + right * mbx + up * mby, fwd)
-    }
-    fn camera_data(&self, w: u32, h: u32) -> CameraData {
-        let eye_v = self.pos(); let target_v = self.target; let up_v = self.up();
-        let eye = [eye_v.x, eye_v.y, eye_v.z];
-        let aspect = (w as f32 / h as f32).max(1e-6); let zoom = self.zoom;
-        let r = self.right(); let u = self.up(); let f = (eye_v - target_v).normalize();
-        // Build orthographic view-projection directly from camera basis
-        // Scale: X = 1/(zoom*aspect), Y = 1/zoom, Z = -1/(f-n)
-        let sx = 1.0 / (zoom * aspect);
-        let sy = 1.0 / zoom;
-        let sz = -1.0 / (1000.0 - 0.01);
-        let tz = -0.01 / (1000.0 - 0.01);
-        // Rotation: view matrix rows are camera basis
-        // Translation: -dot(basis, eye)
-        let tx = -(r.x * eye[0] + r.y * eye[1] + r.z * eye[2]);
-        let ty = -(u.x * eye[0] + u.y * eye[1] + u.z * eye[2]);
-        let tz_view = -(f.x * eye[0] + f.y * eye[1] + f.z * eye[2]);
-        // Combined ortho view-projection (row-major)
-        let vp = [
-            [sx * r.x, sx * r.y, sx * r.z, sx * tx],
-            [sy * u.x, sy * u.y, sy * u.z, sy * ty],
-            [sz * f.x, sz * f.y, sz * f.z, sz * tz_view + tz],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-        // Transpose for WGSL column-major
-        let vp = surfmol_molrender::impostor::transpose4x4(vp);
-        // Debug: verify ortho projection (m[3][0], m[3][1], m[3][2] should be 0 for ortho)
-        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-        if FIRST.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            println!("DEBUG: view_proj[3] = [{}, {}, {}, {}]", vp[3][0], vp[3][1], vp[3][2], vp[3][3]);
-            println!("DEBUG: view_proj[2][2] = {} (should be negative for ortho)", vp[2][2]);
-        }
-        CameraData { view_proj: vp, eye, _pad1: 0.0, right: [r.x, r.y, r.z], _pad2: 0.0, up: [u.x, u.y, u.z], _pad3: 0.0, forward: [f.x, f.y, f.z], ortho: 1.0, ray_shift: [10000.0, 0.0, 0.0, 0.0] }
-    }
-}
 
 fn ray_sphere(ro: Vec3, rd: Vec3, sc: Vec3, sr: f32) -> Option<f32> {
     let oc = ro - sc; let b = oc.dot(rd); let c = oc.dot(oc) - sr * sr; let disc = b * b - c;
@@ -254,8 +175,8 @@ impl App {
         let mut instances = Vec::with_capacity(natoms);
         for i in 0..natoms {
             let el = elems.get(i).map(|s| s.as_str()).unwrap_or("C");
-            let col = element_color_f32(el, &params);
-            let r = element_radius(el, &params) * ATOM_SCALE;
+            let col = params.element_color_f32(el);
+            let r = params.element_radius_vdw(el) * ATOM_SCALE;
             let p = &ps[i];
             instances.push(AtomInstance { pos: [p.x as f32, p.y as f32, p.z as f32], radius: r, color: col, _pad: 0.0 });
         }
@@ -321,6 +242,7 @@ impl App {
     }
 
     fn collect_lines(&self) -> Vec<LineVertex> {
+        use surfmol_apps::gui::gizmos::{make_bond_segments, make_ring, make_axes, make_crosshair};
         let mut lines = Vec::new();
         let ps = self.world.dyn_atoms.atoms.apos.as_slice();
         let natoms = self.world.natoms();
@@ -334,32 +256,20 @@ impl App {
                 let i0 = b[0] as usize; let i1 = b[1] as usize;
                 let p0 = Vec3::new(ps[i0].x as f32, ps[i0].y as f32, ps[i0].z as f32);
                 let p1 = Vec3::new(ps[i1].x as f32, ps[i1].y as f32, ps[i1].z as f32);
-                let mut prev = p0;
-                for s in 1..=BOND_SEG {
-                    let t = s as f32 / BOND_SEG as f32;
-                    let curr = p0 + (p1 - p0) * t;
-                    lines.push(LineVertex { pos: [prev.x, prev.y, prev.z], col });
-                    lines.push(LineVertex { pos: [curr.x, curr.y, curr.z], col });
-                    prev = curr;
-                }
+                lines.extend(make_bond_segments(p0, p1, BOND_SEG, col));
             }
         }
 
         // --- Surface grid removed: textured quad rendered separately ---
 
         // --- Axes ---
-        let o = [0.0f32, 0.0, 0.0];
-        lines.push(LineVertex { pos: o, col: [1.0, 0.0, 0.0, 1.0] });
-        lines.push(LineVertex { pos: [1.0, 0.0, 0.0], col: [1.0, 0.0, 0.0, 1.0] });
-        lines.push(LineVertex { pos: o, col: [0.0, 1.0, 0.0, 1.0] });
-        lines.push(LineVertex { pos: [0.0, 1.0, 0.0], col: [0.0, 1.0, 0.0, 1.0] });
-        lines.push(LineVertex { pos: o, col: [0.0, 0.0, 1.0, 1.0] });
-        lines.push(LineVertex { pos: [0.0, 0.0, 1.0], col: [0.0, 0.0, 1.0, 1.0] });
+        lines.extend(make_axes([0.0, 0.0, 0.0], 1.0));
 
         // --- Ports ---
         if self.show_ports {
             let rr = &self.world.rigid_sp3;
             let neigh_bs = self.world.dyn_atoms.atoms.neigh_bs.as_slice();
+            let port_col = [1.0f32, 0.5, 0.0, 1.0];
             for i in 0..natoms {
                 let pi = Vec3::new(ps[i].x as f32, ps[i].y as f32, ps[i].z as f32);
                 let bs = neigh_bs[i].as_array();
@@ -370,8 +280,8 @@ impl App {
                     let l0 = self.world.uff.bon_params.as_slice()[ib as usize][1];
                     let tip = rr.get_port_tip(ps, i, s, l0);
                     let pt = Vec3::new(tip.x as f32, tip.y as f32, tip.z as f32);
-                    lines.push(LineVertex { pos: [pi.x, pi.y, pi.z], col: [1.0, 0.5, 0.0, 1.0] });
-                    lines.push(LineVertex { pos: [pt.x, pt.y, pt.z], col: [1.0, 0.5, 0.0, 1.0] });
+                    lines.push(LineVertex { pos: [pi.x, pi.y, pi.z], col: port_col });
+                    lines.push(LineVertex { pos: [pt.x, pt.y, pt.z], col: port_col });
                 }
             }
         }
@@ -379,41 +289,26 @@ impl App {
         // --- Picking highlight ring ---
         if let Some(idx) = self.selected {
             let pos = Vec3::new(ps[idx].x as f32, ps[idx].y as f32, ps[idx].z as f32);
-            let r = if self.show_ports { 0.03 } else { element_radius(&self.elems[idx], &self.params) * ATOM_SCALE };
+            let r = if self.show_ports { 0.03 } else { self.params.element_radius_vdw(&self.elems[idx]) * ATOM_SCALE };
             let ring_col: [f32; 4] = if self.pinned[idx] { [1.0, 1.0, 0.0, 1.0] } else { [0.0, 1.0, 0.4, 1.0] };
-            const N: i32 = 16;
-            for k in 0..N {
-                let t0 = (k as f32 / N as f32) * std::f32::consts::TAU;
-                let t1 = ((k + 1) as f32 / N as f32) * std::f32::consts::TAU;
-                let p0r = pos + Vec3::new(t0.cos(), t0.sin(), 0.0) * r * 1.6;
-                let p1r = pos + Vec3::new(t1.cos(), t1.sin(), 0.0) * r * 1.6;
-                lines.push(LineVertex { pos: [p0r.x, p0r.y, p0r.z], col: ring_col });
-                lines.push(LineVertex { pos: [p1r.x, p1r.y, p1r.z], col: ring_col });
-            }
+            lines.extend(make_ring(pos, r * 1.6, 16, ring_col));
         }
 
         // --- Ray from picked atom to cursor ---
         if let Some(idx) = self.selected {
             let atom_pos = Vec3::new(ps[idx].x as f32, ps[idx].y as f32, ps[idx].z as f32);
             let (ray0, _) = self.cam.screen_ray(self.prev_mouse, self.window_size.0, self.window_size.1);
-            lines.push(LineVertex { pos: [atom_pos.x, atom_pos.y, atom_pos.z], col: [1.0, 0.0, 0.0, 1.0] });
-            lines.push(LineVertex { pos: [ray0.x, ray0.y, ray0.z], col: [1.0, 0.0, 0.0, 1.0] });
+            let red = [1.0f32, 0.0, 0.0, 1.0];
+            lines.push(LineVertex { pos: [atom_pos.x, atom_pos.y, atom_pos.z], col: red });
+            lines.push(LineVertex { pos: [ray0.x, ray0.y, ray0.z], col: red });
         }
 
         // --- Debug cursor: mouse ray origin + direction ---
         if self.show_debug_cursor {
             let (ro, rd) = self.cam.screen_ray(self.mouse_now, self.window_size.0, self.window_size.1);
-            let sz = 0.5f32; // crosshair size
             let green = [0.0f32, 1.0, 0.0, 1.0];
             let yellow = [1.0f32, 1.0, 0.0, 1.0];
-            // Cross at ray origin
-            lines.push(LineVertex { pos: [ro.x - sz, ro.y, ro.z], col: green });
-            lines.push(LineVertex { pos: [ro.x + sz, ro.y, ro.z], col: green });
-            lines.push(LineVertex { pos: [ro.x, ro.y - sz, ro.z], col: green });
-            lines.push(LineVertex { pos: [ro.x, ro.y + sz, ro.z], col: green });
-            lines.push(LineVertex { pos: [ro.x, ro.y, ro.z - sz], col: green });
-            lines.push(LineVertex { pos: [ro.x, ro.y, ro.z + sz], col: green });
-            // Ray direction line (20 units long)
+            lines.extend(make_crosshair(ro, 0.5, green));
             let r_end = ro + rd * 20.0;
             lines.push(LineVertex { pos: [ro.x, ro.y, ro.z], col: yellow });
             lines.push(LineVertex { pos: [r_end.x, r_end.y, r_end.z], col: yellow });
@@ -679,7 +574,7 @@ impl App {
                     ui.label(egui::RichText::new(pin_text).size(14.0).color(if self.pinned[idx] { egui::Color32::from_rgb(255, 160, 0) } else { egui::Color32::GRAY }));
                     let pos = self.world.dyn_atoms.atoms.apos.as_slice()[idx];
                     ui.label(egui::RichText::new(format!("pos: {:.3} {:.3} {:.3}", pos.x, pos.y, pos.z)).size(14.0).color(egui::Color32::GRAY));
-                    let r = element_radius(&self.elems[idx], &self.params);
+                    let r = self.params.element_radius_vdw(&self.elems[idx]);
                     ui.label(egui::RichText::new(format!("RvdW = {:.3} Å", r)).size(14.0).color(egui::Color32::GRAY));
                 });
         }

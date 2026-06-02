@@ -1,1 +1,1 @@
-pub mod thumbnailer;
+pub mod gui;

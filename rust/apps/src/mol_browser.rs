@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use eframe::egui;
 use surfmol_common::xyz::read_xyz;
 use surfmol_topology::params::Params;
-use surfmol_apps::thumbnailer::MolThumbnailer;
+use surfmol_apps::gui::thumbnailer::MolThumbnailer;
 
 // ------------------------------------------------------------------
 // Molecule entry

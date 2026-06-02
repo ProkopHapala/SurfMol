@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use surfmol_common::math::vec3::Vec3d;
 use surfmol_common::xyz::read_xyz;
 use surfmol_topology::params::Params;
-use surfmol_apps::thumbnailer::MolThumbnailer;
+use surfmol_apps::gui::thumbnailer::MolThumbnailer;
 
 fn save_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) {
     let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).expect("bad image buffer");

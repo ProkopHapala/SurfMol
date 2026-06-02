@@ -3,6 +3,40 @@
 ## Design Philosophy
 The SurfMol repository is designed with a strict modularity and language-based organization. The primary components are implemented in Rust and OpenCL for high performance, with Python bindings planned as a future layer for scripting and accessibility.
 
+## File Naming and Organization Rules
+
+### 1. Unique, Descriptive Names
+- **No generic names** like `shared.rs`, `frontend.rs`, `utils.rs` that could exist in multiple crates
+- **Use crate-specific prefixes** for library roots and shared modules to ensure uniqueness across the repository
+- **Exception:** `lib.rs` is acceptable as a crate root module organizer (it is standard Rust and only appears once per crate)
+- **Examples:**
+  - `common/src/common.rs` (not `lib.rs`)
+  - `forcefields/src/forcefields.rs` (not `lib.rs`)
+  - `topology/src/topology_lib.rs` (distinguishes from `topology.rs` module)
+  - `apps/src/lib.rs` — standard crate root, only `pub mod gui;`
+
+### 2. No Tiny Stub Files
+- **Avoid files with only module declarations** (e.g., `pub mod foo;` in a 2-line file) unless serving as a crate root or module organizer
+- **Inline small modules** into their parent or the crate root if they don't warrant separate files
+- **Exception:** Crate root files (`lib.rs`) and module organizers (`mod.rs`) may contain only `pub mod` declarations
+- **Example:** `apps/src/lib.rs` containing only `pub mod gui;` is acceptable — it is a standard Rust crate root
+
+### 3. Test Location Rules
+- **Backend module tests** (no GUI, single-module focus) → `crate/tests/` directory
+  - `forcefields/tests/test_rigid_sp3.rs` — tests rigid_sp3 logic
+  - `forcefields/tests/test_surface.rs` — tests surface potential
+  - `molrender/tests/debug_simple.rs` — tests rendering primitives
+- **GUI/composite app tests** (require GUI or multiple backends) → `apps/tests/` directory
+  - `apps/tests/test_thumb.rs` — tests MolThumbnailer (uses rendering + topology)
+
+### 4. Binary Location Rules
+- **GUI applications** → `apps/src/` (not `src/bin/`)
+  - `apps/src/editor.rs` — 3D molecular editor
+  - `apps/src/mol_browser.rs` — XYZ directory browser
+- **CLI tools** → place in the backend crate they belong to, not in `apps/`
+  - `topology/src/bin/assign_uff.rs` — UFF type assignment CLI
+  - `forcefields/src/mol_engine.rs` — MD engine CLI with Rhai scripting
+
 ## Directory Structure
 The repository is organized by language and capability:
 
@@ -36,8 +70,27 @@ The simulation and relaxation engine.
 - **Data Ownership:** `MolWorld` does not own atomic positions or forces directly; these live in `DynamicAtoms` (`surfmol-common`). Each forcefield module owns only its specialized parameters and borrows shared slices during evaluation. For the full ownership model, design decisions, and future extension patterns, see `rust/forcefields/DESIGN.md`.
 
 ### 4. `surfmol-apps` (rust/apps)
-Contains the executable targets, including CLI bindings and Rust-based GUI applications.
-Planned applications include:
+High-level composite applications crate. **No simulation logic lives here.** All backends (forcefields, topology, rendering, math) are imported from sibling crates. This crate wires together multiple backend modules into user-facing GUI applications.
+
+**Layout:**
+- `src/` — executable binaries, one per GUI application. Each binary is a thin frontend that wires together backend crates.
+- `src/lib.rs` — crate root (module organizer, contains only `pub mod gui;`).
+- `src/gui/` — shared GUI utilities reused by multiple frontends (e.g. `MolThumbnailer`, `TrackballCam`).
+  - `gui/mod.rs` — `pub mod thumbnailer;`
+  - `gui/thumbnailer.rs` — `MolThumbnailer` widget.
+- `tests/` — integration tests for GUI/composite functionality (tests that require multiple backend crates or GUI context).
+
+**Current binaries:**
+| Binary | Path | Description |
+|--------|------|-------------|
+| `mol_browser` | `src/mol_browser.rs` | XYZ directory browser with GPU thumbnail grid |
+| `editor` | `src/editor.rs` | 3D molecular editor / viewer |
+
+**Test location rule:**
+- **Backend module tests** (no GUI, single-module focus) → live in their respective crate's `tests/` directory (e.g. `forcefields/tests/`, `molrender/tests/`)
+- **GUI/composite app tests** (require GUI or multiple backends) → live in `apps/tests/`
+
+**Planned:**
 1. **MolBrowser:** A fast tool for searching and visualizing molecular files (`.xyz`, `.pdb`, `.mol`, `.cif`) across directories. It generates pre-rendered small texture tiles for quick thumbnail views (similar to image browsers like ACDSee or XnView).
 2. **MolEdit2D:** An efficient 2D molecule drawing tool (similar to ChemSketch).
 3. **MolWorld App:** A rich 3D environment allowing users to move and relax molecules on surfaces. It features:

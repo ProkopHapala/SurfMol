@@ -294,6 +294,21 @@ impl Params {
         self.element_dict.get(name).map(|&i| &self.elements[i])
     }
 
+    /// RGB color as [f32; 3] from the element's packed u32 color field.
+    pub fn element_color_f32(&self, elem: &str) -> [f32; 3] {
+        self.get_element_type(elem)
+            .map(|et| {
+                let c = et.color;
+                [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0]
+            })
+            .unwrap_or([0.78, 0.78, 0.78])
+    }
+
+    /// Van-der-Waals radius as f32, default 1.0 Å.
+    pub fn element_radius_vdw(&self, elem: &str) -> f32 {
+        self.get_element_type(elem).map(|et| et.r_vdw as f32).unwrap_or(1.0)
+    }
+
     pub fn get_atom_type(&self, name: &str) -> Option<&AtomType> {
         self.atom_type_dict.get(name).map(|&i| &self.atom_types[i])
     }

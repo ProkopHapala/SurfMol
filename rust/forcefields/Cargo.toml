@@ -3,9 +3,12 @@ name = "surfmol-forcefields"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/forcefields.rs"
+
 [[bin]]
 name = "mol_engine"
-path = "src/main.rs"
+path = "src/mol_engine.rs"
 
 [dependencies]
 surfmol-common = { path = "../common" }

@@ -3,8 +3,8 @@ use surfmol_common::math::vec3::Vec3d;
 use surfmol_topology::params::Params;
 use surfmol_molrender::impostor::{ImpostorRenderer, AtomInstance, CameraData};
 use surfmol_molrender::line_renderer::{LineRenderer, LineVertex};
-use surfmol_molrender::impostor::{ortho, look_at, mul4x4, transpose4x4, mul3s, add3, sub3, normalize3, cross3};
-
+use surfmol_molrender::impostor::{sub3, normalize3, transpose4x4};
+ 
 /// External harness for molecule thumbnail generation.
 /// Uses surfmol-molrender GPU primitives but handles alignment,
 /// ortho camera fitting, and bond rendering externally.
@@ -14,7 +14,7 @@ pub struct MolThumbnailer {
     pub(crate) impostor: ImpostorRenderer,
     pub(crate) lines: LineRenderer,
 }
-
+ 
 impl MolThumbnailer {
     pub fn new() -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -29,7 +29,7 @@ impl MolThumbnailer {
             compatible_surface: None,
             force_fallback_adapter: false,
         })).expect("no adapter");
-
+ 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 required_features: wgpu::Features::empty(),
@@ -40,7 +40,7 @@ impl MolThumbnailer {
                 trace: wgpu::Trace::Off,
             },
         )).expect("no device");
-
+ 
         let device = Arc::new(device);
         let queue = Arc::new(queue);
         let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -48,28 +48,28 @@ impl MolThumbnailer {
         let lines = LineRenderer::new(device.clone(), queue.clone(), fmt);
         Self { device, queue, impostor, lines }
     }
-
+ 
     pub fn render(&mut self, size: u32, apos: &[Vec3d], elems: &[String], bonds: &[[usize; 2]], params: &Params) -> Vec<u8> {
         if apos.is_empty() {
             return vec![0u8; (size * size * 4) as usize];
         }
-
+ 
         // 1. Align to principal axes (longest in x, y; shortest in z)
         let aligned = align_to_principal_axes(apos);
-
+ 
         // 2. Build atom instances
         let mut instances = Vec::with_capacity(aligned.len());
         let mut rmax = 0.0f32;
         for (i, p) in aligned.iter().enumerate() {
             let el = elems.get(i).map(|s| s.as_str()).unwrap_or("C");
-            let col = element_color_f32(el, params);
+            let col = params.element_color_f32(el);
             let r = params.get_element_type(el).map(|e| e.r_vdw as f32).unwrap_or(1.7) * 0.3;
             if r > rmax { rmax = r; }
             instances.push(AtomInstance { pos: *p, radius: r, color: col, _pad: 0.0 });
         }
         self.impostor.set_atoms(&instances);
         self.impostor.set_target_size(size, size);
-
+ 
         // 3. Fit ortho camera to aligned bounds
         let (mut mn, mut mx) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
         for p in &aligned {
@@ -83,7 +83,7 @@ impl MolThumbnailer {
         let half_y = wy * 0.5 + rmax;
         let half = half_x.max(half_y); // preserve aspect ratio
         let half_z = (wz * 0.5 + rmax).max(1.0);
-
+ 
         let zoom = half;
         let aspect = 1.0f32;
         let near = 0.01f32;
@@ -93,7 +93,7 @@ impl MolThumbnailer {
         let right = [1.0f32, 0.0, 0.0];
         let up = [0.0f32, 1.0, 0.0];
         let f = normalize3(sub3(eye, center));
-
+ 
         let sx = 1.0 / (zoom * aspect);
         let sy = 1.0 / zoom;
         let sz = -1.0 / (far - near);
@@ -107,7 +107,7 @@ impl MolThumbnailer {
             [sz * f[0], sz * f[1], sz * f[2], sz * tz_view + tz],
             [0.0, 0.0, 0.0, 1.0],
         ];
-
+ 
         let camera = CameraData {
             view_proj: transpose4x4(vp),
             eye,
@@ -120,7 +120,7 @@ impl MolThumbnailer {
             ortho: 1.0,
             ray_shift: [0.0, 0.0, 0.0, 0.0],
         };
-
+ 
         // 4. Offscreen target
         let out_tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("thumb_out"),
@@ -131,10 +131,10 @@ impl MolThumbnailer {
             view_formats: &[],
         });
         let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
+ 
         // 5. Render atoms
         self.impostor.render(&out_view, wgpu::Color { r: 0.08, g: 0.08, b: 0.12, a: 1.0 }, &camera);
-
+ 
         // 6. Render bonds
         if !bonds.is_empty() {
             let mut verts = Vec::with_capacity(bonds.len() * 2);
@@ -151,7 +151,7 @@ impl MolThumbnailer {
                 self.queue.submit(std::iter::once(enc.finish()));
             }
         }
-
+ 
         // 7. Readback
         let buf_size = (size * size * 4) as wgpu::BufferAddress;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -166,7 +166,7 @@ impl MolThumbnailer {
             wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
         );
         self.queue.submit(std::iter::once(enc.finish()));
-
+ 
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
@@ -178,7 +178,7 @@ impl MolThumbnailer {
         rgba
     }
 }
-
+ 
 pub(crate) fn align_to_principal_axes(apos: &[Vec3d]) -> Vec<[f32; 3]> {
     let n = apos.len() as f64;
     let cog = Vec3d::new(
@@ -186,7 +186,7 @@ pub(crate) fn align_to_principal_axes(apos: &[Vec3d]) -> Vec<[f32; 3]> {
         apos.iter().map(|p| p.y).sum::<f64>() / n,
         apos.iter().map(|p| p.z).sum::<f64>() / n,
     );
-
+ 
     let mut ixx = 0.0f64; let mut iyy = 0.0f64; let mut izz = 0.0f64;
     let mut ixy = 0.0f64; let mut ixz = 0.0f64; let mut iyz = 0.0f64;
     for p in apos {
@@ -200,25 +200,25 @@ pub(crate) fn align_to_principal_axes(apos: &[Vec3d]) -> Vec<[f32; 3]> {
         ixz -= x*z;
         iyz -= y*z;
     }
-
+ 
     let mat = nalgebra::Matrix3::new(
         ixx as f32, ixy as f32, ixz as f32,
         ixy as f32, iyy as f32, iyz as f32,
         ixz as f32, iyz as f32, izz as f32,
     );
     let eig = mat.symmetric_eigen();
-
+ 
     // smallest eigenvalue => largest spatial extent => x (longest)
     // largest eigenvalue  => smallest spatial extent => z (view axis)
     let mut pairs: Vec<(f32, nalgebra::Vector3<f32>)> = (0..3).map(|i| {
         (eig.eigenvalues[i], eig.eigenvectors.column(i).into_owned())
     }).collect();
     pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
+ 
     let ex = &pairs[0].1;
     let ey = &pairs[1].1;
     let ez = &pairs[2].1;
-
+ 
     let mut out = Vec::with_capacity(apos.len());
     for p in apos {
         let vx = (p.x - cog.x) as f32;
@@ -232,12 +232,4 @@ pub(crate) fn align_to_principal_axes(apos: &[Vec3d]) -> Vec<[f32; 3]> {
     }
     out
 }
-
-pub(crate) fn element_color_f32(elem: &str, params: &Params) -> [f32; 3] {
-    params.get_element_type(elem)
-        .map(|et| {
-            let c = et.color;
-            [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0]
-        })
-        .unwrap_or([0.78, 0.78, 0.78])
-}
+ 

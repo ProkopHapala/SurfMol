@@ -3,9 +3,16 @@ name = "surfmol-apps"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "mol_browser"
-path = "src/bin/mol_browser.rs"
+path = "src/mol_browser.rs"
+
+[[bin]]
+name = "editor"
+path = "src/editor.rs"
 
 [dependencies]
 surfmol-forcefields = { path = "../forcefields" }

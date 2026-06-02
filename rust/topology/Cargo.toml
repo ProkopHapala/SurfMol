@@ -3,6 +3,9 @@ name = "surfmol-topology"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/topology_lib.rs"
+
 [dependencies]
 surfmol-common = { path = "../common" }
 serde = { version = "1.0", features = ["derive"] }
