@@ -87,7 +87,7 @@ impl MolBrowserApp {
         for i in 0..n {
             let mut candidates: Vec<(usize, f64)> = Vec::new();
             for j in (i+1)..n {
-                let d = numcore::math::vec3::Vec3d::set_sub(xyz.apos[j], xyz.apos[i]);
+                let d = numtypes::Vec3d::set_sub(xyz.apos[j], xyz.apos[i]);
                 let rcut = radii[i] + radii[j] + 0.4;
                 let dist2 = d.norm2();
                 if dist2 < rcut * rcut {

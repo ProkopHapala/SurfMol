@@ -1,0 +1,8 @@
+[package]
+name = "numtypes"
+version = "0.1.0"
+edition = "2021"
+description = "Low-level data layout vocabulary: #[repr(C)] math vectors/matrices, aligned allocators, graph/spatial data contracts. Tiny intrinsic operations only — no algorithms."
+
+[dependencies]
+bytemuck = { workspace = true }

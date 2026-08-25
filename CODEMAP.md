@@ -42,7 +42,7 @@ SurfMol/
 
 ```
 crates/libs/   (10 library crates, no binary targets)
-  numcore, moltopo, pgraph, pgraph_ops, spacc,
+  numtypes, numcore, moltopo, pgraph, spacc,
   molff, surfff, surfmol, molrender, molgui
 
 crates/apps/   (4 binary crates)
@@ -52,11 +52,17 @@ crates/apps/   (4 binary crates)
 ### Crate dependency graph
 
 ```
-numcore ← moltopo ← molff ← surfmol
-         ↖ molrender ← molgui
-         ↖ surfff ↗
-         ↖ pgraph ← pgraph_ops
-         ↖ pgraph ← spacc
+                numtypes
+       ___________|_____________
+      /            |            \
+   numcore       pgraph         spacc
+      |            |              |
+      ↓            ↓              ↘
+  moltopo ←── molff ←── surfmol
+      ↘       ↗         ↗
+       molrender ← molgui
+      ↗
+   surfff
 ```
 
 Apps depend on libs:
@@ -73,14 +79,14 @@ Apps depend on libs:
 | `egui` | 0.34 | Immediate-mode GUI |
 | `egui-winit` | 0.34 | `default-features=false`, `features=["wayland","x11","links"]` |
 | `egui-wgpu` | 0.34 | egui ↔ wgpu backend |
-| `ndarray` | 0.16 | N-d arrays (molff, molengine) |
+| `ndarray` | 0.16 | **Currently unused in source** — listed in `molff` and `molengine` Cargo.toml but no `use ndarray` in any `src/`. Candidate for removal. |
 | `rand` | 0.8 | RNG |
 | `ocl` | 0.19 | **OpenCL bindings — chosen crate** (see `DESIGN_GOALS.md` §10) |
 | `wgpu` | 29 | GPU compute/graphics |
 | `pollster` | 0.4 | Async runtime (block_on) |
 | `bytemuck` | 1.21 | `features=["derive"]` — zero-cost casts for GPU buffers |
 | `winit` | 0.30 | Windowing |
-| `glam` | 0.29 | Math (apps: Quat, Vec3) |
+| `glam` | 0.29 | **Under review** — used for `Quat`/`Vec2`/`Vec3` in `editor`, `molgui` (`trackball`, `gizmos`), and `molbrowser` Cargo.toml. Can be replaced by `numtypes::Vec2f`/`Vec3f`/`Vec4f` + `qmul` once `numtypes` quaternion helpers mature. |
 | `serde` | 1.0 | `features=["derive"]` — serialization |
 | `serde_json` | 1.0 | JSON I/O |
 | `rhai` | 1.19 | Scripting (molengine) |
@@ -96,21 +102,29 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 
 ## 3. File inventory by crate
 
-### `numcore` (`crates/libs/numcore/`, 437 LOC)
-*Bedrock: math + data structures. No chemistry/physics. `#[repr(C)]`, 64-byte aligned.*
+### `numtypes` (`crates/libs/numtypes/`, ~380 LOC)
+*Low-level memory/data-layout vocabulary — `#[repr(C)]` math vectors/matrices, aligned allocators, graph/spatial data contracts. Tiny intrinsic operations only.*
 
 | File | LOC | Contents |
 |------|-----|----------|
-| `src/lib.rs` | 4 | Crate root: `pub mod math; pub mod util;` |
-| `src/util.rs` | 60 | `AlignedVec<T, A>` — cache-aligned allocator (64-byte), `as_slice`/`as_mut_slice`/`resize_fill`. `unsafe` for raw alloc. |
-| `src/math/mod.rs` | 7 | Module declarations: vec2, vec3, quat4, math3d, math4d, fastmath, linalg. |
-| `src/math/vec3.rs` | 43 | `Vec3d` (`#[repr(C)]`, f64), ops (add/sub/mul/dot/cross/norm/normalize), `VEC3_ZERO`, `VEC3_NAN`. |
-| `src/math/vec2.rs` | — | `Vec2d` with `mul_cmplx` (complex multiply for angle/dihedral Fourier series). |
-| `src/math/quat4.rs` | 31 | `Quat4d` (f64 xyzw), `Quat4i` (i32 xyzw), `QUAT4I_MINUS_ONES`. |
-| `src/math/math3d.rs` | 26 | f32 helpers: `normalize3`, `cross3`, `dot3`, `sub3`, `add3`, `mul3s` (for GPU rendering). |
-| `src/math/math4d.rs` | 37 | f32 4×4 matrices: `look_at`, `ortho` (Vulkan NDC), `mul4x4`, `transpose4x4`. |
+| `src/lib.rs` | 34 | Crate root; re-exports `vec`, `mat`, `alloc`, `graph`, `spatial` public items. |
+| `src/vec.rs` | ~170 | `Vec2f/d`, `Vec3f/d`, `Vec4f/d`, `Vec4i`, `Vec6f/d`; component-wise ops, `array()` zero-copy views, `Index<usize>`, complex helpers (`cmul`, `cconj`), quaternion helpers (`qmul`, `qconj`, `qrotate`), `Quat4d`/`Quat4i` aliases, `QUAT4I_MINUS_ONES`. |
+| `src/mat.rs` | ~150 | `Mat3d`/`Mat4d` and `Mat4f`; `rows()`/`array()` views, `dot`, `mmul3`/`mmul4`/`mmul4f`, `outer`, `det`, `inverse`. `Mat4f` adds `look_at`, `ortho`, `to_arr4x4()` for graphics. |
+| `src/alloc.rs` | ~95 | `AlignedVec<T, A>` — 64-byte aligned allocator, `Deref`/`DerefMut` to `[T]`, `with_len_fill`, `resize_fill`, `push`. |
+| `src/graph.rs` | ~150 | `Index`, `INVALID`, `PGraph`, `PGraphView`, `Elements<N>`, `RaggedIndex` (replaces `Ragged`+`IndexGroups`), `Permutation`, `Partition`, `RangeGroups`, `CsrAdj`, `FixedRows<K>`, `FixedAdj<K>` (using aligned `AlignedVec`). |
+| `src/spatial.rs` | ~70 | `Aabb3d`/`Aabb3f` and `SymMat3d`/`SymMat3f` as `Vec6` aliases; standalone `aabb_*` and `sym3_*` intrinsic functions. |
+
+### `numcore` (`crates/libs/numcore/`, ~110 LOC)
+*Numerical algorithms. Does **not** re-export `numtypes` data; owns `fastmath` and `linalg` only.*
+
+| File | LOC | Contents |
+|------|-----|----------|
+| `src/lib.rs` | 1 | Crate root: `pub mod math;` |
+| `src/math/mod.rs` | 2 | Module declarations: `fastmath`, `linalg`. |
 | `src/math/fastmath.rs` | 36 | `sq`, `dangle`, `clamp_abs`, `sincos_taylor2`, `sincos_r2_taylor` (Taylor approximations). |
 | `src/math/linalg.rs` | 92 | `symmetric_eigen_3x3` — analytical (closed-form) 3×3 symmetric eigendecomposition. Ported from FireCore `Mat3.h:Mat3T::eigenvals()` + `eigenvec()`. Replaces nalgebra for PCA in thumbnailer. |
+
+(The `util`, `vec2`, `vec3`, `quat4` re-export modules and the f32 `math3d`/`math4d` array helpers have been removed. Data primitives and f32/f64 matrix constructors now live in `numtypes`.) |
 
 ### `moltopo` (`crates/libs/moltopo/`, 1855 LOC)
 *Molecular topology SSOT. Bonds/angles/dihedrals/inversions. UFF type assignment.*
@@ -126,33 +140,26 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | `src/export.rs` | 74 | `TopologyData` (serde), `Topology::export_json()`, `import_json()`. TODO: .npy export. |
 | `src/xyz.rs` | 48 | `XyzSystem`, `read_xyz()`, `write_xyz_frame()` — XYZ file I/O. |
 
-### `pgraph` (`crates/libs/pgraph/`, 280 LOC)
-*Positioned graph data contract — domain-agnostic foundation. See `notes/designs/topology_builder.md`.*
-
-| File | LOC | Contents |
-|------|-----|----------|
-| `src/lib.rs` | 280 | `PGraph` (pos + edges), `PGraphView<'a>`, `Elements<N>`, `Ragged`, `Permutation`, `FixedRows<K>`/`FixedAdj<K>` (ELL-like, `-1` sentinel), `CsrAdj`, `Partition`/`IndexGroups`/`RangeGroups`. `Index = u32`, `INVALID = -1`. |
-
-### `pgraph_ops` (`crates/libs/pgraph_ops/`, 623 LOC)
-*Reusable graph algorithms on `pgraph` data. Ported from FireCore `MolecularGraph.h` without class ownership.*
+### `pgraph` (`crates/libs/pgraph/`, ~620 LOC)
+*Reusable graph algorithms on `numtypes` data. Ported from FireCore `MolecularGraph.h` without class ownership.*
 
 | File | LOC | Contents |
 |------|-----|----------|
 | `src/lib.rs` | 11 | Module declarations: adjacency, components, bridges, reorder, geometry. |
 | `src/adjacency.rs` | 155 | `build_csr_adj` (count→prefix→scatter), `build_fixed_adj::<K>` (fails loud on degree > K via `DegreeOverflow`). Both produce parallel `neigh` + `edge` arrays. |
-| `src/components.rs` | 85 | `connected_components(csr)` via iterative BFS → `Partition`. `split_by_component(csr)` → `Vec<Vec<Index>>`. |
+| `src/components.rs` | 85 | `connected_components(csr)` via iterative BFS → `Partition`. `split_by_component(csr)` → `RaggedIndex`. |
 | `src/bridges.rs` | 130 | `find_bridges(csr)` via iterative Tarjan DFS (discovery times + low-link). No recursion → no stack overflow. |
 | `src/reorder.rs` | 154 | `partition_to_index_groups`, `group_aware_permutation` (→ `Permutation` + `RangeGroups`), `apply_permutation`, `permute_edges`. |
 | `src/geometry.rs` | 87 | `edge_vec`, `edge_length`, `edge_lengths`, `bounding_box`, `bounding_box_center`, `bounding_box_span`. |
 
-### `spacc` (`crates/libs/spacc/`, 256 LOC)
-*Spatial acceleration — rebuildable caches, no molecular semantics.*
+### `spacc` (`crates/libs/spacc/`, ~220 LOC)
+*Spatial acceleration — rebuildable caches, no molecular semantics. Operates on `numtypes` layouts.*
 
 | File | LOC | Contents |
 |------|-----|----------|
 | `src/lib.rs` | 6 | Module declarations: aabb, buckets. |
-| `src/aabb.rs` | 130 | `Aabb` (lo/hi Vec3d), `fit_aabb(pos, ids)`, `fit_group_aabbs(pos, groups, out)`. Dataflow: `positions + IndexGroups → Aabb[group]`. |
-| `src/buckets.rs` | 117 | `Buckets` — spatial hashing via count→prefix→scatter (FireCore `Buckets.h` pattern). `build(cell_of_obj)`, `cell_objects(c)`. |
+| `src/aabb.rs` | 96 | `fit_aabb(pos, ids)`, `fit_group_aabbs(pos, RaggedIndex, out)`, `fit_range_aabbs(pos, ranges, out)`. Uses `numtypes::Aabb3d` and `numtypes::RaggedIndex`. |
+| `src/buckets.rs` | 95 | `Buckets` — spatial hashing via count→prefix→scatter (FireCore `Buckets.h` pattern). `build(cell_of_obj)`; `cell_objects(c)`. Single `counts` buffer doubles as cursor; no extra allocation during rebuild. |
 
 ### `molff` (`crates/libs/molff/`, 1205 LOC)
 *Intra-molecular forcefields. See `notes/designs/` for forcefield data ownership.*
@@ -188,7 +195,7 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | File | LOC | Contents |
 |------|-----|----------|
 | `src/lib.rs` | 154 | Crate root + `ThumbnailRenderer` — offscreen wgpu renderer. Auto-fitting ortho camera. RGBA readback. |
-| `src/impostor.rs` | 365 | `ImpostorRenderer` — raytraced sphere impostors (WGSL inline). `AtomInstance`, `CameraData`. Re-exports `math3d`/`math4d` helpers. |
+| `src/impostor.rs` | 363 | `ImpostorRenderer` — raytraced sphere impostors (WGSL inline). `AtomInstance`, `CameraData`. Uses `numtypes::Vec3f`/`Mat4f` for camera math. |
 | `src/line_renderer.rs` | 191 | `LineRenderer` — line segments (WGSL inline). `LineVertex`. |
 | `src/surface_renderer.rs` | 229 | `SurfaceRenderer` — textured quad for surface potential (WGSL inline). |
 | `tests/debug_simple.rs` | — | Single-atom render debug. |
@@ -287,7 +294,7 @@ cargo run -p molengine -- --script examples/relax.rhai       # Rhai MD engine
 cargo test                               # all tests
 cargo test -p molff                      # forcefield tests
 cargo test -p molrender                  # render tests
-cargo test -p pgraph -p pgraph_ops -p spacc  # graph/spatial tests
+cargo test -p numtypes -p pgraph -p spacc  # data-layout + graph/spatial tests
 
 # Check
 cargo check --workspace                  # fast type check
@@ -300,24 +307,26 @@ cargo clippy --workspace                 # lints
 
 | Struct | Crate | Role |
 |--------|-------|------|
-| `Vec3d`, `Quat4d`, `Quat4i` | numcore | `#[repr(C)]` math primitives, f64 |
-| `AlignedVec<T, 64>` | numcore | 64-byte aligned allocator for SIMD-friendly arrays |
+| `Vec2d`, `Vec3d`, `Vec4d`, `Quat4d`, `Quat4i`, `Vec6d` | numtypes | `#[repr(C)]` math primitives; `Vec2d` as complex, `Vec4d` as quaternion, `Vec6d` for AABB/symmetric 3×3 |
+| `Mat3d`, `Mat4d` | numtypes | `#[repr(C)]` rows-of-vectors matrices; `rows()`/`array()` zero-copy views |
+| `AlignedVec<T, 64>` | numtypes | 64-byte aligned allocator for SIMD-friendly arrays |
+| `PGraph`, `PGraphView` | numtypes | Positioned graph: pos + edges (domain-agnostic) |
+| `FixedAdj<K>`, `CsrAdj` | numtypes | Adjacency representations (ELL-like / CSR) |
+| `RaggedIndex`, `Partition`, `RangeGroups` | numtypes | Group/partition representations |
+| `Permutation` | numtypes | Bidirectional index remapping |
+| `Aabb3d`, `Aabb3f` | numtypes | `Vec6` aliases for AABB; `aabb_*` intrinsic functions |
 | `symmetric_eigen_3x3` | numcore | Analytical 3×3 symmetric eigendecomposition (replaces nalgebra) |
 | `Atoms` | moltopo | Static atomic data (apos, atypes, neighs, neigh_bs) |
 | `DynamicAtoms` | moltopo | Atoms + fapos + vapos + MD integrators. **Single owner of per-atom state.** |
 | `Topology` | moltopo | Flat arrays: apos, bonds, angles, dihedrals, inversions |
 | `Builder` | moltopo | Slot-based graph with generational handles (AtomH, BondH), hex-grid editing |
 | `Params` | moltopo | Loaded FF parameter tables |
-| `PGraph`, `PGraphView` | pgraph | Positioned graph: pos + edges (domain-agnostic) |
-| `FixedAdj<K>`, `CsrAdj` | pgraph | Adjacency representations (ELL-like / CSR) |
-| `Partition`, `IndexGroups`, `RangeGroups` | pgraph | Group representations |
-| `Permutation` | pgraph | Bidirectional index remapping |
 | `Uff` | molff | Bonded FF: SoA arrays, Buckets force assembly, hneigh |
 | `RigidSp3FF` | molff | Port-based rigid body: quat, omega, tau. **RAFF precursor.** |
 | `NonBondedFF` | molff | LJ+Coulomb+Hbond: reqs, plqs, excl, PBC shifts |
 | `SurfaceFolded` | surfff | Separable Fourier basis surface potential |
 | `MolWorld` | surfmol | Coordinator: DynamicAtoms + Uff + RigidSp3FF + optional NonBondedFF/SurfaceFolded |
-| `Aabb`, `Buckets` | spacc | Spatial acceleration (AABB fitting, spatial hashing) |
+| `Buckets` | spacc | Spatial hashing (count→prefix→scatter); replaces `molff::uff::Buckets` long-term |
 | `AtomInstance`, `CameraData` | molrender | GPU vertex/uniform layouts (match WGSL structs) |
 | `ImpostorRenderer`, `LineRenderer`, `SurfaceRenderer` | molrender | wgpu render pipelines |
 | `TrackballCam`, `KekuleEditor`, `MolThumbnailer`, `Clipboard` | molgui | GUI utilities |

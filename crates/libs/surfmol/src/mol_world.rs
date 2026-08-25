@@ -1,4 +1,4 @@
-use numcore::math::vec3::{Vec3d, VEC3_ZERO};
+
 use moltopo::molecular::DynamicAtoms;
 use moltopo::topology::Topology;
 use molff::uff::Uff;

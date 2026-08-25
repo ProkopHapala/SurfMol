@@ -1,11 +1,11 @@
-//! Reorder / compact: Partition → IndexGroups, group-aware permutation → RangeGroups.
+//! Reorder / compact: Partition → RaggedIndex, group-aware permutation → RangeGroups.
 //! Implements the count → prefix → scatter pattern from FireCore Groups::setGroupMapping().
 
-use pgraph::{Index, IndexGroups, Partition, Permutation, RangeGroups};
+use numtypes::{Index, RaggedIndex, Partition, Permutation, RangeGroups};
 
-/// Convert a Partition to packed IndexGroups (count → prefix → scatter).
+/// Convert a Partition to packed RaggedIndex (count → prefix → scatter).
 /// Each item appears exactly once in its group. Unassigned items (group = -1) are dropped.
-pub fn partition_to_index_groups(part: &Partition) -> IndexGroups {
+pub fn partition_to_index_groups(part: &Partition) -> RaggedIndex {
     let ngroups = part.ngroups();
     // 1. Count items per group
     let mut counts = vec![0u32; ngroups];
@@ -28,7 +28,7 @@ pub fn partition_to_index_groups(part: &Partition) -> IndexGroups {
         cursor[gi] += 1;
         items[pos] = item as Index;
     }
-    IndexGroups { offsets, items }
+    RaggedIndex { offsets, items }
 }
 
 /// Build a group-aware permutation that reorders items so each group is contiguous.

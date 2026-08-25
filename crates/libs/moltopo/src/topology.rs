@@ -1,5 +1,5 @@
-use numcore::math::quat4::Quat4i;
-use numcore::math::vec3::Vec3d;
+use numtypes::Quat4i;
+use numtypes::Vec3d;
 
 /// Number of lone electron pairs for common main-group elements.
 /// Based on valence shell configuration: C=4, N=5, O=6, F=7 → lone_pairs = (8 - valence)/2 for period-2.

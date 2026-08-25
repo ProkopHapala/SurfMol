@@ -1,6 +1,6 @@
-use numcore::math::quat4::{Quat4i, Quat4d, QUAT4I_MINUS_ONES};
-use numcore::math::vec3::{Vec3d, VEC3_ZERO};
-use numcore::util::AlignedVec;
+use numtypes::{Quat4i, QUAT4I_MINUS_ONES};
+use numtypes::{Vec3d, VEC3D_ZERO as VEC3_ZERO};
+use numtypes::AlignedVec;
 
 /// Static atomic data: geometry + types + neighbor lists.
 /// Shared by all forcefield modules.

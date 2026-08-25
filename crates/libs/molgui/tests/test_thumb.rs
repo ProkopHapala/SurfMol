@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use numcore::math::vec3::Vec3d;
+use numtypes::Vec3d;
 use moltopo::xyz::read_xyz;
 use moltopo::params::Params;
 use molgui::gui::thumbnailer::MolThumbnailer;

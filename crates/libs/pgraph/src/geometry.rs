@@ -1,8 +1,7 @@
 //! Geometry helpers: edge vectors, lengths, normals from positioned graph data.
 //! These are shared by picking, selection, and rendering — no molecular semantics.
 
-use numcore::math::vec3::Vec3d;
-use pgraph::Index;
+use numtypes::{Vec3d, Index};
 
 /// Edge vector from vertex a to vertex b: `pos[b] - pos[a]`.
 #[inline(always)]

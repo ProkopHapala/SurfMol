@@ -1,7 +1,7 @@
 //! Adjacency builders: edge list → CSR or fixed-stride (ELL) adjacency.
 //! Both produce parallel `neigh` + `edge` arrays so hot kernels don't search for bond ids.
 
-use pgraph::{CsrAdj, FixedAdj, Index};
+use numtypes::{CsrAdj, FixedAdj, Index};
 
 /// Build CSR adjacency from an edge list. Undirected: each edge appears in both endpoints.
 /// Pattern: count → prefix → scatter (same as FireCore MolecularGraph::makeNeighbors).
@@ -82,7 +82,7 @@ pub fn build_fixed_adj<const K: usize>(nverts: usize, edges: &[[Index; 2]]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgraph::INVALID;
+    use numtypes::INVALID;
 
     #[test]
     fn test_csr_simple() {

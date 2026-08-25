@@ -5,7 +5,7 @@ edition = "2021"
 description = "wgpu rendering primitives: sphere impostors, lines, surface quads"
 
 [dependencies]
-numcore = { workspace = true }
+numtypes = { workspace = true }
 moltopo = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }

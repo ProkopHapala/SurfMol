@@ -1,4 +1,5 @@
-use molrender::impostor::{ImpostorRenderer, AtomInstance, CameraData, look_at, ortho, mul4x4, normalize3, sub3, cross3};
+use numtypes::{Vec3f, Mat4f, mmul4f};
+use molrender::impostor::{ImpostorRenderer, AtomInstance, CameraData};
 
 #[test]
 fn impostor_single_atom() {
@@ -40,28 +41,31 @@ fn impostor_single_atom() {
     }];
     renderer.set_atoms(&atoms);
 
-    let eye = [0.0, 0.0, 5.0];
-    let target = [0.0, 0.0, 0.0];
-    let up = [0.0, 1.0, 0.0];
-    let view = look_at(eye, target, up);
-    let proj = ortho(-3.0, 3.0, -3.0, 3.0, 0.1, 100.0);
+    let eye = Vec3f::new(0.0, 0.0, 5.0);
+    let target = Vec3f::new(0.0, 0.0, 0.0);
+    let view = Mat4f::look_at(eye, target, Vec3f::new(0.0, 1.0, 0.0));
+    let proj = Mat4f::ortho(-3.0, 3.0, -3.0, 3.0, 0.1, 100.0);
     // Row-major row-vector M (clip = point * M); upload directly — WGSL column-major
     // byte interpretation transposes it, so M_wgsl = M^T and M_wgsl * v = v * M.
-    let vp = mul4x4(view, proj);
+    let vp = mmul4f(view, proj).to_arr4x4();
 
-    let z = normalize3(sub3(eye, target));
-    let right = normalize3(cross3([0.0, 1.0, 0.0], z));
-    let upv = cross3(z, right);
+    let mut z = eye - target;
+    z.normalize();
+    let mut right = Vec3f::new(0.0, 1.0, 0.0).cross(z);
+    right.normalize();
+    let up = z.cross(right);
+    let mut forward = target - eye;
+    forward.normalize();
 
     let cam = CameraData {
         view_proj: vp,
-        eye,
+        eye: *eye.array(),
         _pad1: 0.0,
-        right,
+        right: *right.array(),
         _pad2: 0.0,
-        up: upv,
+        up: *up.array(),
         _pad3: 0.0,
-        forward: normalize3(sub3(target, eye)),
+        forward: *forward.array(),
         ortho: 0.0,
         ray_shift: [0.0, 0.0, 0.0, 0.0],
     };

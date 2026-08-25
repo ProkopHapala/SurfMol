@@ -1,54 +1,47 @@
 ---
 type: rust-crate
 title: pgraph
-description: Positioned graph data contract — positions + edges + index containers. Domain-agnostic foundation for molecules, meshes, trusses. P0 foundation implemented.
-tags: [rust, crate, graph, data-structure]
+description: Reusable graph algorithms on numtypes data contracts — adjacency, components, bridges, reorder, geometry. Formerly pgraph_ops.
+tags: [rust, crate, graph-algorithms, numtypes]
 timestamp: 2026-08-25
 ---
 
 # pgraph
 
-Minimal data contract for positioned indexed connectivity: `pos[i]` + `edges[e] = (i, j)`. The defining property is that vertices have positions — this is what distinguishes `pgraph` from a generic graph library. Domain-agnostic: molecules, polygon meshes, and trusses all share this structure.
+Reusable graph algorithms that operate on the data contracts in `numtypes::graph` (`PGraph`, `CsrAdj`, `FixedAdj<K>`, `Partition`, `Permutation`, `RaggedIndex`, `RangeGroups`). Ported from FireCore `MolecularGraph.h` but without class ownership — free functions over borrowed data.
+
+The original `pgraph` data crate has been merged into `numtypes::graph`; this crate now carries only the algorithm library.
 
 ## What's implemented (P0 foundation)
 
-- **`PGraph`** — dense vertex/edge storage with `pos: Vec<Vec3d>` and `edges: Vec<[Index; 2]>`. `validate()` checks edge endpoints in range. `view()` borrows as zero-allocation `PGraphView`.
-- **`PGraphView<'a>`** — borrowed slices for zero-copy views (safe Rust analogue of FireCore `CMesh`).
-- **`Elements<const N>`** — fixed-size element collections. `Elements<3>` = triangles OR angle triples; `Elements<4>` = tetrahedra OR dihedrals. Share storage, not semantics — the owning layer decides meaning.
-- **`Ragged`** — count/offset/packed-items primitive for variable-length sets (polygon loops, ring lists, arbitrary groups). `from_counts()`, `group()`, `group_mut()`.
-- **`Permutation`** — bidirectional old2new / new2old remapping for compaction/reordering. `from_new2old()`, `identity()`.
-- **`FixedRows<const K>` / `FixedAdj<const K>`** — ELL-like padded adjacency with `-1` sentinel for empty slots. Valid entries packed first; `push()` fails loud on degree > K (never truncates). `FixedAdj` carries parallel `neigh` + `edge` tables so hot kernels don't search for bond ids — matches FireCore `neighs[natom]` + `neighBs[natom]` layout.
-- **`CsrAdj`** — compact CSR adjacency for arbitrary degree. `offsets` / `neigh` / `edge` arrays; `neighbors(v)` returns parallel slices.
-- **`Partition` / `IndexGroups` / `RangeGroups`** — disjoint group representations: flexible assignment → packed index lists → contiguous ranges after group-aware permutation.
+- **`adjacency.rs`** — `build_csr_adj(nverts, edges)` builds CSR via count→prefix→scatter (same pattern as FireCore `MolecularGraph::makeNeighbors`). `build_fixed_adj::<K>(nverts, edges)` builds ELL-like fixed-stride adjacency; fails loud with `DegreeOverflow` on degree > K — never truncates. Both produce parallel `neigh` + `edge` arrays.
+- **`components.rs`** — `connected_components(csr)` via iterative BFS; returns `Partition`. `split_by_component(csr)` returns `RaggedIndex` packed by component.
+- **`bridges.rs`** — `find_bridges(csr)` via iterative Tarjan DFS with discovery times and low-link values. No recursion → no stack overflow on large graphs. Ported from FireCore `MolecularGraph.h::findBridges` without class ownership.
+- **`reorder.rs`** — `partition_to_index_groups(part)` count→prefix→scatter (FireCore `Groups::setGroupMapping` pattern). `group_aware_permutation(part)` packs groups contiguously → `(Permutation, RangeGroups)`. `apply_permutation()`, `permute_edges()` for remapping sidecars.
+- **`geometry.rs`** — `edge_vec`, `edge_length`, `edge_lengths`, `bounding_box`, `bounding_box_center`, `bounding_box_span`. Shared by picking, selection, rendering — no molecular semantics.
+
+## Not yet implemented (P1/P2)
+
+- **`loops.rs`** — cycle/ring detection (P2)
+- **`selection.rs`** — SDF-based selection (P2)
+- **`picking.rs`** — ray-sphere (atoms), ray-cylinder (bonds) picking (P2)
+- **`edit.rs`** — editing helpers (P2)
 
 ## Design principles
 
-- **Dense vertex/edge IDs** with valid edge endpoints — no sparse handle indirection
-- **Sidecar arrays** for atom types, materials, flags, charges, colors — NOT in PGraph
-- **Adjacency is a selectable representation/cache**, not the graph identity — build CSR or FixedAdj as needed
-- **Almost no algorithms** — this is a data contract, not an algorithm library. Algorithms live in `pgraph_ops`
-- **`Index = u32`** — sufficient for all SurfMol use cases (molecules < 1M atoms)
-- **`INVALID = -1`** (i32) — ELLPACK convention, GPU-friendly, matches FireCore
+- Algorithms accept slices / `PGraphView` / `CsrAdj` / `FixedAdj` — no ownership of graph data.
+- **Depends only on `numtypes`** — the data contracts now live there.
+- **Scratch space is local** — never a `PGraph` member; no static DFS time counter.
+- **Allocation-free overloads** can take caller buffers for hot paths (not yet needed).
+- **Fail loud** on invariant violations (degree overflow, length mismatches).
 
-## Architectural role
+## Tests
 
-Part of the `pgraph` / `pgraph_ops` / `spacc` trio — a domain-agnostic foundation that `moltopo` will eventually build upon:
-
-```
-        numcore
-      /    |    \
-   pgraph  spacc  molrender
-      \    /
-      pgraph_ops
-          |
-       moltopo
-```
-
-This supersedes the earlier `mgraph` proposal (from `rust_workspace_reorg.md`) — `pgraph` ("positioned graph") is unambiguous, while `mgraph` could mean molecule/mesh/material graph.
+19 tests covering all design-doc §16 invariants: CSR matches brute force, FixedAdj matches CSR, valid entries packed first + remainder `-1`, degree > K errors, permutations preserve associations, Partition→RaggedIndex preserves each item exactly once, bridge finding on triangles/paths/mixed graphs.
 
 ## See also
 
-- `notes/designs/topology_builder.md` — full design with implementation priority (P0/P1/P2)
-- `pgraph_ops` — algorithms on positioned graphs (adjacency builders, components, bridges, reorder, geometry)
-- `spacc` — spatial acceleration structures (AABB, Buckets)
-- `moltopo` — chemistry-specific layer that will eventually use `pgraph`
+- `numtypes::graph` — the data contracts this crate operates on (`PGraph`, `CsrAdj`, `FixedAdj<K>`, `RaggedIndex`, `Permutation`, `Partition`, `RangeGroups`)
+- `notes/designs/topology_builder.md` — full design (§10 for `MolecularGraph.h` → `pgraph` mapping)
+- `spacc` — spatial acceleration (used by some algorithms)
+- FireCore `MolecularGraph.h` — C++ reference implementation

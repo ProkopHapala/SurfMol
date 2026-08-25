@@ -9,7 +9,7 @@ fn debug_simple_atoms() {
     let mut renderer = ThumbnailRenderer::new(128);
 
     // Single atom at origin
-    let apos = vec![numcore::math::vec3::Vec3d { x: 0.0, y: 0.0, z: 0.0 }];
+    let apos = vec![numtypes::Vec3d { x: 0.0, y: 0.0, z: 0.0 }];
     let elems = vec!["C".to_string()];
     let bonds: Vec<[usize; 2]> = vec![];
 

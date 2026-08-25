@@ -1,10 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
-use numcore::math::math3d::*;
-use numcore::math::math4d::*;
-pub use numcore::math::math3d::{normalize3, cross3, dot3, sub3, add3, mul3s};
-pub use numcore::math::math4d::{look_at, ortho, mul4x4, transpose4x4};
+
 
 // ------------------------------------------------------------------
 // GPU data layouts (must match WGSL structs exactly)

@@ -5,7 +5,7 @@ edition = "2021"
 description = "SurfMol molecular simulation engine: integrates intra-molecular and surface forcefields"
 
 [dependencies]
-numcore = { workspace = true }
+numtypes = { workspace = true }
 moltopo = { workspace = true }
 molff = { workspace = true }
 surfff = { workspace = true }

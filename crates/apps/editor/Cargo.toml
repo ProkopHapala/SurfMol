@@ -13,7 +13,7 @@ surfmol = { workspace = true }
 molff = { workspace = true }
 surfff = { workspace = true }
 moltopo = { workspace = true }
-numcore = { workspace = true }
+numtypes = { workspace = true }
 molgui = { workspace = true }
 molrender = { workspace = true }
 wgpu = { workspace = true }

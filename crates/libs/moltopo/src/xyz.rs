@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use numcore::math::vec3::Vec3d;
+use numtypes::Vec3d;
 
 pub struct XyzSystem {
     pub apos: Vec<Vec3d>,

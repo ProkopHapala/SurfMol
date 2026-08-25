@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use numcore::math::vec3::Vec3d;
+use numtypes::Vec3d;
 use moltopo::builder::{Builder, AtomH, BondH};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

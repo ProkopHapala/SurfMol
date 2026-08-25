@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 moltopo = { workspace = true }
-numcore = { workspace = true }
+numtypes = { workspace = true }
 molgui = { workspace = true }
 molrender = { workspace = true }
 wgpu = { workspace = true }

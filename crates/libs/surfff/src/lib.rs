@@ -1,4 +1,4 @@
-use numcore::math::vec3::{Vec3d, VEC3_ZERO};
+use numtypes::Vec3d;
 
 const TAU: f64 = 6.283185307179586476925286766559;
 

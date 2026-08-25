@@ -1,9 +1,9 @@
 [workspace]
 members = [
+    "crates/libs/numtypes",
     "crates/libs/numcore",
     "crates/libs/moltopo",
     "crates/libs/pgraph",
-    "crates/libs/pgraph_ops",
     "crates/libs/spacc",
     "crates/libs/molff",
     "crates/libs/surfff",
@@ -24,10 +24,10 @@ edition = "2021"
 
 [workspace.dependencies]
 # Internal crates
+numtypes = { path = "crates/libs/numtypes" }
 numcore = { path = "crates/libs/numcore" }
 moltopo = { path = "crates/libs/moltopo" }
 pgraph = { path = "crates/libs/pgraph" }
-pgraph_ops = { path = "crates/libs/pgraph_ops" }
 spacc = { path = "crates/libs/spacc" }
 molff = { path = "crates/libs/molff" }
 surfff = { path = "crates/libs/surfff" }

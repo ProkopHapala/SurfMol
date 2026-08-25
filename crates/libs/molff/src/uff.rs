@@ -1,6 +1,6 @@
-use numcore::math::quat4::{Quat4d, Quat4i, QUAT4I_MINUS_ONES};
-use numcore::math::vec3::{Vec3d, VEC3_NAN, VEC3_ZERO};
-use numcore::util::AlignedVec;
+use numtypes::{Quat4d, Quat4i, QUAT4I_MINUS_ONES};
+use numtypes::{Vec3d, VEC3D_ZERO as VEC3_ZERO};
+use numtypes::AlignedVec;
 use moltopo::topology::Topology;
 
 #[derive(Default)]
@@ -437,7 +437,6 @@ impl Uff {
 
     #[inline(always)]
     pub fn eval_atom_bonds(&mut self, ia: usize, apos: &[Vec3d], fapos: &mut [Vec3d], neighs: &[Quat4i], neigh_bs: &[Quat4i]) -> f64 {
-        use numcore::math::vec2::Vec2d;
         let hneigh = self.hneigh.as_mut_slice();
         let bon_params = self.bon_params.as_slice();
 
@@ -469,7 +468,7 @@ impl Uff {
 
     #[inline(always)]
     pub fn eval_angle_prokop(&mut self, ia: usize) -> f64 {
-        use numcore::math::vec2::Vec2d;
+        use numtypes::Vec2d;
         let ngs = self.ang_ngs.as_slice()[ia];
         if ngs[0] < 0 || ngs[1] < 0 { return 0.0; }
         let qij = self.hneigh.as_slice()[ngs[0] as usize]; // ji
@@ -508,7 +507,7 @@ impl Uff {
 
     #[inline(always)]
     pub fn eval_dihedral_prokop(&mut self, id: usize) -> f64 {
-        use numcore::math::vec2::Vec2d;
+        use numtypes::Vec2d;
         let ngs = self.dih_ngs.as_slice()[id];
         if ngs[0] < 0 || ngs[1] < 0 || ngs[2] < 0 { return 0.0; }
         let q12 = self.hneigh.as_slice()[ngs[0] as usize]; // ji
@@ -546,7 +545,7 @@ impl Uff {
 
     #[inline(always)]
     pub fn eval_inversion_prokop(&mut self, ii: usize) -> f64 {
-        use numcore::math::vec2::Vec2d;
+        use numtypes::Vec2d;
         let ngs = self.inv_ngs.as_slice()[ii];
         if ngs[0] < 0 || ngs[1] < 0 || ngs[2] < 0 { return 0.0; }
         let q21 = self.hneigh.as_slice()[ngs[0] as usize]; // ji

@@ -5,10 +5,10 @@ use std::sync::Arc;
 use glam::{Quat, Vec2, Vec3};
 use surfmol::mol_world::{BondedFFMode, MolWorld};
 use molff::nonbonded::NonBondedFF;
-use molrender::impostor::{AtomInstance, CameraData, ImpostorRenderer, look_at as imp_look_at, ortho as imp_ortho, mul4x4 as imp_mul4x4};
+use molrender::impostor::{AtomInstance, ImpostorRenderer};
 use molrender::line_renderer::{LineRenderer, LineVertex};
 use molrender::surface_renderer::SurfaceRenderer;
-use numcore::math::vec3::Vec3d;
+use numtypes::Vec3d;
 use moltopo::xyz;
 use moltopo::assign_uff;
 use moltopo::builder;
@@ -154,7 +154,7 @@ impl App {
         for ia in 0..world.uff.nangles as usize { let ang = world.uff.ang_atoms.as_slice()[ia]; let i0 = ang[0] as usize; let i1 = ang[1] as usize; let i2 = ang[2] as usize; let a = elems[i0].as_str(); let b = elems[i1].as_str(); let c = elems[i2].as_str(); let ap = params.get_angle_param(a, b, c).unwrap_or_else(|| panic!("missing angle param for {}-{}-{}", a, b, c)); let th0 = ap.a0.to_radians(); let ct = th0.cos(); let st2 = 1.0 - ct * ct; assert!(st2 > 1e-12, "invalid angle theta0={} deg leads to sin^2(theta0)~0", ap.a0); let c2 = 1.0 / (4.0 * st2); let c1 = -4.0 * c2 * ct; let c0 = c2 * (2.0 * ct * ct + 1.0); world.uff.ang_params.as_mut_slice()[ia] = [ap.k, c0, c1, c2, 0.0]; }
         for id in 0..world.uff.ndihedrals as usize { let d = world.uff.dih_atoms.as_slice()[id]; let a = uff_types[d.x as usize].as_str(); let b = uff_types[d.y as usize].as_str(); let c = uff_types[d.z as usize].as_str(); let e = uff_types[d.w as usize].as_str(); if let Some(dp) = params.get_dihedral_param(a, b, c, e, 1) { let a0 = dp.a0.to_radians(); let n = dp.n as f64; let phase = n * a0; let s = phase.sin().abs(); if s > 1e-3 { panic!("dihedral phase not supported by current Uff dihedral form: {}-{}-{}-{} a0={}deg n={} => n*a0={}deg", a, b, c, e, dp.a0, dp.n, phase.to_degrees()); } let dsign = if phase.cos() >= 0.0 { 1.0 } else { -1.0 }; world.uff.dih_params.as_mut_slice()[id] = [dp.k, dsign, dp.n as f64]; } else { world.uff.dih_params.as_mut_slice()[id] = [0.0, 1.0, 3.0]; } }
         for ii in 0..world.uff.ninversions as usize { let inv = world.uff.inv_atoms.as_slice()[ii]; let ic = inv.x as usize; let t = uff_types[ic].as_str(); if matches!(t, "C_R"|"C_2"|"N_R"|"O_2"|"O_R") { world.uff.inv_params.as_mut_slice()[ii] = [50.0, 1.0, -1.0, 0.0]; } else { world.uff.inv_params.as_mut_slice()[ii] = [0.0, 1.0, -1.0, 0.0]; } }
-        } else { for i in 0..world.natoms() { let mut req = [1.5, 0.1, 0.0, 0.0]; if charges[i] != 0.0 { req[2] = charges[i]; } world.nonbonded.as_mut().unwrap().reqs.as_mut_slice()[i] = req; } world.nonbonded.as_mut().unwrap().make_plqs(2.0); let apos_slice = world.dyn_atoms.atoms.apos.as_slice(); for ib in 0..world.uff.nbonds as usize { let b = world.uff.bon_atoms.as_slice()[ib]; let ia = b[0] as usize; let ja = b[1] as usize; let d = numcore::math::vec3::Vec3d::set_sub(apos_slice[ja], apos_slice[ia]); let l0 = d.norm(); world.uff.bon_params.as_mut_slice()[ib] = [100.0, l0]; } }
+        } else { for i in 0..world.natoms() { let mut req = [1.5, 0.1, 0.0, 0.0]; if charges[i] != 0.0 { req[2] = charges[i]; } world.nonbonded.as_mut().unwrap().reqs.as_mut_slice()[i] = req; } world.nonbonded.as_mut().unwrap().make_plqs(2.0); let apos_slice = world.dyn_atoms.atoms.apos.as_slice(); for ib in 0..world.uff.nbonds as usize { let b = world.uff.bon_atoms.as_slice()[ib]; let ia = b[0] as usize; let ja = b[1] as usize; let d = numtypes::Vec3d::set_sub(apos_slice[ja], apos_slice[ia]); let l0 = d.norm(); world.uff.bon_params.as_mut_slice()[ib] = [100.0, l0]; } }
         }
         for i in 0..world.natoms() { world.dyn_atoms.atoms.apos.as_mut_slice()[i].z += 2.0; }
         world.update_hneigh();

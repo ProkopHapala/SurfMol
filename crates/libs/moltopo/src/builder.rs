@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use numcore::math::vec3::Vec3d;
+use numtypes::Vec3d;
 use crate::topology::{Topology, build_angles_from_bonds, build_dihedrals_from_bonds, build_inversions_from_bonds};
 
 #[derive(Copy, Clone, Default, PartialEq, Eq, Hash, Debug)]

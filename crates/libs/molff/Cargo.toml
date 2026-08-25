@@ -5,7 +5,7 @@ edition = "2021"
 description = "Intra-molecular forcefields: UFF, RigidSp3, NonBonded"
 
 [dependencies]
-numcore = { workspace = true }
+numtypes = { workspace = true }
 moltopo = { workspace = true }
 ndarray = { workspace = true }
 

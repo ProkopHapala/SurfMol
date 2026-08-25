@@ -1,6 +1,6 @@
 use surfmol::mol_world::MolWorld;
 use moltopo::topology::Topology;
-use numcore::math::vec3::Vec3d;
+use numtypes::Vec3d;
 
 #[test]
 fn test_rigid_sp3_tetrahedron() {

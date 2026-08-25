@@ -1713,3 +1713,3293 @@ That seems much more Rust-natural while staying data-oriented.
 
 The two revised docs incorporate all of this, including the FireCore material that was largely missing from the earlier import inventory.
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---
+
+# USER
+
+OK, I let my coding agent implement it, it is not yet used, can you review it, both architecture (dependecies, modularity etc. what we discussed) but also effiicecy, we want to have aligned arrays, highly cache-aware data-oridented desing, SIMD friendly, etc etc, target is high perforamcne computing, it should be both simple/elegant (flexible and extensible withut much new code and without majore refactroing) and performant, these are the two major priorities
+
+https://github.com/ProkopHapala/SurfMol/tree/main/crates/libs
+read also 
+https://github.com/ProkopHapala/SurfMol/blob/main/AGENTS.md
+https://github.com/ProkopHapala/SurfMol/blob/main/DESIGN_GOALS.md
+
+evaluate if the implemented crates pgraph and spacc properly target that goals
+
+
+---
+
+
+# Chat GPT 5.6 sol
+
+The **conceptual architecture is good**, and I would keep `pgraph / pgraph_ops / spacc`. The coding agent captured most of what we discussed. But the implementation is not yet at the level where I would call it an HPC foundation. The main problems are relatively local and are best fixed **now, before anything depends on these crates**.
+
+My overall assessment:
+
+| Aspect                     | `pgraph` |  `spacc` | Comment                                                                    |
+| -------------------------- | -------: | -------: | -------------------------------------------------------------------------- |
+| Concept / separation       | **9/10** | **8/10** | The fundamental split is right                                             |
+| Simplicity / extensibility | **8/10** | **8/10** | Mostly compact, no trait/generic-framework bloat                           |
+| Data-oriented layout       | **8/10** | **6/10** | FixedAdj/CSR good; AABB/Buckets need work                                  |
+| Cache/SIMD readiness       | **6/10** | **5/10** | Ordinary `Vec`, some avoidable allocation/layout issues                    |
+| GPU friendliness           | **7/10** | **5/10** | `FixedAdj<4>` concept excellent; spacc is currently CPU/reference-oriented |
+| Fail-fast invariants       | **6/10** | **5/10** | Several malformed states can slip through or panic without useful context  |
+
+The project goals explicitly demand flat arrays, cache-aware SoA, 64-byte alignment and GPU-oriented `float4` layouts, so I am judging against that fairly high standard.
+
+## 1. `pgraph` architecture: fundamentally right
+
+This part I like.
+
+```rust
+PGraph {
+    pos:   Vec<Vec3d>,
+    edges: Vec<[u32;2]>,
+}
+```
+
+plus independent:
+
+```text
+Elements<N>
+Ragged
+Permutation
+FixedAdj<K>
+CsrAdj
+Partition / IndexGroups / RangeGroups
+```
+
+is much better than a giant generic `Graph<TVertex, TEdge, ...>` or a `GraphLike` trait hierarchy. The code also correctly states that adjacency is a selectable cache rather than graph identity, and domain attributes stay in sidecars.
+
+`PGraphView` is particularly important:
+
+```rust
+pub struct PGraphView<'a> {
+    pub pos:   &'a [Vec3d],
+    pub edges: &'a [[Index;2]],
+}
+```
+
+That should remain the interoperability mechanism. It means algorithms are **storage-neutral**: later an aligned molecular state, mmap file, editor `Vec`, or some GPU staging buffer can all expose the same slices without changing `pgraph_ops`.
+
+That is exactly the sort of extensibility you want: flexibility through simple array interfaces rather than through abstractions.
+
+---
+
+# 2. I would **not** mechanically replace every `Vec` by `AlignedVec`
+
+This is an important distinction.
+
+Right now `PGraph`, `Elements`, CSR, fixed adjacency, groups, etc. all use ordinary `Vec`; therefore the owning allocations are only guaranteed to satisfy the natural alignment of the element. For `[i32;4]`, that is not a guaranteed 16/64-byte allocation; for `Vec3d`, it is only its natural alignment.
+
+So literally, **the current implementation does not fulfill the 64-byte-aligned-array goal**.
+
+But alignment should follow the access pattern.
+
+| Structure                            | Recommendation                                   |
+| ------------------------------------ | ------------------------------------------------ |
+| `PGraph.pos`                         | **Keep `Vec<Vec3d>` for now**                    |
+| `PGraph.edges`                       | ordinary `Vec` is fine                           |
+| `Ragged`, `Partition`, `Permutation` | ordinary `Vec`                                   |
+| `CsrAdj`                             | ordinary `Vec` initially; alignment is secondary |
+| **`FixedRows<K>` / `FixedAdj<K>`**   | **64-byte aligned**                              |
+| forcefield topology/parameters       | **64-byte aligned**                              |
+| OpenCL state                         | packed `float4` / `int4`, aligned                |
+
+Why not align/pad `PGraph.pos` aggressively? `Vec3d` is 24 bytes. Even if the start is 64-byte aligned, its addresses go:
+
+```text
+0, 24, 48, 72, 96, ...
+```
+
+so individual vectors are not regularly 32/64-byte aligned anyway. And graph geometry often does indexed/gather accesses:
+
+```rust
+p0 = pos[edge[0]]
+p1 = pos[edge[1]]
+```
+
+where **vertex reordering/cache locality matters more than base alignment**.
+
+I therefore would **not change the fundamental graph to `Vec4d` merely for SIMD**. Keep the compact 24-byte scientific representation; bake to `float4` for GPU and to specialized aligned arrays where computation needs it.
+
+That preserves simplicity.
+
+---
+
+# 3. `FixedAdj<K>` is one of the strongest parts — but its storage should be aligned
+
+This:
+
+```rust
+pub struct FixedAdj<const K: usize> {
+    pub neigh: FixedRows<K>,
+    pub edge:  FixedRows<K>,
+}
+```
+
+is exactly right. Separate arrays are preferable to an AoS `(neighbor,edge)` pair because a kernel needing only neighbors doesn't pull bond IDs into cache. For organic molecules,
+
+```text
+FixedAdj<4>
+
+neigh: int4 / atom
+edge:  int4 / atom
+```
+
+maps naturally onto CPU SIMD and OpenCL `int4`.
+
+But currently:
+
+```rust
+FixedRows<K> {
+    data: Vec<[i32;K]>
+}
+```
+
+does not guarantee the alignment needed for that intention.
+
+This is the first place I would actually use:
+
+```rust
+AlignedVec<[i32; K], 64>
+```
+
+For `K=4`, each row is 16 B, so with a 64-B base every row is naturally 16-byte aligned. `K=8` gives 32-B rows and `K=16` gives 64-B rows.
+
+SurfMol's existing `Uff` already follows exactly this policy: its hot bond/angle/dihedral arrays and parameters are `AlignedVec<...,64>`.
+
+So `pgraph` should converge with what your forcefield code already does rather than invent a different allocation policy.
+
+---
+
+# 4. `build_fixed_adj()` does unnecessary work
+
+The current bulk builder first counts degree—which is good—but then ignores those counts during insertion and calls:
+
+```rust
+adj.neigh.push(...)
+adj.edge.push(...)
+```
+
+four times per edge. Each `push()` scans the row from slot zero looking for the first `-1`.
+
+For `K=4` that isn't disastrous, but for `K=16/64` it becomes silly. More importantly, the counts you already computed can serve directly as write cursors:
+
+```rust
+let mut next = vec![0usize; nverts];
+
+for (ie, &[a,b]) in edges.iter().enumerate() {
+    let sa = next[a as usize]; next[a as usize] += 1;
+    let sb = next[b as usize]; next[b as usize] += 1;
+
+    adj.neigh.data[a as usize][sa] = b as i32;
+    adj.edge .data[a as usize][sa] = ie as i32;
+
+    adj.neigh.data[b as usize][sb] = a as i32;
+    adj.edge .data[b as usize][sb] = ie as i32;
+}
+```
+
+The degree-count array itself can become `next` after overflow validation:
+
+```rust
+degrees.fill(0);
+```
+
+No searching for sentinels, no `Result`, no repeated `expect()`, deterministic O(E).
+
+Keep `FixedRows::push()` because it is useful for small incremental operations. Just don't use it for bulk construction.
+
+---
+
+# 5. Same optimization applies to CSR
+
+Current CSR construction does:
+
+```rust
+counts
+offsets
+cursor = offsets[..nverts].to_vec()
+scatter
+```
+
+so there is an unnecessary cursor allocation/copy.
+
+Again, reuse `counts` after making offsets:
+
+```text
+count degrees
+prefix -> offsets
+counts.fill(0)
+scatter at offsets[v] + counts[v]
+```
+
+This is exactly the classic Buckets implementation.
+
+It saves one `O(N)` allocation and memory pass with essentially no increase in code complexity.
+
+For a topology baked once this isn't huge, but it is the correct fundamental algorithm.
+
+---
+
+# 6. `spacc → pgraph` is the main dependency mistake
+
+The design document says:
+
+```text
+pgraph -> numcore
+spacc  -> numcore
+```
+
+and even `spacc/src/lib.rs` claims "`Depends only on numcore`".
+
+But its actual Cargo file has:
+
+```toml
+numcore
+pgraph
+```
+
+and `aabb.rs` imports:
+
+```rust
+use pgraph::Index;
+...
+groups: &pgraph::IndexGroups
+```
+
+I would definitely remove this dependency.
+
+`spacc` must be useful for:
+
+```text
+atoms
+particles
+rigid bodies
+mesh triangles
+AABBs
+terrain objects
+render instances
+collision bodies
+```
+
+without importing a positioned graph library.
+
+Make the interface simply:
+
+```rust
+fit_indexed_aabb(
+    pos: &[Vec3d],
+    ids: &[u32],
+)
+
+fit_group_aabbs(
+    pos: &[Vec3d],
+    offsets: &[u32],
+    items: &[u32],
+    out: &mut [Aabb],
+)
+```
+
+Because `pgraph::Index` is just a type alias for `u32`, nothing is lost.
+
+The resulting dependency graph is cleaner:
+
+```text
+                 numcore
+                /      \
+             pgraph    spacc
+                |
+           pgraph_ops
+                |
+             moltopo
+
+molff can later use moltopo + spacc
+```
+
+`pgraph_ops` only needs to acquire a `spacc` dependency if there eventually are real operations requiring both. Don't add it just for architectural symmetry.
+
+---
+
+# 7. `spacc::Buckets` currently regressed relative to existing SurfMol code
+
+This is probably the clearest concrete performance issue I found.
+
+Current `spacc` does:
+
+```rust
+pub fn scatter(...) {
+    let mut cursor = self.cell_i0s.clone();
+    ...
+}
+```
+
+which means **every spatial rebuild allocates/copies another O(ncell) array**.
+
+This is exactly the sort of thing you do not want if Buckets eventually rebuild every step/frame.
+
+More importantly, SurfMol already contains the better implementation in `molff::uff::Buckets`:
+
+```rust
+update_offsets() {
+    ...
+    for v in &mut self.cell_ns { *v = 0; }
+}
+
+add_to_cell(...) {
+    let i = cell_i0s[cell] + cell_ns[cell];
+    cell2obj[i] = obj;
+    cell_ns[cell] += 1;
+}
+```
+
+So `cell_ns` itself becomes the cursor. No temporary allocation.
+
+The new `spacc` implementation should become the generalized/extracted good implementation, and eventually `molff` should use it. That also follows your `AGENTS.md` rule to inventory and generalize rather than duplicate.
+
+I would actually simplify the representation further to:
+
+```rust
+pub struct Buckets {
+    counts:  Vec<u32>,  // rebuild scratch
+    offsets: Vec<u32>,  // ncells+1
+    items:   Vec<u32>,  // packed valid items
+}
+```
+
+Then:
+
+```rust
+cell(c) = &items[offsets[c]..offsets[c+1]];
+```
+
+No `nobjs` field, no duplicated `cell_ns + cell_i0s` query state, and it matches the CSR/Ragged convention used everywhere else.
+
+---
+
+# 8. Add the contiguous-fragment fast path to `spacc`
+
+The current:
+
+```rust
+fit_group_aabbs(pos, IndexGroups, out)
+```
+
+does indexed gathers:
+
+```rust
+p = pos[items[i]]
+```
+
+That is necessary for arbitrary groups.
+
+But one of your explicit performance goals is that **compiled fragments are contiguous in memory**.
+
+Therefore `spacc` should have two paths:
+
+```rust
+fit_index_groups_aabbs(pos, offsets, items, out) // arbitrary grouping
+
+fit_range_aabbs(pos, ranges, out)                // packed fragments
+```
+
+The second is simply:
+
+```rust
+for &[i0,i1] in ranges {
+    for p in &pos[i0..i1] { ... }
+}
+```
+
+which is a beautiful sequential cache stream.
+
+For your target fragment sizes of 16/32/64/128 atoms, this is exactly what you want before later replacing it with a GPU workgroup reduction.
+
+---
+
+# 9. Current `Aabb` is a good CPU reference, not yet an HPC/GPU representation
+
+Currently:
+
+```rust
+struct Aabb {
+    lo: Vec3d,   // 24 bytes
+    hi: Vec3d,   // 24 bytes
+}
+```
+
+so an AABB is 48 bytes and isn't declared `#[repr(C)]`.
+
+I would **not over-engineer this yet**.
+
+Keep this as the f64 CPU/reference geometry representation. But don't mistake it for the eventual GPU broad-phase format.
+
+For GPU I expect something closer to:
+
+```text
+float4 bb_lo[n]
+float4 bb_hi[n]
+```
+
+or:
+
+```rust
+#[repr(C)]
+struct Aabb4f {
+    lo: [f32;4],
+    hi: [f32;4],
+}
+```
+
+32 B/AABB, natural `float4` loads.
+
+No reason to infect generic `Aabb` with scalar generics at this stage.
+
+There is, however, one correctness issue now: an empty AABB uses `(+inf,-inf)`, and `center()` on it generates NaNs. Empty groups are currently explicitly allowed by `fit_group_aabbs()`. That clashes with your fail-fast philosophy. Either add a well-defined `is_empty()` contract or reject empty semantic groups at bake time.
+
+---
+
+# 10. `Ragged` and `IndexGroups` are unnecessarily duplicated
+
+These are structurally identical:
+
+```rust
+Ragged {
+    offsets,
+    items,
+}
+
+IndexGroups {
+    offsets,
+    items,
+}
+```
+
+and each reimplements group slicing.
+
+Given your earlier question about a common set of fundamental structures, I would simplify this now.
+
+Something like:
+
+```rust
+pub struct RaggedIndex {
+    pub offsets: Vec<Index>,
+    pub items:   Vec<Index>,
+}
+
+pub type IndexGroups = RaggedIndex;
+```
+
+Potential future aliases:
+
+```rust
+pub type Loops = RaggedIndex;
+pub type Rings = RaggedIndex;
+```
+
+This is exactly the correct sort of abstraction: **one storage primitive, almost zero additional machinery**.
+
+`RangeGroups` remains a genuinely different representation.
+
+---
+
+# 11. One function already violates the data-oriented representation: `split_by_component`
+
+`connected_components()` nicely returns a flat `Partition`.
+
+Then `split_by_component()` converts that into:
+
+```rust
+Vec<Vec<Index>>
+```
+
+creating one separate heap allocation per component.
+
+That is precisely what `IndexGroups/Ragged` was invented to avoid.
+
+It should return the packed representation:
+
+```text
+offsets[]
+items[]
+```
+
+This also demonstrates why I think the core design itself is good: the proper data structure already exists; a few algorithms simply aren't consistently using it yet.
+
+---
+
+# 12. Reordering is good, but only half-finished for cache locality
+
+`group_aware_permutation()` is a good idea and matches the contiguous-fragment goal.
+
+However:
+
+```rust
+permute_edges()
+```
+
+only remaps the endpoints. It **does not reorder the edges themselves**.
+
+After packing atoms by fragment, I would also optionally pack/sort edges, for example by:
+
+```text
+(min(a,b), max(a,b))
+```
+
+or fragment / first endpoint.
+
+Why? A bond loop then walks endpoints clustered in nearby position memory rather than visiting bonds in historical editor insertion order.
+
+For molecular systems this may be modest; for large trusses/meshes it can matter significantly.
+
+The important point is: make **vertex permutation and edge permutation both first-class**, rather than assuming remapping vertex IDs automatically gives a cache-optimal edge stream.
+
+---
+
+# 13. Fail-fast validation needs strengthening
+
+The code is generally defensive, but there are several dangerous holes.
+
+`Permutation::from_new2old()` accepts duplicates or omitted indices and silently leaves invalid `old2new` entries.
+
+`Ragged::ngroups()`, `IndexGroups::ngroups()` and `CsrAdj::nverts()` assume `offsets.len() >= 1`.
+
+The adjacency builders index edges before providing a contextual check that `a,b < nverts`.
+
+`Buckets` does not explicitly check that:
+
+```text
+cell_of_obj.len() == expected object count
+0 <= cell < ncells
+```
+
+before indexing.
+
+And `PGraph::validate()` checks connectivity but not whether positions are finite.
+
+These checks should happen during construction/bake, not in hot kernels, so they cost essentially nothing in the final evaluator.
+
+I would rather have:
+
+```text
+vertex 173 has cell=591 but ncells=512
+```
+
+than a generic Rust bounds panic.
+
+---
+
+# 14. The existing `AlignedVec` creates one policy question you should resolve
+
+SurfMol already has a real 64-byte allocator in `numcore`.  UFF already relies heavily on it.
+
+So using it for `FixedRows` is natural.
+
+But `AGENTS.md` and `DESIGN_GOALS.md` currently say all project `unsafe` should be isolated to the OpenCL crate, while `numcore::AlignedVec` itself uses `std::alloc` and several unsafe blocks.
+
+That is already an architectural contradiction, independent of `pgraph`.
+
+Given your priorities, I would probably explicitly bless:
+
+```text
+numcore::AlignedVec
+```
+
+as a tiny second audited unsafe island, rather than sacrifice control of alignment. Alternatively use a tiny safe aligned-allocation dependency.
+
+But make the rule explicit, because otherwise coding agents will repeatedly "fix" one side or the other.
+
+---
+
+# 15. What I would change before allowing other crates to depend on these
+
+| Priority | Change                                                              | Reason                                        |
+| -------- | ------------------------------------------------------------------- | --------------------------------------------- |
+| **P0**   | Remove `spacc -> pgraph`                                            | Correct reusable dependency boundary          |
+| **P0**   | Make `FixedRows<K>` 64-B aligned                                    | This structure is explicitly HPC/GPU-oriented |
+| **P0**   | Rewrite fixed-adj bulk build using degree counters as write cursors | O(E), branch-light, works well for K=64 too   |
+| **P0**   | Remove CSR/Buckets cursor clones; reuse count buffers               | No allocation during rebuild                  |
+| **P0**   | Add contiguous `fit_range_aabbs()`                                  | Directly realizes contiguous fragment design  |
+| **P0**   | Strengthen validation at bake/build boundaries                      | Prevent subtle corrupted layouts              |
+| **P1**   | Collapse `Ragged` + `IndexGroups` to one primitive                  | Less code, more reusable                      |
+| **P1**   | Make components return packed groups, not `Vec<Vec<_>>`             | Data-oriented, one allocation                 |
+| **P1**   | Optimize Tarjan bridge unwind                                       | Avoid rescanning parent's neighbor list       |
+| **P1**   | Add optional edge reordering                                        | Better endpoint/cache locality                |
+| **P1**   | Add flat-array access to `FixedRows<K>`                             | Easy OpenCL `int4`/flat upload                |
+| **P1**   | Resolve `AlignedVec`/unsafe policy                                  | Architecture/docs consistency                 |
+| **P2**   | Add GPU `float4` AABB representation                                | When actual OpenCL broad phase is implemented |
+| **P2**   | Morton/uniform grid                                                 | Only once an actual consumer needs them       |
+
+I would **not** introduce traits, allocators as generic type parameters, a generic scalar `PGraph<T>`, ECS-style attributes, or a BVH framework now. Those would hurt the simplicity/extensibility goal rather than help it.
+
+## Bottom line
+
+The coding agent understood the **important conceptual decisions**. In particular, `PGraph`, `PGraphView`, separate sidecars, fixed vs CSR adjacency, partitions/permutations, and the `pgraph_ops` separation are all worth keeping. The implementation is already much closer to the architecture you want than the old FireCore class hierarchy.
+
+The key correction is to recognize two tiers:
+
+```text
+GENERAL / BUILD-TIME                    HOT / COMPILED
+────────────────────                    ──────────────
+PGraph Vec3d                            aligned FF arrays
+edges                                   FixedAdj<K>
+Ragged / Partition                     contiguous fragments
+CSR generic traversal                  GPU float4/int4
+Permutation                            spacc packed broad phase
+```
+
+That gives you **simplicity without giving up HPC**. You do not need every generic container to look like an AVX kernel. But every structure whose *purpose* is fast repeated numerical evaluation—especially `FixedAdj`, fragment ranges, Buckets rebuilds and forcefield arrays—should be designed much more aggressively around alignment, allocation-free reuse and contiguous streaming.
+
+Because none of these new crates is used yet, I would make the P0 changes **before integrating `pgraph` into `moltopo`**. That should be a relatively small correction rather than a redesign.
+
+
+
+
+
+
+
+
+
+
+
+
+---
+
+# USER
+
+I think you analysis is great and I agree with most of it, but reading it and looking on the code I'm more and mor inclined to do oe radical architecturral change.
+
+what about refactoring all datatypes (structs) into crate numtype which weill moctly contian just lighweith sharable data layout definition (maybe minimal code about the aglocators, copy/move sematics ...? most low level probably also unsafe)
+
+this will be than used by pgraph\_ops (we can rename it to pgraph because current pgraph would berge to numptypes), spacc and numcore (numcore woull be now about algorithms operation on numtypes not mix both together), now spacc,pgrah and numcore does not need to depend on each other only on numtypes
+
+ad "But `AGENTS.md` and `DESIGN_GOALS.md` currently say all project `unsafe` should be isolated to the OpenCL crate, while `numcore::AlignedVec` itself uses `std::alloc` and several unsafe blocks."
+I never wrote it, agent missintepreted it, we should remove this form our rules, yes, we need unsafe from low level 
+
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes. I think this is a **better architecture than the current `numcore + pgraph + pgraph_ops + spacc` split**, especially for what you are trying to build: a small HPC-oriented foundation where data layout is stable and many independent algorithm modules operate on it.
+
+The main thing I would change in your formulation is:
+
+> **Do not interpret “all structs go to `numtypes`” literally.**
+>
+> Put all **generic, reusable low-level data-layout types** there. Keep domain-specific state beside its domain.
+
+That distinction keeps `numtypes` from becoming a garbage drawer.
+
+## 1. The architecture I would aim for
+
+Something like:
+
+```text
+                         numtypes
+                 _________|___________
+                /         |           \
+             numcore    pgraph        spacc
+                \         |           /
+                 \        |          /
+                  \       |         /
+                       moltopo
+                         |
+                       molff
+                         |
+                       surfmol
+```
+
+where the three foundational algorithm crates are siblings:
+
+```text
+numtypes     = data layout + primitive local operations
+numcore      = numerical/math algorithms
+pgraph       = graph/geometry algorithms
+spacc        = spatial algorithms
+```
+
+and crucially:
+
+```text
+numcore ─X→ pgraph
+pgraph  ─X→ spacc
+spacc   ─X→ pgraph
+```
+
+They communicate through types defined below them.
+
+That is very attractive.
+
+The current `pgraph_ops` should indeed become simply **`pgraph`**, while the current `pgraph` data structures move down.
+
+---
+
+# 2. `numtypes` is essentially your C header/data ABI layer
+
+I would think of `numtypes` almost like the collection of low-level `.h` files you would naturally use in C/C++:
+
+```text
+numtypes/
+    math.rs
+    alloc.rs
+    index.rs
+    graph.rs
+    spatial.rs
+```
+
+For example:
+
+```rust
+// math
+Vec2f
+Vec3f
+Vec3d
+Vec4f
+Quat4f
+Quat4d
+Mat3d
+...
+
+// basic index layouts
+Index
+INVALID
+Elements<N>
+RaggedIndex
+Permutation
+Partition
+RangeGroups
+
+// graph layouts
+PGraph
+PGraphView
+FixedRows<K>
+FixedAdj<K>
+CsrAdj
+
+// spatial primitive layouts
+Aabb
+Aabb4f
+GridShape3
+...
+```
+
+Perhaps eventually:
+
+```text
+AlignedVec<T,64>
+AlignedArray...
+```
+
+These types should be boring, transparent, predictable.
+
+In particular I would strongly encourage:
+
+```rust
+#[repr(C)]
+#[derive(Copy, Clone, ...)]
+```
+
+where appropriate, and `bytemuck::Pod/Zeroable` for things that genuinely satisfy the requirements.
+
+That gives you a very useful common ABI:
+
+```text
+Rust CPU algorithms
+OpenCL staging
+wgpu rendering
+binary files
+FFI
+debugging tools
+```
+
+all speaking essentially the same simple array language.
+
+---
+
+# 3. Important Rust caveat: `numtypes` cannot contain *only* struct declarations
+
+This is because Rust does not allow another crate to add inherent methods to a type.
+
+Suppose:
+
+```rust
+// numtypes
+pub struct Vec3d { x:f64, y:f64, z:f64 }
+```
+
+Then `numcore` cannot later do:
+
+```rust
+impl Vec3d {
+    fn dot(...) ...
+}
+```
+
+because `Vec3d` belongs to `numtypes`.
+
+Nor can `numcore` implement:
+
+```rust
+impl std::ops::Add for Vec3d
+```
+
+because both `Add` and `Vec3d` are foreign to `numcore`.
+
+So I would put **tiny intrinsic operations beside the type**:
+
+```rust
+impl Vec3d {
+    #[inline(always)] pub const fn new(...) -> Self
+    #[inline(always)] pub fn dot(self, b: Self) -> f64
+    #[inline(always)] pub fn norm2(self) -> f64
+    #[inline(always)] pub fn cross(...)
+}
+
+impl Add for Vec3d { ... }
+impl Sub for Vec3d { ... }
+impl Mul<f64> for Vec3d { ... }
+```
+
+That does **not** violate the idea.
+
+I would define the distinction as:
+
+```text
+numtypes
+    layout + primitive operations intrinsic to one value
+
+numcore
+    algorithms operating on arrays / many values
+```
+
+So:
+
+```text
+Vec3d::dot()                  numtypes
+Vec3d::cross()                numtypes
+Quat4d::rotate()              numtypes
+
+matmul(A,B)                   numcore
+CG solver                     numcore
+Jacobi                        numcore
+FFT wrappers                  numcore
+PCA                           numcore
+linear regression             numcore
+batch vector transformations  numcore
+```
+
+That boundary is both natural and Rust-friendly.
+
+---
+
+# 4. The current `numcore` is actually mixing exactly these two concepts
+
+Today it contains things like `Vec3d` and `AlignedVec`.
+
+But it also contains genuine algorithm modules such as linalg/fastmath etc.
+
+So splitting it is conceptually clean:
+
+```text
+old numcore
+    |
+    +-- low-level data / ABI -------------> numtypes
+    |
+    `-- numerical algorithms -------------> numcore
+```
+
+I like this much more than letting `numcore` gradually become the universal dependency containing unrelated utilities.
+
+---
+
+# 5. And it solves the problem I identified with `spacc -> pgraph`
+
+Today:
+
+```text
+spacc
+  -> numcore
+  -> pgraph
+```
+
+because `spacc` wants `Index` and `IndexGroups`.
+
+Under the new arrangement:
+
+```text
+spacc -> numtypes
+pgraph -> numtypes
+numcore -> numtypes
+```
+
+and `spacc` can naturally accept:
+
+```rust
+fit_group_aabbs(
+    pos: &[Vec3d],
+    groups: &RaggedIndex,
+    out: &mut [Aabb],
+)
+```
+
+without knowing what a graph is.
+
+Exactly right.
+
+Similarly `pgraph` can use:
+
+```rust
+PGraph
+CsrAdj
+FixedAdj
+Partition
+Permutation
+```
+
+without knowing anything about spatial acceleration.
+
+---
+
+# 6. I would even move `Aabb` into `numtypes`
+
+This is where I think your more radical idea improves my previous proposal.
+
+Previously I was thinking:
+
+```text
+spacc owns Aabb
+```
+
+But if we really embrace the new architecture, `Aabb` is not an algorithm. It is a basic geometric data type:
+
+```rust
+struct Aabb {
+    lo: Vec3d,
+    hi: Vec3d,
+}
+```
+
+It can be used by:
+
+```text
+spacc
+renderer
+selection
+picking
+mesh code
+molecule code
+debugging
+```
+
+So:
+
+```text
+numtypes::Aabb
+```
+
+makes sense.
+
+Then `spacc` owns:
+
+```text
+fit_aabb()
+fit_group_aabbs()
+overlap_pairs()
+build_grid()
+build_bvh()
+...
+```
+
+That is a very clean distinction.
+
+---
+
+# 7. Same for `Buckets`? Here I would be slightly more conservative
+
+There are two categories.
+
+### Pure data contract
+
+Definitely `numtypes`:
+
+```text
+Aabb
+CsrAdj
+FixedAdj
+PGraphView
+RaggedIndex
+Permutation
+Vec3d
+```
+
+### Algorithm-owned mutable state/cache
+
+Potentially stays with the algorithm:
+
+```rust
+pub struct Buckets {
+    ...
+}
+```
+
+because `Buckets` is both a representation and the mutable state of a specific algorithm.
+
+I don't think it hurts if it stays:
+
+```text
+spacc::Buckets
+```
+
+The dependency graph remains clean.
+
+Likewise a future:
+
+```text
+spacc::Bvh
+spacc::UniformGrid
+numcore::CgWorkspace
+pgraph::TarjanWorkspace
+```
+
+should not be moved to `numtypes` just because they happen to be structs.
+
+Otherwise `numtypes` eventually contains every scratch buffer in the project.
+
+So my precise rule would be:
+
+> **`numtypes` contains shared data contracts, not all Rust structs.**
+
+That is the important safeguard.
+
+---
+
+# 8. Likewise molecular structs should NOT migrate there
+
+For example:
+
+```rust
+AtomConf
+MolBond
+MolTopology
+UffTopo
+RigidSp3Params
+```
+
+are data structures, but they carry chemistry or forcefield semantics.
+
+Keep them:
+
+```text
+moltopo::AtomConf
+moltopo::MolTopology
+molff::UffTopo
+```
+
+even if internally they use:
+
+```text
+numtypes::FixedAdj<4>
+numtypes::Elements<3>
+numtypes::RangeGroups
+```
+
+That preserves the direction:
+
+```text
+generic -> domain-specific
+```
+
+and never the reverse.
+
+---
+
+# 9. This also improves the meaning of `pgraph`
+
+I actually prefer:
+
+```text
+pgraph = graph algorithms
+```
+
+over:
+
+```text
+pgraph = graph POD
+pgraph_ops = graph algorithms
+```
+
+The latter always feels slightly artificial.
+
+Under your new structure:
+
+```rust
+use numtypes::{PGraph, CsrAdj};
+
+let csr = pgraph::build_csr(...);
+let comps = pgraph::components(...);
+let bridges = pgraph::find_bridges(...);
+```
+
+That reads very naturally.
+
+Likewise:
+
+```rust
+let bb = spacc::fit_aabb(...);
+let grid = spacc::build_grid(...);
+
+let eig = numcore::jacobi(...);
+```
+
+The crate name tells you **what kind of computation is happening**, and all computations consume the same basic data vocabulary.
+
+I think that's elegant.
+
+---
+
+# 10. I would merge `Ragged` and `IndexGroups` during this refactor
+
+The new common type crate is exactly the right moment.
+
+Instead of:
+
+```rust
+Ragged
+IndexGroups
+```
+
+which are byte-for-byte the same concept, just have something like:
+
+```rust
+pub struct RaggedIndex {
+    pub offsets: Vec<Index>,
+    pub items: Vec<Index>,
+}
+```
+
+And if semantic aliases make code more readable:
+
+```rust
+pub type IndexGroups = RaggedIndex;
+```
+
+Maybe not even aliases unless needed.
+
+Then:
+
+```text
+rings
+polygon loops
+components
+groups
+neighbor lists
+```
+
+can all use the same packed primitive.
+
+This is exactly the kind of **generalization that reduces code rather than increases it**.
+
+---
+
+# 11. The low-level allocator belongs in `numtypes`
+
+Yes.
+
+I strongly agree with you here.
+
+Something like:
+
+```text
+numtypes::alloc
+    AlignedVec<T,A>
+```
+
+is a natural low-level primitive.
+
+And I would explicitly define this crate as one of the places where `unsafe` is expected and audited.
+
+For example:
+
+```rust
+//! Low-level memory/data-layout primitives.
+//!
+//! `unsafe` is allowed here when needed for allocation, alignment,
+//! zero-copy views, SIMD/GPU interoperability, etc.
+//! Keep unsafe small, documented and tested.
+```
+
+Then algorithm crates can preferably be entirely safe:
+
+```text
+numtypes     unsafe allowed
+numcore      safe unless strongly justified
+pgraph       safe
+spacc        safe in CPU code
+opencl       unsafe allowed at FFI/interoperability boundary
+```
+
+That is a much more sensible policy than “unsafe only in OpenCL”.
+
+---
+
+# 12. Yes, remove that rule from `AGENTS.md` and `DESIGN_GOALS.md`
+
+The current text says:
+
+> “only OpenCL crate uses unsafe”
+
+and `DESIGN_GOALS.md` similarly requires all unsafe to be confined to a single feature-gated OpenCL crate.
+
+But the repository already contradicts this through `numcore::AlignedVec`, which necessarily uses low-level allocation operations.
+
+Since you say that restriction was the agent's interpretation rather than your rule, I would replace it with something closer to:
+
+> **Unsafe is allowed where it provides a concrete low-level benefit**—custom aligned allocation, SIMD/data-layout operations, FFI, OpenCL/graphics interoperability. Keep unsafe localized in foundational low-level modules, expose safe APIs upward, document invariants with `// SAFETY:`, and do not use unsafe merely to bypass borrow checking or bounds checks without measured need.
+
+This aligns far better with HPC.
+
+I would **not** say “all unsafe must live in `numtypes`” either, because OpenCL FFI naturally belongs in the OpenCL crate.
+
+More like:
+
+```text
+unsafe is a low-level implementation tool,
+not an architectural taboo.
+```
+
+---
+
+# 13. `AlignedVec` itself should become a real foundational primitive
+
+Since it would now be foundational, I would tighten its contract a little.
+
+Probably:
+
+```rust
+pub struct AlignedVec<T, const A: usize> { ... }
+```
+
+but intended primarily for plain HPC values:
+
+```text
+Copy
+POD-like
+no complicated Drop semantics
+```
+
+Potentially even:
+
+```rust
+T: bytemuck::Pod
+```
+
+although I wouldn't force that until you know it doesn't become annoying.
+
+Important features, but no `std::vector` imitation bloat:
+
+```rust
+new()
+with_capacity()
+with_len()
+len()
+capacity()
+resize()
+as_slice()
+as_mut_slice()
+as_ptr()
+as_mut_ptr()
+
+Deref<Target=[T]>
+DerefMut
+```
+
+Maybe:
+
+```rust
+From<Vec<T>>
+```
+
+only if needed.
+
+No need to recreate the entire Rust `Vec` API.
+
+---
+
+# 14. I would define a very strict policy for data representations
+
+This refactor gives you the opportunity to write down something quite powerful:
+
+### Editing/general representation
+
+```text
+Vec<T>
+u32 indices
+f64 geometry
+compact memory
+easy mutation
+```
+
+### Compiled CPU representation
+
+```text
+AlignedVec<T,64>
+fixed-stride adjacency where useful
+contiguous fragment ranges
+SoA where kernels benefit
+```
+
+### GPU representation
+
+```text
+f32
+float4 / int4
+workgroup-sized blocks
+explicit padding
+zero-copy-compatible POD
+```
+
+All three can be expressed using types originating in `numtypes`.
+
+This is much cleaner than trying to force a single universal storage layout to simultaneously be ideal for topology editing, AVX and OpenCL.
+
+---
+
+# 15. One subtle but important point: data *layout* and data *ownership* should be separate where possible
+
+For example, I would consider pairs like:
+
+```rust
+pub struct PGraph {
+    pub pos: Vec<Vec3d>,
+    pub edges: Vec<[Index;2]>,
+}
+
+pub struct PGraphView<'a> {
+    pub pos: &'a [Vec3d],
+    pub edges: &'a [[Index;2]],
+}
+```
+
+But over time the **view** is probably the more important universal contract.
+
+Algorithms should prefer:
+
+```rust
+fn foo(pos: &[Vec3d], edges: &[[Index;2]])
+```
+
+or:
+
+```rust
+fn foo(g: PGraphView<'_>)
+```
+
+rather than:
+
+```rust
+fn foo(g: &PGraph)
+```
+
+Then whether the owner uses:
+
+```text
+Vec
+AlignedVec
+mapped memory
+GPU staging buffer
+molecular topology wrapper
+```
+
+does not propagate through the API.
+
+This is one of the strongest ways of combining flexibility with performance.
+
+---
+
+# 16. What I would *not* do
+
+I would avoid turning `numtypes` into a highly abstract type framework:
+
+```rust
+Graph<TPos, TIndex, Allocator, Storage>
+Vector<S, N>
+Adjacency<Layout>
+SpatialStructure<T>
+```
+
+No.
+
+I'd keep it brutally concrete:
+
+```rust
+Vec3d
+Vec4f
+Index = u32
+PGraph
+PGraphView
+FixedAdj<K>
+CsrAdj
+RaggedIndex
+Aabb
+AlignedVec<T,A>
+```
+
+You can add another concrete layout later in ~10 lines when a kernel actually needs it.
+
+That is much closer to your desired design philosophy.
+
+---
+
+## Revised architectural picture
+
+I think I would now settle on this:
+
+```text
+numtypes
+│
+├── math types
+│   Vec2/3/4, Quat, Mat...
+│
+├── memory/layout
+│   AlignedVec
+│
+├── generic indexing
+│   Index, Elements<N>, RaggedIndex,
+│   Partition, Permutation, RangeGroups
+│
+├── graph layouts
+│   PGraph, PGraphView,
+│   CsrAdj, FixedRows<K>, FixedAdj<K>
+│
+└── geometry layouts
+    Aabb, perhaps Ray etc.
+
+
+numcore  ───────► numtypes
+    numerical algorithms
+
+pgraph   ───────► numtypes
+    graph + positioned-geometry algorithms
+    adjacency
+    components
+    bridges/rings
+    reorder
+    graph geometry
+    selection/picking
+
+spacc    ───────► numtypes
+    AABB fitting
+    Buckets
+    uniform grids
+    Morton
+    BVH/broad phase
+
+
+moltopo ───────► numtypes + pgraph (+ spacc only where actually needed)
+
+molff   ────────► numtypes + numcore + moltopo (+ spacc)
+
+surfmol ────────► domain crates
+```
+
+I think this is **cleaner than what we designed yesterday**. The reason is not merely fewer dependency arrows: it creates a deliberately stable **data-oriented vocabulary at the bottom**, while algorithms remain independent and composable above it.
+
+And because the new `pgraph/spacc` code is not yet integrated, this is precisely the right moment for such a fairly radical refactor—it becomes much more painful once `moltopo`, renderers and forcefields start importing the current locations.
+
+
+
+
+
+
+
+---
+
+# USER
+
+ad Vec4 and Quat should be the same thing, we should only add few minimal function operation on Vec4 as quaternion operation, the same Vec2 are complex number. 
+
+I agree that subset of operations we should add direcly to our numptypes, but we do not want to use sematics like * for Vec2/Vec4 being complex/quaterion multiplication, keep simple component-wise sematics, and complex/quaternion multiplication lets implement as snadalone inline functions. (not sure if in numcore or drecly in numtypes, that is not so important), AABB can have in numptypes intrising function like inside or enclose, merge which are lightweight, basically jusgment which function sould be intrinsinc is if they are small inlined and used very often (core behaviour of given class)
+
+---
+
+
+# Chat GPT 5.6 sol
+
+Yes — I agree, and I think this makes `numtypes` cleaner still.
+
+The key principle should be:
+
+> **A type represents memory layout, not mathematical interpretation.**
+
+So `Vec2`, `Vec3`, `Vec4` are the fundamental storage/math types. Complex numbers and quaternions are *operations/interpretations* of `Vec2` and `Vec4`, not separate structs.
+
+## 1. One `Vec4`, no separate `Quat4`
+
+I would remove the duplication:
+
+```rust
+pub struct Vec4d {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub w: f64,
+}
+```
+
+and use it everywhere:
+
+```rust
+let q: Vec4d;   // quaternion when interpreted as one
+let v: Vec4d;   // generic SIMD/vector quantity otherwise
+```
+
+Likewise:
+
+```rust
+Vec2d
+```
+
+can be a 2-vector or complex number.
+
+This is particularly good for HPC/GPU because it maps directly onto:
+
+```text
+float2
+float4
+double2
+double4
+```
+
+without introducing artificial CPU-side wrapper types.
+
+I would **not even make a `Quat4d` wrapper struct**, because then sooner or later you get conversions, duplicate methods, duplicate OpenCL layouts, generic constraints, etc.
+
+A type alias such as
+
+```rust
+pub type Quat4d = Vec4d;
+```
+
+could be retained temporarily for migration/readability if useful, but conceptually I would phase it out.
+
+---
+
+## 2. Operators should always have boring component-wise semantics
+
+Strongly agree.
+
+This:
+
+```rust
+a + b
+a - b
+a * b
+a / b
+```
+
+should mean component-wise vector algebra where implemented.
+
+In particular **never overload `Vec4 * Vec4` to mean quaternion multiplication**.
+
+Likewise `Vec2 * Vec2` should not suddenly mean complex multiplication.
+
+That's important because otherwise:
+
+```rust
+a * b
+```
+
+has completely different mathematical meaning depending on whether the programmer mentally considers the values vectors, complex numbers, or quaternions.
+
+For a numerical/HPC library, explicit is much better:
+
+```rust
+cmul(a, b)
+qmul(a, b)
+```
+
+It is also more recognizable when reading a hot kernel.
+
+---
+
+# 3. I would use standalone functions for these semantic operations
+
+Something compact like:
+
+```rust
+#[inline(always)]
+pub fn cmul(a: Vec2d, b: Vec2d) -> Vec2d {
+    Vec2d::new(
+        a.x*b.x - a.y*b.y,
+        a.x*b.y + a.y*b.x,
+    )
+}
+```
+
+and:
+
+```rust
+#[inline(always)]
+pub fn qmul(a: Vec4d, b: Vec4d) -> Vec4d {
+    Vec4d::new(
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
+    )
+}
+```
+
+assuming the canonical layout is:
+
+```text
+(x,y,z,w)
+vector part xyz
+scalar part w
+```
+
+I strongly recommend fixing this convention globally now. It maps naturally to GPU `float4`, where `.xyz` is geometrical and `.w` is scalar/auxiliary.
+
+Then perhaps:
+
+```rust
+qconj(q)
+qmul(a,b)
+qrotate(q,v)
+```
+
+and:
+
+```rust
+cmul(a,b)
+cconj(a)
+```
+
+No classes, traits or semantic wrapper types required.
+
+---
+
+# 4. Your criterion for intrinsic methods is exactly the one I would use
+
+I would formulate it as:
+
+> **Put an operation with the datatype when it is tiny, ubiquitous, inlineable, and intrinsic to manipulating one instance of that datatype.**
+
+So `Vec3` should certainly have:
+
+```rust
+v.dot(b)
+v.norm2()
+v.norm()
+v.add_mul(b,k)
+```
+
+perhaps:
+
+```rust
+cross(a,b)
+```
+
+either method or free function.
+
+`Aabb`:
+
+```rust
+bb.contains(p)
+bb.include(p)
+bb.merge(other)
+bb.center()
+bb.size()
+bb.overlaps(other)
+```
+
+Absolutely.
+
+They are essentially part of what an AABB *is*.
+
+By contrast:
+
+```text
+fit AABB over 1M points
+build group AABBs
+construct BVH
+spatial sweep
+broad-phase collision
+```
+
+are algorithms and belong to `spacc`.
+
+That boundary is much better than trying to decide based on some abstract OO notion of encapsulation.
+
+---
+
+# 5. I'd use the same criterion for graph types
+
+For example, `CsrAdj` in `numtypes` can have trivial accessors:
+
+```rust
+#[inline(always)]
+pub fn degree(&self, i: usize) -> usize { ... }
+
+#[inline(always)]
+pub fn neighs(&self, i: usize) -> &[Index] { ... }
+```
+
+because those are just interpretation/indexing of its own layout.
+
+But:
+
+```rust
+build_csr(edges)
+find_components(csr)
+find_bridges(csr)
+```
+
+belong in `pgraph`.
+
+Likewise `FixedRows<K>`:
+
+```rust
+row(i)
+row_mut(i)
+degree(i)
+```
+
+can be intrinsic.
+
+But:
+
+```rust
+build_fixed_adj<K>(edges)
+```
+
+belongs in `pgraph`.
+
+This gives a very clean mental rule.
+
+---
+
+# 6. Similar distinction for `AlignedVec`
+
+Its fundamental memory-management behavior lives in `numtypes`:
+
+```rust
+new
+with_capacity
+resize
+as_slice
+as_mut_slice
+as_ptr
+```
+
+But algorithms such as:
+
+```text
+vector reductions
+SIMD transforms
+sorting/reordering
+BLAS-like operations
+```
+
+do not.
+
+Again: **local behavior of the storage object versus algorithms over datasets.**
+
+---
+
+# 7. I would probably structure `numtypes` approximately like this
+
+Not too many source files initially:
+
+```text
+numtypes/
+  src/
+    lib.rs
+    vec.rs
+    geom.rs
+    graph.rs
+    alloc.rs
+```
+
+### `vec.rs`
+
+```text
+Vec2f Vec2d
+Vec3f Vec3d
+Vec4f Vec4d
+
+component-wise operators
+dot/norm/etc.
+
+cmul
+qmul
+qconj
+qrotate
+```
+
+I don't think complex/quaternion functions need their own modules unless they eventually grow considerably.
+
+### `geom.rs`
+
+```text
+Aabb
+Ray maybe
+Plane maybe
+
+tiny intrinsic operations only
+```
+
+### `graph.rs`
+
+```text
+Index
+INVALID
+
+Elements<N>
+RaggedIndex
+Permutation
+Partition
+RangeGroups
+
+PGraph
+PGraphView
+CsrAdj
+FixedRows<K>
+FixedAdj<K>
+```
+
+### `alloc.rs`
+
+```text
+AlignedVec<T,A>
+```
+
+That's already enough.
+
+---
+
+# 8. I would resist traditional mathematical type proliferation
+
+This design also avoids something I dislike in many Rust math libraries:
+
+```text
+Vector4
+Quaternion
+Complex
+Point3
+Normal3
+Direction3
+Color4
+Homogeneous4
+```
+
+even when all of them are literally four numbers and eventually need constant conversions.
+
+For your use cases that is more obstruction than safety.
+
+Better:
+
+```text
+Vec2
+Vec3
+Vec4
+```
+
+plus explicit functions indicating semantics at the operation site.
+
+For example:
+
+```rust
+let q2 = qmul(dq, q);
+let z2 = cmul(z, dz);
+```
+
+is actually **clearer** than:
+
+```rust
+let q2 = dq * q;
+let z2 = z * dz;
+```
+
+because I immediately know what multiplication is meant.
+
+---
+
+# 9. There is also an important performance benefit
+
+A single canonical `Vec4f` makes lots of interchange almost trivial:
+
+```text
+CPU quaternion
+       │
+       ├── OpenCL float4
+       ├── wgpu vec4<f32>
+       ├── SIMD vector
+       ├── positions padded xyz+w
+       └── parameters packed xyzw
+```
+
+No conversion between:
+
+```text
+Quat4f ↔ Vec4f
+```
+
+and no duplicated `#[repr(C)]`, `Pod`, alignment or serialization implementations.
+
+It also means an algorithm can reuse the same array operations without knowing whether the `Vec4f` represents quaternion, parameters, color, or four independent scalars.
+
+That's very much in line with the data-oriented design.
+
+---
+
+## So I would sharpen the `numtypes` definition to
+
+> **`numtypes` defines the project's common low-level memory vocabulary and the tiny intrinsic operations needed to manipulate those values efficiently. Mathematical/domain interpretation should normally be expressed by explicit functions rather than additional wrapper types.**
+
+And specifically:
+
+```text
+Vec2 = also complex storage
+Vec4 = also quaternion storage
+
++ - * /     component-wise/vector semantics
+cmul()      explicit complex multiplication
+qmul()      explicit quaternion multiplication
+qrotate()   explicit quaternion-vector rotation
+```
+
+I think this is considerably cleaner than the current `Quat4d`/`Vec4d` distinction and will make CPU/OpenCL/rendering interoperability simpler as the codebase grows.
+
+
+
+---
+
+# USER
+
+1\) yes, I see we are all the same page, I share this very much, totally subscibe "This design also avoids something I dislike in many Rust math libraries\:Vector4 Quaternion Complex Point3 Normal3 Direction3 Color4 Homogeneous4 even when all of them are literally four numbers and eventually need constant conversions."
+
+2\) I'm not sure if I would pack all Vec2,Vec3,Ve4 into single module, I do not want to include things which I do not need just because I must, what are pros and cons - it makes sense if it allow us better interconversion (like swizzles?/destructing?), but maybe the motivation is just the size - we do not want to have module with just 10 line each right? Anyway what about Mat3 and Mat4, they are usefull, can should be probably in numtypes, can we mimic the elegant unition structure we have in 
+/home/prokop/git/FireCore/cpp/common/math/Mat3.h
+
+```
+template <class T>
+class Mat3T{
+	using VEC = Vec3T<T>;
+	using MAT = Mat3T<T>;
+	public:
+	union{
+		struct{
+			T xx,xy,xz;
+			T yx,yy,yz;
+			T zx,zy,zz;
+		};
+		struct{
+			T ax,ay,az;
+			T bx,by,bz;
+			T cx,cy,cz;
+		};
+		struct{	VEC a,b,c;    };
+		struct{	VEC lf,up,fw; };
+		T array[9];
+		VEC  vecs [3];
+	};
+
+```
+
+3\) what is currenly suposed to be in the geom.rs ? do we have some other specific geom datatypes? Or just algorithms which can be moved to numcore. Anyway  what weill be left in numcore? some linar algebra? We should be maybe be more explicit about that.
+maybe some fast function aporiximations we have in 
+/home/prokop/git/FireCore/cpp/common/math/fastmath.h (fast function apporoximations)
+or other functonality form 
+/home/prokop/git/FireCore/cpp/common/math
+some splines? Multipoles? Spherical hamronics? 
+
+
+
+
+
+ ---
+
+ # Chat GPT 5.6 sol
+
+
+ Yes. After looking at the actual FireCore math directory, I think we can make the split considerably more explicit. The important refinement is:
+
+> **`numtypes` = stable memory vocabulary + intrinsic O(1) behavior of those values.**
+> **`numcore` = numerical algorithms, approximations, interpolation, solvers, transforms/fitting, special functions.**
+
+That gives quite a clean answer to all three points.
+
+### 1. `Vec2/Vec3/Vec4`: one file or separate modules?
+
+There is almost **no technical reason** they must be in the same Rust module. Putting them in one file does not enable swizzles or conversions that would otherwise be impossible: because they are all defined in the same crate, we can implement conversions between them regardless of which source files/modules contain them.
+
+Likewise, putting all three in `vec.rs` does **not mean unused vector types get dragged into the final executable** in the C/C++ header sense. Rust/LLVM will not emit unused functions/types into the final binary. The small cost is mostly parsing/compiling the module, which here is negligible.
+
+So this is mainly an organizational choice.
+
+I slightly prefer **one `vec.rs` initially**, because these really are one family:
+
+```text
+Vec2f Vec2d
+Vec3f Vec3d
+Vec4f Vec4d
+```
+
+and they share the same conventions, operators and conversions. A 200–400 line `vec.rs` is healthier than three 60–100-line files plus three module declarations and repeated imports. If it eventually becomes 1000 lines, split it then.
+
+I would add only a **tiny set of structural “swizzles”**, not GLSL's combinatorial zoo:
+
+```rust
+v4.xyz()
+v4.xy()
+
+v3.xy()
+v3.extend(w)      // -> Vec4
+v2.extend(z)      // -> Vec3
+
+Vec4d::from_vec3(v, w)
+```
+
+No `xxxy()`, `zyzx()`, etc. That produces enormous APIs for very little value.
+
+And as agreed:
+
+```text
+Vec2 = 2 numbers, sometimes interpreted as complex
+Vec4 = 4 numbers, sometimes interpreted as quaternion
+```
+
+with explicit:
+
+```rust
+cmul(a,b)
+qmul(a,b)
+qconj(q)
+qrotate(q,v)
+```
+
+rather than semantic types or overloaded multiplication.
+
+---
+
+## 2. `Mat3` and `Mat4` definitely belong in `numtypes`
+
+The FireCore `Mat3T` union is actually a very good expression of what we want conceptually. It says that the same 9 numbers can be viewed as scalar matrix coefficients, three vectors, or a flat array:
+
+```cpp
+xx xy xz
+yx yy yz
+zx zy zz
+
+a,b,c
+
+lf,up,fw
+
+array[9]
+vecs[3]
+```
+
+and FireCore's `a,b,c` correspond directly to the three rows.
+
+I would preserve that **representation philosophy**, but not literally use a Rust `union`.
+
+A Rust union would technically work, but reading union fields is `unsafe`, anonymous C-style struct overlays are awkward, and we'd end up wrapping every access anyway. There is no performance benefit.
+
+I think the clean Rust version is:
+
+```rust
+#[repr(C)]
+#[derive(Copy, Clone, Default, Pod, Zeroable)]
+pub struct Mat3d {
+    pub a: Vec3d,
+    pub b: Vec3d,
+    pub c: Vec3d,
+}
+```
+
+with canonical correspondence:
+
+```text
+a = (xx,xy,xz)
+b = (yx,yy,yz)
+c = (zx,zy,zz)
+```
+
+So scalar access becomes:
+
+```rust
+m.a.x   // xx
+m.a.y   // xy
+m.b.x   // yx
+m.c.z   // zz
+```
+
+which I actually find quite transparent.
+
+Then we recover FireCore's zero-copy alternate views:
+
+```rust
+#[inline(always)]
+pub fn rows(&self) -> &[Vec3d; 3] {
+    bytemuck::cast_ref(self)
+}
+
+#[inline(always)]
+pub fn array(&self) -> &[f64; 9] {
+    bytemuck::cast_ref(self)
+}
+```
+
+and mutable equivalents.
+
+Thus:
+
+```text
+Mat3d
+  │
+  ├── m.a, m.b, m.c
+  ├── m.rows()[i]
+  └── m.array()[i]
+```
+
+all access exactly the same 72 bytes.
+
+That is essentially the nice part of the C++ union without unsafe access at every call site.
+
+I would **not recreate `lf/up/fw` as fields**. That's interpretation again:
+
+```rust
+let lf = m.a;
+let up = m.b;
+let fw = m.c;
+```
+
+or a frame algorithm can call the rows whatever it wants.
+
+### `Mat4`
+
+Exactly analogous:
+
+```rust
+#[repr(C)]
+pub struct Mat4d {
+    pub a: Vec4d,
+    pub b: Vec4d,
+    pub c: Vec4d,
+    pub d: Vec4d,
+}
+```
+
+and:
+
+```rust
+array() -> &[f64;16]
+rows()  -> &[Vec4d;4]
+```
+
+FireCore already uses precisely the `a,b,c,d` / flat-array multiple-view idea for `Mat4T`.
+
+---
+
+## 3. What should be intrinsic to `Mat3/Mat4`?
+
+I would apply your criterion, with one additional qualification:
+
+> intrinsic = small + frequently used + **unambiguously part of manipulating that value**.
+
+So I would put these directly beside `Mat3`:
+
+```text
+identity()
+zero()
+transpose()
+transposed()
+
+row()
+col()
+
+add()
+sub()
+scale()
+
+dot(v)       // M v
+dot_t(v)     // Mᵀ v
+mmul(A,B)
+
+outer(a,b)
+add_outer(a,b)
+
+det()
+```
+
+These are fixed amounts of arithmetic, no allocations, no convergence, no tolerance policy, and no substantial algorithm.
+
+FireCore does exactly this sort of work directly in `Mat3T`: vector multiplication, transpose, outer product and fixed 3×3 matrix multiplication are all implemented as tiny inline methods.
+
+I'd probably put `inverse()` there too **if** it is the simple explicit 3×3 inverse.
+
+But these should move to `numcore`:
+
+```text
+eigenvalues/eigenvectors
+orthogonalization algorithms
+SVD
+iterative polar decomposition
+matrix fitting
+PCA
+```
+
+because they embody an algorithm/numerical policy rather than merely the matrix representation.
+
+This is already a useful correction to current SurfMol: `symmetric_eigen_3x3()` is clearly a `numcore::linalg` algorithm; it implements a specific analytical eigensolver and stability strategy.
+
+### Mat4 graphics functions should definitely NOT be intrinsic
+
+FireCore's `Mat4T` also contains:
+
+```text
+setPerspective()
+setOrthographic()
+```
+
+alongside generic matrix arithmetic.
+
+I would **not copy that part**.
+
+Perspective matrices depend on graphics conventions: handedness, NDC depth convention, row-vs-column vectors, OpenGL vs wgpu/Vulkan, etc.
+
+So:
+
+```text
+Mat4 data + algebra            numtypes
+perspective/orthographic       molrender / graphics module
+```
+
+That's a nice example of where we can improve on FireCore rather than transliterate it.
+
+---
+
+# 4. I would probably drop my vague `geom.rs` suggestion
+
+There is currently **no `geom.rs` in SurfMol `numtypes`**; that was just my proposed organization.
+
+And I now think the name is too vague.
+
+If the only obvious geometry datatype today is:
+
+```rust
+Aabb {
+    lo: Vec3d,
+    hi: Vec3d,
+}
+```
+
+then we shouldn't invent a whole geometry taxonomy around it.
+
+Two reasonable layouts are:
+
+```text
+numtypes/
+    vec.rs
+    mat.rs
+    graph.rs
+    spatial.rs
+    alloc.rs
+```
+
+where `spatial.rs` initially contains only `Aabb`.
+
+Or even:
+
+```text
+aabb.rs
+```
+
+if you prefer.
+
+I'd choose **`spatial.rs`**, because eventually there may naturally be a few genuinely reusable data records:
+
+```text
+Aabb
+Grid3              maybe
+Ray3               if picking really uses it everywhere
+Sphere             if it becomes a ubiquitous broad-phase primitive
+```
+
+But don't add `Ray`, `Plane`, `Sphere`, `Capsule` now simply because a geometry library traditionally has them.
+
+Add a datatype when two places actually need to exchange it.
+
+---
+
+# 5. More important: let's explicitly define what `numcore` becomes
+
+This makes the architecture much less vague.
+
+Current `numcore` already has two very different categories:
+
+```text
+Vec3d / Quat4d / AlignedVec       ← DATA
+fastmath / symmetric eigen        ← ALGORITHMS
+```
+
+The first category moves into `numtypes`.
+
+Then **`numcore` becomes our small reusable numerical-algorithms library**.
+
+I would envisage:
+
+```text
+numcore/
+    fastmath.rs
+    linalg.rs
+    spline.rs       when ported
+    special.rs      only when needed
+    ...
+```
+
+Not empty at all.
+
+---
+
+## 6. `numcore::fastmath` is a very natural home for FireCore's approximations
+
+Your FireCore `fastmath.h` has much more than trivial vector operations. It contains things such as:
+
+```text
+sin_taylor2
+cos_taylor2
+sincos_taylor2
+sincosR2_taylor
+
+erf approximations
+erf(x)/x approximations
+
+exp_p8
+gauss_p8
+finiteExp
+fastExp
+fastFloor / fastFract
+...
+```
+
+These are textbook `numcore`, even though many are very small and inline.
+
+This slightly refines the criterion we discussed:
+
+> Being tiny and inline is **necessary but not sufficient** for putting something in `numtypes`.
+
+For example:
+
+```rust
+Vec3::dot()
+```
+
+belongs to the type because dot product is intrinsic vector behavior.
+
+But:
+
+```rust
+exp_p8(x)
+```
+
+is an **algorithmic approximation with an accuracy/domain/performance tradeoff**. It belongs to `numcore::fastmath`.
+
+Likewise:
+
+```rust
+sincos_taylor2(x)
+```
+
+is not intrinsic behavior of an `f64`; it is a deliberately chosen approximation.
+
+This gives us a surprisingly crisp boundary.
+
+---
+
+# 7. Linear algebra is probably the other major `numcore` pillar
+
+The FireCore math directory contains dedicated implementations of:
+
+```text
+CG.h
+CGNE.h
+Cholesky.h
+```
+
+in addition to matrix-local operations.
+
+These belong naturally under something like:
+
+```text
+numcore::linalg
+```
+
+Potential contents, only as demanded by real code:
+
+```text
+symmetric_eigen_3x3
+Jacobi eigensolver
+CG
+CGNE
+Cholesky
+small dense solves
+banded solve
+```
+
+No giant LAPACK replacement.
+
+`numtypes::Mat3` knows how to multiply itself by `Vec3`.
+
+`numcore::symmetric_eigen_3x3(Mat3)` knows how to find its eigenvectors.
+
+That is a clean division.
+
+---
+
+# 8. Splines/interpolation are another obvious reusable numerical family
+
+FireCore has quite a lot here:
+
+```text
+Bspline.h
+Bspline_fit.h
+Bspline_fit_2D.h
+Bspline_fit_3D.h
+spline_hermite.h
+Spline2d.h
+radial_splines.h
+NURBS.h
+...
+```
+
+Those are excellent candidates for eventual:
+
+```text
+numcore::spline
+```
+
+or perhaps:
+
+```text
+numcore::interp
+```
+
+I slightly prefer `spline` while that is what we actually have.
+
+For SurfMol this is far from academic: tricubic/B-spline grid interpolation is exactly the sort of reusable numerical machinery that surfaces, force fields and visualization can all use.
+
+But again, **port on demand**, not “port the whole FireCore math directory because we've created a crate”.
+
+---
+
+# 9. Spherical harmonics: yes, `numcore`, when we need them
+
+FireCore has spherical-harmonic/Ylm machinery on the Fortran side, e.g. `getYlm.f90`.
+
+Those are numerical basis functions:
+
+```text
+Y_lm(theta,phi)
+real spherical harmonics
+gradients
+basis evaluation
+```
+
+They clearly are not data types.
+
+So eventually:
+
+```text
+numcore::spherical
+```
+
+or:
+
+```text
+numcore::special
+```
+
+would be natural.
+
+I wouldn't create the module yet unless we're actually porting one.
+
+---
+
+# 10. Multipoles are an interesting boundary case
+
+FireCore's `Multipoles.h` is actually a good example of something that should probably be **split**, not simply assigned wholesale to `numcore`.
+
+It mixes generic multipole projection/evaluation with explicitly electrostatic things such as:
+
+```cpp
+Coulomb(...)
+COULOMB_CONST
+charges Q
+```
+
+So I'd distinguish:
+
+```text
+generic multipole basis/projection/evaluation
+        ↓ perhaps numcore::multipole
+
+Coulomb energy/force, physical constants,
+charge-specific interaction
+        ↓ molff / electrostatics
+```
+
+And if generic multipoles only ever have one electrostatic user, don't prematurely generalize them into `numcore` at all.
+
+The rule should be **reusability demonstrated by actual clients**, not “mathematical sounding => numcore”.
+
+---
+
+# 11. I therefore see the low-level architecture becoming
+
+```text
+numtypes
+│
+├── vec.rs
+│   Vec2f/d
+│   Vec3f/d
+│   Vec4f/d
+│   dot/norm/etc.
+│   cmul/qmul/qrotate
+│   minimal xy/xyz/extend conversions
+│
+├── mat.rs
+│   Mat3f/d
+│   Mat4f/d
+│   row/flat zero-copy views
+│   transpose
+│   M*v, Mᵀ*v
+│   M*M
+│   outer
+│   determinant
+│
+├── graph.rs
+│   Index
+│   Elements<N>
+│   RaggedIndex
+│   Partition
+│   Permutation
+│   RangeGroups
+│   PGraph/View
+│   CSR
+│   FixedAdj<K>
+│
+├── spatial.rs
+│   Aabb
+│
+└── alloc.rs
+    AlignedVec<T,A>
+
+
+numcore
+│
+├── fastmath.rs
+│   fast exp/sin/cos/erf/Gaussian approximations
+│
+├── linalg.rs
+│   eigensolvers
+│   CG / Cholesky / Jacobi etc.
+│
+├── spline.rs              [when needed]
+│   interpolation/fitting
+│
+├── spherical.rs           [when needed]
+│
+└── multipole.rs           [only if genuinely generic]
+
+
+pgraph
+    adjacency construction
+    components
+    bridges/rings
+    graph reorder
+    graph geometry
+    selection/picking
+
+
+spacc
+    fit AABBs
+    Buckets
+    neighbor grids
+    Morton
+    broad phase / BVH
+```
+
+And I would write the boundary rule directly into the README because it is simple enough for coding agents to follow:
+
+> **`numtypes`: data layouts and tiny intrinsic operations. No algorithms whose cost scales with dataset size; no numerical approximation/fitting/iteration policy.**
+>
+> **`numcore`: generic numerical algorithms acting on `numtypes` or slices. Fast approximations belong here even when inline, because approximation accuracy is an algorithmic choice.**
+>
+> **`pgraph`: algorithms whose defining input is connectivity.**
+>
+> **`spacc`: algorithms whose defining purpose is spatial acceleration.**
+
+I think that is now much more precise than the earlier vague distinction of “types here, algorithms there,” and it lets us keep the things you liked about FireCore's low-level math style without reproducing the monolithic header organization.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---
+
+# USER 
+
+1\) I really like the bytemuck
+
+I renconsider it, remove swizzle at all I do not like combinatorial zoom and the one you added like v2.extend(z)  are also quite useless, but can we have somthing like vec3 = mat3.as\_array[i], resp then we can easily have swizzle like vec2 = vec4({0,3}) ? ability to change index (stride ) programetically is much more usefull than hard-coded swusle like .xy 
+yes, m.rows()[i] , m.array()[i] is essential, also for vectro vec.array[i]
+
+I would **not recreate** **`lf/up/fw`** **as fields**. That's interpretation again: - fine
+
+ad Aabb, it accidently represnt also 6-compoennt symmetric matrix (3 diagonal, 3 offdiagonal) not sure if it make sense tom merge the two into Vec6 type? 
+
+
+
+---
+
+
+# Chat GPT 5.6 sol
+
+Yes — I would remove swizzles completely. Your alternative is better for this codebase: **make the underlying components cheaply indexable, then compose whatever permutation/gather is needed explicitly.**
+
+For vectors I would make this fundamental:
+
+```rust
+#[repr(C)]
+pub struct Vec4d { pub x:f64, pub y:f64, pub z:f64, pub w:f64 }
+
+impl Vec4d {
+    #[inline(always)]
+    pub fn array(&self) -> &[f64;4] {
+        bytemuck::cast_ref(self)
+    }
+
+    #[inline(always)]
+    pub fn array_mut(&mut self) -> &mut [f64;4] {
+        bytemuck::cast_mut(self)
+    }
+}
+```
+
+Then:
+
+```rust
+let a = v.array();
+
+let x = a[i];
+let u = Vec2d::new(a[i], a[j]);
+let w = Vec3d::new(a[ix], a[iy], a[iz]);
+```
+
+This is much more powerful than `.xy()`, `.xzw()`, etc., because the permutation can come from runtime data:
+
+```rust
+let inds = [2, 0, 3];
+let u = Vec3d::new(a[inds[0]], a[inds[1]], a[inds[2]]);
+```
+
+For fixed compile-time cases the compiler will trivially eliminate the indexing machinery anyway.
+
+I would **not even add a `pick2()`/`pick3()` initially**. The explicit three-index construction above is short enough. If we later see the same pattern 50 times, then generalize it.
+
+## Matrices: two essential zero-copy views
+
+For:
+
+```rust
+#[repr(C)]
+pub struct Mat3d {
+    pub a: Vec3d,
+    pub b: Vec3d,
+    pub c: Vec3d,
+}
+```
+
+I would provide both:
+
+```rust
+#[inline(always)]
+pub fn rows(&self) -> &[Vec3d;3] {
+    bytemuck::cast_ref(self)
+}
+
+#[inline(always)]
+pub fn array(&self) -> &[f64;9] {
+    bytemuck::cast_ref(self)
+}
+```
+
+So you have both:
+
+```rust
+let row: Vec3d = m.rows()[i];
+
+let x = m.array()[i];
+let mij = m.array()[i*3 + j];
+```
+
+and mutable versions:
+
+```rust
+m.rows_mut()[i] = v;
+m.array_mut()[i*3+j] = x;
+```
+
+That essentially reproduces the useful FireCore union behavior:
+
+```text
+a,b,c       <-> Vec3[3]
+xx..zz      <-> scalar[9]
+```
+
+without a union.
+
+Same for `Vec3`:
+
+```rust
+v.array()[i]
+v.array_mut()[i]
+```
+
+This is something I would regard as absolutely intrinsic to these low-level types.
+
+One subtle point: I'd call the matrix vector view `rows()` rather than `as_array()`, because we also need the flat scalar array and otherwise `array` becomes ambiguous:
+
+```text
+v.array()    -> &[T;3]
+m.rows()     -> &[Vec3;3]
+m.array()    -> &[T;9]
+```
+
+Very compact and obvious.
+
+---
+
+## `Index` implementation could also be useful
+
+We could additionally implement:
+
+```rust
+impl Index<usize> for Vec3d {
+    type Output = f64;
+    #[inline(always)]
+    fn index(&self, i:usize) -> &f64 {
+        &self.array()[i]
+    }
+}
+```
+
+giving:
+
+```rust
+v[i]
+m.rows()[i][j]
+```
+
+That is attractive.
+
+I'm moderately in favor of it because indexing is **not semantic overloading** like quaternion `*`; it has one completely obvious meaning.
+
+Then:
+
+```rust
+let u = Vec2d::new(v[i], v[j]);
+```
+
+becomes extremely clean.
+
+For matrices I would probably **not implement `m[i]` directly**, because it becomes unclear whether `i` indexes a scalar or a row. Explicit:
+
+```rust
+m.rows()[i]
+m.array()[i]
+```
+
+is better.
+
+---
+
+# AABB vs symmetric 3×3: I would NOT merge them into `Vec6`
+
+The fact that both contain six scalars is interesting, but I think this is where we should distinguish:
+
+> identical **size** is not necessarily identical **useful layout**.
+
+An AABB naturally wants:
+
+```rust
+pub struct Aabb3d {
+    pub lo: Vec3d,
+    pub hi: Vec3d,
+}
+```
+
+because almost every operation is:
+
+```rust
+bb.lo
+bb.hi
+
+p >= bb.lo
+p <= bb.hi
+
+bb.lo = min(bb.lo, p)
+bb.hi = max(bb.hi, p)
+```
+
+That is an excellent representation.
+
+A symmetric matrix naturally wants something like:
+
+```text
+xx xy xz
+xy yy yz
+xz yz zz
+```
+
+Its six independent components are conventionally:
+
+```text
+xx yy zz xy xz yz
+```
+
+or some similar ordering.
+
+Its hot operations are completely different:
+
+```text
+M*v
+quadratic form vᵀMv
+eigen decomposition
+outer-product accumulation
+```
+
+If we force both through:
+
+```rust
+Vec6d
+```
+
+we lose the most natural structure of each merely because `sizeof(A)==sizeof(B)`.
+
+That's the sort of unification I would avoid.
+
+---
+
+## But a compact symmetric matrix type itself is probably worthwhile
+
+I think this **is** a useful `numtypes` type:
+
+```rust
+#[repr(C)]
+pub struct SymMat3d {
+    pub diag: Vec3d,   // xx yy zz
+    pub off:  Vec3d,   // xy xz yz
+}
+```
+
+or perhaps:
+
+```rust
+pub struct SymMat3d {
+    pub xx:f64,
+    pub yy:f64,
+    pub zz:f64,
+    pub xy:f64,
+    pub xz:f64,
+    pub yz:f64,
+}
+```
+
+I prefer the first for data-oriented work:
+
+```rust
+diag = (xx,yy,zz)
+off  = (xy,xz,yz)
+```
+
+because it naturally separates diagonal/off-diagonal terms and still gives:
+
+```rust
+sym.array() -> &[f64;6]
+```
+
+via `bytemuck`.
+
+It also makes operations like:
+
+```rust
+diag += ...
+off  += ...
+```
+
+quite convenient.
+
+Then a full `Mat3` remains 9 scalars when nonsymmetry is required.
+
+### Why not `Vec6`?
+
+A `Vec6` has no natural hardware counterpart:
+
+```text
+CPU SIMD: awkward
+OpenCL:   no float6
+wgpu:     no vec6
+```
+
+and unlike Vec2/3/4 it has no ubiquitous geometric interpretation.
+
+So I would **not add `Vec6` just to accommodate symmetric matrices**.
+
+If someday we genuinely have lots of six-component mathematical vectors—for example 6-DOF twists/wrenches—then we can revisit it. Even there, I might prefer:
+
+```rust
+struct Vec6 {
+    lin: Vec3,
+    ang: Vec3,
+}
+```
+
+because the split is computationally meaningful.
+
+---
+
+# There is a deeper rule emerging here
+
+I think we've arrived at something useful for `numtypes`:
+
+### Unify representations when both the storage **and common access pattern** are the same.
+
+Hence:
+
+```text
+Vec2 == complex storage       YES
+Vec4 == quaternion storage    YES
+```
+
+because both really are arrays of 2/4 scalars and the useful component access is identical.
+
+But:
+
+```text
+Aabb == symmetric Mat3        NO
+```
+
+despite both containing six scalars, because their useful decomposition is different:
+
+```text
+Aabb:      lo.xyz | hi.xyz
+SymMat3:   diag.xyz | off.xyz
+```
+
+Interestingly they can still have **the same physical low-level layout**:
+
+```text
+2 × Vec3
+```
+
+without pretending they are the same type.
+
+That is actually ideal. The compiler sees the same compact 48-byte pattern while the source code remains transparent.
+
+So I would currently settle on:
+
+```text
+vec.rs
+    Vec2<T>
+    Vec3<T>
+    Vec4<T>
+    .array()
+    Index<usize>
+
+mat.rs
+    Mat3<T>    = 3 × Vec3
+    Mat4<T>    = 4 × Vec4
+    SymMat3<T> = 2 × Vec3
+    .rows()
+    .array()
+
+spatial.rs
+    Aabb3<T>   = 2 × Vec3
+    .array() perhaps
+    contains/include/merge/overlap
+```
+
+No swizzles, no semantic quaternion/complex wrapper types, and no `Vec6` unless a real six-vector use case appears. This feels very close to the low-level simplicity of your FireCore unions, but cleaner and safer to compose in Rust.
+
+
+
+
+
+
+---
+
+# USER
+
+ad "AABB vs symmetric 3×3: I would NOT merge them into `Vec6`"
+xx,yy,zz can be natually 1st vec3 x,y,z, the sencong will be like what is missing, v2.x = yz, v2.y=xz, v2.z=xy, it also helps with implementation of things like crossproducts or deterinants which is often what we use these symetrix matrixes for, but I know this is a bit unorthodoz, going agains principle of least astomishmet, but maybe it gos together with geometric-agebra (oriednted paralleograms ...)
+Vec6 have now harware counterpart but mergining AABB and SymetricMatrix in one seems to me usefulle, althou I don't see clearly cases when we will reinterpret (cast) one as the other, while in Vec2-complex and Vec4-quaternion I see that clearly
+
+
+---
+
+
+# Chat GPT 5.6 sol
+
+I think your argument changes my view somewhat. I was focusing too much on semantic distinction. Under the principle we have converged on — **types primarily describe storage/layout, semantics come from operations** — a generic `Vec6 = 2×Vec3` is quite defensible.
+
+The strongest argument is actually not that we would often cast an AABB into a symmetric matrix. We probably never will. It is that both naturally use the same **primitive decomposition into two 3-vectors**, and algorithms can exploit that representation efficiently.
+
+For the symmetric matrix, your ordering is especially nice:
+
+```rust
+// symmetric matrix
+// [ xx xy xz ]
+// [ xy yy yz ]
+// [ xz yz zz ]
+
+Vec6 {
+    a: Vec3 { x: xx, y: yy, z: zz }, // diagonal
+    b: Vec3 { x: yz, y: xz, z: xy }, // opposite-axis pairs
+}
+```
+
+The second vector is not arbitrary. Its components correspond naturally to the coordinate plane **opposite each axis**:
+
+```text
+b.x = yz   opposite x
+b.y = xz   opposite y
+b.z = xy   opposite z
+```
+
+That makes the representation more geometrically meaningful than the conventional flat ordering `xx,yy,zz,xy,xz,yz`.
+
+And several formulas become pleasantly regular. If
+
+```text
+d = (xx, yy, zz)
+o = (yz, xz, xy)
+```
+
+then
+
+```text
+det(M) =
+    d.x*d.y*d.z
+  + 2*o.x*o.y*o.z
+  - d.x*o.x*o.x
+  - d.y*o.y*o.y
+  - d.z*o.z*o.z
+```
+
+which is almost a component-wise expression. The diagonal of the adjugate is similarly:
+
+```rust
+Vec3d::new(
+    d.y*d.z - o.x*o.x,
+    d.x*d.z - o.y*o.y,
+    d.x*d.y - o.z*o.z,
+)
+```
+
+So there is a real computational reason for your `yz,xz,xy` ordering, not just compactness.
+
+### I would therefore consider this
+
+```rust
+#[repr(C)]
+pub struct Vec6d {
+    pub a: Vec3d,
+    pub b: Vec3d,
+}
+
+impl Vec6d {
+    #[inline(always)]
+    pub fn array(&self) -> &[f64; 6] {
+        bytemuck::cast_ref(self)
+    }
+
+    #[inline(always)]
+    pub fn vecs(&self) -> &[Vec3d; 2] {
+        bytemuck::cast_ref(self)
+    }
+}
+```
+
+And analogously `Vec6f`.
+
+Then the conventions can be:
+
+```text
+AABB:
+    a = lo
+    b = hi
+
+Symmetric Mat3:
+    a = (xx,yy,zz)
+    b = (yz,xz,xy)
+```
+
+I would **not put either interpretation directly into `Vec6` methods**. `Vec6` should remain boring storage:
+
+```text
+a
+b
+array()
+vecs()
+indexing
+componentwise arithmetic, if useful
+```
+
+Semantic operations live as explicit functions:
+
+```rust
+aabb_contains(bb, p)
+aabb_merge(a, b)
+
+sym3_det(m)
+sym3_dot(m, v)
+sym3_outer(v)
+sym3_inverse(m)
+```
+
+or organized in modules:
+
+```rust
+aabb::contains(bb, p)
+sym3::det(m)
+```
+
+That fits very well with our earlier decision:
+
+```rust
+qmul(Vec4, Vec4)
+cmul(Vec2, Vec2)
+```
+
+rather than giving `Vec4` quaternion semantics.
+
+### Type aliases could still document intent
+
+We could optionally have:
+
+```rust
+pub type Aabb3d   = Vec6d;
+pub type SymMat3d = Vec6d;
+```
+
+These provide no type safety, but they can make signatures/documentation nicer:
+
+```rust
+fn fit_aabb(...) -> Aabb3d
+fn inertia_tensor(...) -> SymMat3d
+```
+
+while preserving zero conversion and literally identical representation.
+
+Given your philosophy, I don't think the lack of strong semantic type separation is necessarily a defect. Accidentally passing an AABB to `sym3_det()` is about as plausible as passing positions to forces when both are `Vec3d`; we already accept that because proliferating `Position3`, `Force3`, `Velocity3`, `Normal3`, etc. would be worse.
+
+That is a good consistency argument for `Vec6`.
+
+### On geometric algebra
+
+I would be slightly careful with that motivation. A symmetric 3×3 tensor is **not itself a bivector** in geometric algebra. In 3D, a bivector only has three independent components, whereas a symmetric tensor has six (`1` trace + `5` traceless components).
+
+But your ordering nevertheless has a geometric flavor:
+
+```text
+x ↔ yz
+y ↔ zx
+z ↔ xy
+```
+
+which is exactly the familiar 3D duality between axes and their perpendicular coordinate planes. That is why the ordering feels natural around cofactors, cross products and determinants.
+
+So I would say the connection is not:
+
+> symmetric matrix = geometric-algebra bivector
+
+but rather:
+
+> the `yz,zx,xy` ordering exploits the same axis ↔ opposite-plane correspondence that appears in cross products, cofactors and 3D duality.
+
+That is a solid numerical/geometric reason to choose it.
+
+### The hardware-counterpart objection is also weaker than I made it sound
+
+You're right that `Vec6` has no `float6`, but that does not matter very much for a **CPU/storage primitive**.
+
+```text
+Vec6f = 24 bytes
+Vec6d = 48 bytes
+```
+
+is perfectly sensible packed storage.
+
+If a GPU kernel wants aligned loads, we can later compile/repack an AABB into:
+
+```text
+float4 lo
+float4 hi
+```
+
+or an array of two `float4`s. We already accept that generic scientific representation and hot GPU representation need not be identical.
+
+So I would revise my earlier position to:
+
+> **Yes, introduce `Vec6` as `2×Vec3`, and consider `Aabb3` and `SymMat3` to be semantic interpretations/aliases rather than separate physical structs.**
+
+What convinces me is not reinterpret-casting AABB ↔ symmetric matrix; that is almost irrelevant. It is the consistency with `Vec2/complex` and `Vec4/quaternion`, plus the fact that your symmetric-matrix packing `(diag.xyz, yz/xz/xy)` has genuine computational structure.
+
+I would probably make the primitive family:
+
+```text
+Vec2
+Vec3
+Vec4
+Vec6 = 2×Vec3
+
+Mat3 = 3×Vec3
+Mat4 = 4×Vec4
+```
+
+with all of them exposing `array()` and, where appropriate, `vecs()/rows()`. That's a surprisingly compact numerical vocabulary.
+
+

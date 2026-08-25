@@ -5,4 +5,5 @@ edition = "2021"
 description = "Core numerical primitives: #[repr(C)] math vectors, aligned allocators"
 
 [dependencies]
+numtypes = { workspace = true }
 bytemuck = { workspace = true }

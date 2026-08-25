@@ -2,7 +2,7 @@
 //! A bridge is an edge whose removal disconnects the graph.
 //! Ported from FireCore MolecularGraph.h findBridges — without class ownership.
 
-use pgraph::{CsrAdj, Index};
+use numtypes::{CsrAdj, Index};
 
 /// Find all bridge edges in an undirected graph. Returns edge indices that are bridges.
 /// Uses iterative Tarjan's algorithm with discovery times and low-link values.

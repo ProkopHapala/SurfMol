@@ -1,6 +1,6 @@
 //! Connected components via BFS. Returns a Partition assigning each vertex to a component id.
 
-use pgraph::{CsrAdj, Index, Partition};
+use numtypes::{CsrAdj, Index, Partition};
 
 /// Find connected components of an undirected graph given as CSR adjacency.
 /// Returns Partition where item_group[v] = component id (0-based, -1 impossible since all get assigned).

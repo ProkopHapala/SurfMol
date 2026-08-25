@@ -3,7 +3,7 @@ pub mod line_renderer;
 pub mod surface_renderer;
 
 use std::sync::Arc;
-use numcore::math::vec3::Vec3d;
+use numtypes::{Vec3d, Vec3f, Mat4f, mmul4f};
 use moltopo::params::Params;
 
 // ------------------------------------------------------------------
@@ -75,31 +75,34 @@ impl ThumbnailRenderer {
             let a = [p.x as f32, p.y as f32, p.z as f32];
             for i in 0..3 { mn[i] = mn[i].min(a[i]); mx[i] = mx[i].max(a[i]); }
         }
-        let center = impostor::mul3s(impostor::add3(mn, mx), 0.5);
-        let span = impostor::sub3(mx, mn);
-        let max_span = span[0].max(span[1]).max(span[2]).max(2.0);
+        let center = Vec3f::new((mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5);
+        let span = Vec3f::new(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]);
+        let max_span = span.x.max(span.y).max(span.z).max(2.0);
         let rmax = 3.0f32;
         let ortho_half = max_span * 0.5 + rmax;
 
-        let proj = impostor::ortho(-ortho_half, ortho_half, -ortho_half, ortho_half, 1.0, 1000.0);
-        let eye = impostor::add3(center, [ortho_half * 2.0, ortho_half * 1.5, ortho_half * 2.5]);
-        let view = impostor::look_at(eye, center, [0.0, 1.0, 0.0]);
-        let vp = impostor::mul4x4(view, proj);
+        let proj = Mat4f::ortho(-ortho_half, ortho_half, -ortho_half, ortho_half, 1.0, 1000.0);
+        let eye = center + Vec3f::new(ortho_half * 2.0, ortho_half * 1.5, ortho_half * 2.5);
+        let view = Mat4f::look_at(eye, center, Vec3f::new(0.0, 1.0, 0.0));
+        let vp = mmul4f(view, proj);
 
-        let z = impostor::normalize3(impostor::sub3(eye, center));
-        let x = impostor::normalize3(impostor::cross3([0.0, 1.0, 0.0], z));
-        let y = impostor::cross3(z, x);
-        let fwd = impostor::normalize3(impostor::sub3(center, eye));
+        let mut z = eye - center;
+        z.normalize();
+        let mut x = Vec3f::new(0.0, 1.0, 0.0).cross(z);
+        x.normalize();
+        let y = z.cross(x);
+        let mut fwd = center - eye;
+        fwd.normalize();
 
         let camera = impostor::CameraData {
-            view_proj: vp,
-            eye,
+            view_proj: vp.to_arr4x4(),
+            eye: *eye.array(),
             _pad1: 0.0,
-            right: x,
+            right: *x.array(),
             _pad2: 0.0,
-            up: y,
+            up: *y.array(),
             _pad3: 0.0,
-            forward: fwd,
+            forward: *fwd.array(),
             ortho: 0.0,
             ray_shift: [0.0, 0.0, 0.0, 0.0],
         };

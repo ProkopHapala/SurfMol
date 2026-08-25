@@ -2,7 +2,7 @@
 name = "pgraph"
 version = "0.1.0"
 edition = "2021"
-description = "Positioned graph: minimal data contract (positions + edges + index containers)"
+description = "Reusable graph algorithms: adjacency, components, bridges, loops, reorder, selection, picking. Operates on numtypes data contracts."
 
 [dependencies]
-numcore = { workspace = true }
+numtypes = { workspace = true }

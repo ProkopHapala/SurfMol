@@ -5,5 +5,4 @@ edition = "2021"
 description = "Spatial acceleration: AABB, Buckets, grids, Morton, broad phase"
 
 [dependencies]
-numcore = { workspace = true }
-pgraph = { workspace = true }
+numtypes = { workspace = true }

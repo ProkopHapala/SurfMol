@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::Write;
-use numcore::math::vec3::Vec3d;
+use numtypes::Vec3d;
 use surfff::{setup_nacl_surface, SurfaceFolded};
 
 /// Simple line-plot SVG generator (pure Rust, no external plotting deps).

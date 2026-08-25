@@ -5,4 +5,4 @@ edition = "2021"
 description = "Surface-molecule interaction forcefields"
 
 [dependencies]
-numcore = { workspace = true }
+numtypes = { workspace = true }

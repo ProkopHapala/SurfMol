@@ -1,19 +1,19 @@
 ---
 type: rust-crate
 title: spacc
-description: Spatial acceleration — AABB, Buckets. Rebuildable caches with no molecular semantics. P0 foundation implemented.
-tags: [rust, crate, spatial, acceleration, broad-phase]
+description: Spatial acceleration — AABB fitting and spatial bucketing on numtypes data. No molecular semantics.
+tags: [rust, crate, spatial, acceleration, broad-phase, numtypes]
 timestamp: 2026-08-25
 ---
 
 # spacc
 
-Rebuildable spatial acceleration structures with no molecular semantics. Provides broad-phase collision detection and spatial queries for the `pgraph` / `pgraph_ops` / `spacc` foundation trio.
+Rebuildable spatial acceleration structures with no molecular semantics. Operates on `numtypes` data contracts (`Aabb3d`, `RaggedIndex`) for AABB fitting and spatial hashing.
 
 ## What's implemented (P0 foundation)
 
-- **`aabb.rs`** — `Aabb` (lo/hi `Vec3d`): `include_point`, `include_aabb`, `contains`, `center`, `size`, `max_extent`. `fit_aabb(pos, ids)` fits AABB to selected positions. `fit_group_aabbs(pos, groups, out)` fits AABBs for multiple `IndexGroups` — the dataflow `positions + IndexGroups → spacc::fit_aabbs → Aabb[group]` from the design doc.
-- **`buckets.rs`** — `Buckets`: spatial hashing via count→prefix→scatter (same pattern as FireCore/SSE `Buckets.h` and `NBFF::initBBsFromGroups`). Three-step API (`count` → `update_offsets` → `scatter`) or one-shot `build(cell_of_obj)`. `cell_objects(c)` returns packed item list per cell. Items with `cell = -1` are skipped.
+- **`aabb.rs`** — `fit_aabb(pos, ids)` fits an `Aabb3d` to selected positions. `fit_group_aabbs(pos, groups, out)` fits AABBs for multiple `RaggedIndex` groups. `fit_range_aabbs(pos, ranges, out)` fits AABBs for contiguous `[i0, i1)` ranges — the cache-optimal path for packed fragments. All use `numtypes::aabb_*` intrinsic functions.
+- **`buckets.rs`** — `Buckets`: spatial hashing via count→prefix→scatter (FireCore/SSE `Buckets.h` pattern). One-shot `build(cell_of_obj)`; `cell_objects(c)` returns packed item list per cell. Items with `cell = -1` are skipped. A single `counts` buffer doubles as the per-cell cursor, so no extra allocation happens during rebuild.
 
 ## Not yet implemented (P1/P2)
 
@@ -23,23 +23,24 @@ Rebuildable spatial acceleration structures with no molecular semantics. Provide
 ## Planned API
 
 ```rust
-fit_aabb(pos, ids) -> Aabb
-fit_group_aabbs(pos, offsets, items, out)
-build_buckets(cell_of_item, ncell) -> Buckets
+fit_aabb(pos, ids) -> Aabb3d
+fit_group_aabbs(pos, &RaggedIndex, out)
+fit_range_aabbs(pos, &[[Index;2]], out)
+Buckets::build(cell_of_item)
 build_uniform_grid(pos, cell_size) -> UniformGrid
 ```
 
 ## Design principles
 
-- **Depends only on `numcore` + `pgraph`** — no chemistry dependencies
-- **Bounds are invalidated by geometry changes** — caller must rebuild after moving atoms; spacc does not track validity
-- **May use different grouping than chemistry** — spatial cells are independent of bond topology
-- **Can coexist** as AABB / sphere / capsule / OBB — different query types, different structures
-- **No molecular semantics** — `Buckets` knows nothing about atoms or bonds, just item→cell mapping
+- **Depends only on `numtypes`** — no chemistry or graph-algorithm dependencies.
+- **Bounds are invalidated by geometry changes** — caller must rebuild after moving atoms; `spacc` does not track validity.
+- **May use different grouping than chemistry** — spatial cells are independent of bond topology.
+- **Can coexist** as AABB / sphere / capsule / OBB — different query types, different structures.
+- **No molecular semantics** — `Buckets` knows nothing about atoms or bonds, just item→cell mapping.
 
 ## Architectural role
 
-Spatial acceleration is a separate concern from both the graph data contract (`pgraph`) and graph algorithms (`pgraph_ops`). It enables:
+Spatial acceleration is a separate concern from both the graph data contract (`numtypes::graph`) and graph algorithms (`pgraph`). It enables:
 - Broad-phase neighbor finding for non-bonded forcefields (replacing O(N²) in `NonBondedFF`)
 - Ray-picking acceleration for large structures
 - Bounding volume hierarchies for rendering culling
@@ -47,12 +48,12 @@ Spatial acceleration is a separate concern from both the graph data contract (`p
 
 ## Tests
 
-7 tests: AABB include/contains, fit_aabb, fit_group_aabbs, buckets basic/empty-cell/skip-unassigned.
+7 tests: `Aabb3d` contains, `fit_aabb`, `fit_group_aabbs`, `fit_range_aabbs`, buckets basic/empty-cell/skip-unassigned.
 
 ## See also
 
 - `notes/designs/topology_builder.md` — full design (§7 for `spacc` scope)
-- `pgraph` — data contract (provides `IndexGroups` consumed by `fit_group_aabbs`)
-- `pgraph_ops` — algorithms that consume spatial structures
+- `numtypes::spatial` — `Aabb3d`, `Aabb3f`, and the `aabb_*` / `sym3_*` intrinsics
+- `pgraph` — algorithms that consume spatial structures
 - FireCore/SSE `Buckets.h` — C++ reference for spatial hashing
 - FireCore `NBFF::initBBsFromGroups` — reference for group AABB dataflow

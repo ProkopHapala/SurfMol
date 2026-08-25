@@ -1,9 +1,8 @@
 use std::sync::Arc;
-use numcore::math::vec3::Vec3d;
+use numtypes::{Vec3d, Vec3f};
 use moltopo::params::Params;
 use molrender::impostor::{ImpostorRenderer, AtomInstance, CameraData};
 use molrender::line_renderer::{LineRenderer, LineVertex};
-use molrender::impostor::{sub3, normalize3};
  
 /// External harness for molecule thumbnail generation.
 /// Uses surfmol-molrender GPU primitives but handles alignment,
@@ -92,7 +91,9 @@ impl MolThumbnailer {
         let eye = [center[0], center[1], center[2] + dist];
         let right = [1.0f32, 0.0, 0.0];
         let up = [0.0f32, 1.0, 0.0];
-        let f = normalize3(sub3(eye, center));
+        let mut f = Vec3f::new(eye[0]-center[0], eye[1]-center[1], eye[2]-center[2]);
+        f.normalize();
+        let f = *f.array();
  
         let sx = 1.0 / (zoom * aspect);
         let sy = 1.0 / zoom;

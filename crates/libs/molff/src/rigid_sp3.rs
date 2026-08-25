@@ -1,5 +1,5 @@
-use numcore::math::quat4::{Quat4d, Quat4i};
-use numcore::math::vec3::{Vec3d, VEC3_ZERO};
+use numtypes::{Quat4d, Quat4i};
+use numtypes::{Vec3d, VEC3D_ZERO as VEC3_ZERO};
 use crate::uff::Uff;
 
 pub struct RigidSp3FF {
