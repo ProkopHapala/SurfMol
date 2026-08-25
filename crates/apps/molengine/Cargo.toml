@@ -1,0 +1,20 @@
+[package]
+name = "molengine"
+version = "0.1.0"
+edition = "2021"
+description = "CLI: Rhai-scripted MD/relaxation engine"
+
+[[bin]]
+name = "molengine"
+path = "src/main.rs"
+
+[dependencies]
+surfmol = { workspace = true }
+molff = { workspace = true }
+moltopo = { workspace = true }
+numcore = { workspace = true }
+rhai = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ndarray = { workspace = true }

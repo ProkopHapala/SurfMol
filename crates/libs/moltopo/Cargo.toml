@@ -1,0 +1,10 @@
+[package]
+name = "moltopo"
+version = "0.1.0"
+edition = "2021"
+description = "Static molecular topology: bonds, angles, dihedrals, params, xyz I/O, DynamicAtoms"
+
+[dependencies]
+numcore = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

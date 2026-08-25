@@ -1,0 +1,9 @@
+[package]
+name = "pgraph_ops"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable graph algorithms: adjacency, components, bridges, loops, reorder, selection, picking"
+
+[dependencies]
+numcore = { workspace = true }
+pgraph = { workspace = true }

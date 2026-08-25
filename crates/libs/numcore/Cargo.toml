@@ -1,0 +1,8 @@
+[package]
+name = "numcore"
+version = "0.1.0"
+edition = "2021"
+description = "Core numerical primitives: #[repr(C)] math vectors, aligned allocators"
+
+[dependencies]
+bytemuck = { workspace = true }

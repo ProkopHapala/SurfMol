@@ -1,0 +1,8 @@
+[package]
+name = "spacc"
+version = "0.1.0"
+edition = "2021"
+description = "Spatial acceleration: AABB, Buckets, grids, Morton, broad phase"
+
+[dependencies]
+numcore = { workspace = true }

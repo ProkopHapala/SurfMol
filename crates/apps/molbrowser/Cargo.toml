@@ -1,0 +1,24 @@
+[package]
+name = "molbrowser"
+version = "0.1.0"
+edition = "2021"
+description = "XYZ directory browser with thumbnail grid"
+
+[[bin]]
+name = "molbrowser"
+path = "src/main.rs"
+
+[dependencies]
+moltopo = { workspace = true }
+numcore = { workspace = true }
+molgui = { workspace = true }
+molrender = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+winit = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui-winit = { workspace = true }
+egui-wgpu = { workspace = true }
+glam = { workspace = true }
+nalgebra = { workspace = true }

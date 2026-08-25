@@ -1,0 +1,15 @@
+[package]
+name = "buildff"
+version = "0.1.0"
+edition = "2021"
+description = "CLI: build topology from XYZ, assign forcefield types, export JSON/binary"
+
+[[bin]]
+name = "buildff"
+path = "src/main.rs"
+
+[dependencies]
+moltopo = { workspace = true }
+numcore = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

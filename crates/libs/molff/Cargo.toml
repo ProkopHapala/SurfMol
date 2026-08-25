@@ -1,0 +1,13 @@
+[package]
+name = "molff"
+version = "0.1.0"
+edition = "2021"
+description = "Intra-molecular forcefields: UFF, RigidSp3, NonBonded"
+
+[dependencies]
+numcore = { workspace = true }
+moltopo = { workspace = true }
+ndarray = { workspace = true }
+
+[dev-dependencies]
+surfmol = { workspace = true }

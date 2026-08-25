@@ -1,0 +1,16 @@
+[package]
+name = "molgui"
+version = "0.1.0"
+edition = "2021"
+description = "GUI toolkit: TrackballCam, KekuleEditor, MolThumbnailer, gizmos"
+
+[dependencies]
+numcore = { workspace = true }
+moltopo = { workspace = true }
+molrender = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+nalgebra = { workspace = true }
+glam = { workspace = true }
+[dev-dependencies]
+image = { workspace = true }

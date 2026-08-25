@@ -1,0 +1,16 @@
+[package]
+name = "molrender"
+version = "0.1.0"
+edition = "2021"
+description = "wgpu rendering primitives: sphere impostors, lines, surface quads"
+
+[dependencies]
+numcore = { workspace = true }
+moltopo = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }
+nalgebra = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "surfmol"
+version = "0.1.0"
+edition = "2021"
+description = "SurfMol molecular simulation engine: integrates intra-molecular and surface forcefields"
+
+[dependencies]
+numcore = { workspace = true }
+moltopo = { workspace = true }
+molff = { workspace = true }
+surfff = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

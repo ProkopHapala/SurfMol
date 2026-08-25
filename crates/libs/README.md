@@ -1,0 +1,36 @@
+---
+type: folder
+title: crates/libs
+description: Library crates — reusable dependencies with no binary targets. Imported by apps and each other.
+tags: [rust, workspace, libraries]
+timestamp: 2026-08-25
+---
+
+# crates/libs
+
+Reusable library crates — no binary targets, only `lib.rs`. Imported by `crates/apps/` and by each other.
+
+## Crates
+
+- **`numcore`** — numerical primitives: `Vec3d`, `Quat4d`/`Quat4i`, `AlignedVec`, fast Taylor math, f32 graphics matrices. Zero domain knowledge.
+- **`moltopo`** — molecular topology SSOT: `Topology`, `Builder` (generational arena + hex grid), `Params` (forcefield parameter files), UFF type assignment, `DynamicAtoms` for MD, XYZ/JSON I/O.
+- **`molff`** — intra-molecular forcefields: `Uff` (bonds/angles/dihedrals/inversions with force-piece assembly), `NonBondedFF` (LJ+Coulomb+H-bond with exclusions + PBC), `RigidSp3FF` (quaternion rigid body).
+- **`surfff`** — surface interaction forcefield: folded periodic potential with separable tensor-product Fourier basis, complex recurrence for integer harmonics, NaCl surface template.
+- **`surfmol`** — integration engine: `MolWorld` orchestrator coordinates all forcefields, owns `DynamicAtoms`, runs MD with convergence detection.
+- **`molrender`** — wgpu rendering primitives: sphere impostors (fragment-shader raytracing), line renderer, textured quad surface renderer. No molecular semantics.
+- **`molgui`** — GUI support: trackball camera, PCA-aligned GPU thumbnailer, Kekule hex-grid editor, line gizmos.
+- **`pgraph`** — *(stub)* positioned graph data contract: positions + edges + index containers. Domain-agnostic.
+- **`pgraph_ops`** — *(stub)* reusable graph algorithms: adjacency, components, bridges, loops, picking.
+- **`spacc`** — *(stub)* spatial acceleration: AABB, Buckets, uniform grids, Morton codes.
+
+## Dependency graph
+
+```
+numcore ← moltopo ← molff ← surfmol
+         ↖ molrender ← molgui ↗
+         ↖ surfff ↗
+         ↖ pgraph → pgraph_ops ↘
+         ↖ spacc ↗
+```
+
+See `ARCHITECTURE.md` for the full crate dependency graph and `notes/designs/topology_builder.md` for the planned `pgraph`/`pgraph_ops`/`spacc` refactor.
