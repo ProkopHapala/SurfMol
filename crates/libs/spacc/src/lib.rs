@@ -1,3 +1,6 @@
-// spacc — spatial acceleration: AABB, Buckets, grids, Morton, broad phase.
-// See notes/designs/topology_builder.md for design.
-// Stub — implementation pending.
+//! spacc — spatial acceleration: AABB, Buckets, grids.
+//! See `notes/designs/topology_builder.md` §7 for design.
+//! Depends only on `numcore`. Bounds are invalidated by geometry changes — caller must rebuild.
+
+pub mod aabb;
+pub mod buckets;

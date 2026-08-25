@@ -42,20 +42,18 @@ serde_json = "1.0"
 wgpu = "29"
 pollster = "0.4"
 winit = "0.30"
-eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 egui = "0.34"
-egui-winit = "0.34"
+egui-winit = { version = "0.34", default-features = false, features = ["wayland", "x11", "links"] }
 egui-wgpu = "0.34"
-egui_extras = "0.29"
-egui_plot = "0.34"
 glam = "0.29"
-nalgebra = "0.33"
 ndarray = "0.16"
 rand = "0.8"
 ocl = "0.19"
 rhai = "1.19"
 clap = { version = "4.5", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+arboard = { version = "3.6", default-features = false }
 
 # --- Build profiles (ported from blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_footprint_plan.md A1) ---
 # debug=1: line tables only (backtraces keep file:line at panic site + function names), drops variable debug info

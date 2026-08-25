@@ -201,33 +201,29 @@ pub(crate) fn align_to_principal_axes(apos: &[Vec3d]) -> Vec<[f32; 3]> {
         iyz -= y*z;
     }
  
-    let mat = nalgebra::Matrix3::new(
+    let mat = [
         ixx as f32, ixy as f32, ixz as f32,
         ixy as f32, iyy as f32, iyz as f32,
         ixz as f32, iyz as f32, izz as f32,
-    );
-    let eig = mat.symmetric_eigen();
- 
+    ];
+    let eig = numcore::math::linalg::symmetric_eigen_3x3(mat);
+
     // smallest eigenvalue => largest spatial extent => x (longest)
     // largest eigenvalue  => smallest spatial extent => z (view axis)
-    let mut pairs: Vec<(f32, nalgebra::Vector3<f32>)> = (0..3).map(|i| {
-        (eig.eigenvalues[i], eig.eigenvectors.column(i).into_owned())
-    }).collect();
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
- 
-    let ex = &pairs[0].1;
-    let ey = &pairs[1].1;
-    let ez = &pairs[2].1;
- 
+    // eig is already sorted ascending by eigenvalue
+    let ex = &eig[0].1;
+    let ey = &eig[1].1;
+    let ez = &eig[2].1;
+
     let mut out = Vec::with_capacity(apos.len());
     for p in apos {
         let vx = (p.x - cog.x) as f32;
         let vy = (p.y - cog.y) as f32;
         let vz = (p.z - cog.z) as f32;
         out.push([
-            ex.x * vx + ex.y * vy + ex.z * vz,
-            ey.x * vx + ey.y * vy + ey.z * vz,
-            ez.x * vx + ez.y * vy + ez.z * vz,
+            ex[0] * vx + ex[1] * vy + ex[2] * vz,
+            ey[0] * vx + ey[1] * vy + ey[2] * vz,
+            ez[0] * vx + ez[1] * vy + ez[2] * vz,
         ]);
     }
     out

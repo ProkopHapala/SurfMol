@@ -10,7 +10,8 @@ moltopo = { workspace = true }
 molrender = { workspace = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }
-nalgebra = { workspace = true }
 glam = { workspace = true }
+egui = { workspace = true }
+arboard = { workspace = true }
 [dev-dependencies]
 image = { workspace = true }

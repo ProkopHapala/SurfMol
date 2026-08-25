@@ -15,6 +15,7 @@ use moltopo::builder;
 use moltopo::params::{Params, get_reqh};
 use molgui::gui::trackball::TrackballCam;
 use molgui::gui::kekule_editor::{KekuleEditor, EditMode, AtomType, collect_hex_grid_points, collect_builder_bonds, collect_builder_atoms, export_xyz, builder_summary, element_color};
+use molgui::gui::clipboard::{Clipboard, inject_cut_copy_if_needed, inject_paste_if_needed, handle_output_commands};
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -67,6 +68,7 @@ struct App {
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    clipboard: Clipboard,
     etot: f64, eb: f64, ea: f64, ed: f64, ei: f64, enb: f64, es: f64,
     // --- Kekule editor state ---
     kekule_editor: KekuleEditor,
@@ -194,7 +196,7 @@ impl App {
         let mut dirty = Dirty::default(); dirty.atoms = false; dirty.camera = true; dirty.bonds = false; dirty.surface = false; dirty.groups = false;
         println!("App initialized. Controls: H=help  SPACE=relax  S=surface  B=bonds  P=pin  ESC=deselect");
         let kekule_editor = KekuleEditor::new();
-        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: true, show_help: true, show_groups: false, show_ports: false, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: 0.0, zero_v_on_opposition: true, per_frame, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0, kekule_editor, builder: b, show_kekule_editor: true, show_hex_grid: true, show_ghost_hexes: true, edit_from_builder: false };
+        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: true, show_help: true, show_groups: false, show_ports: false, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: 0.0, zero_v_on_opposition: true, per_frame, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, clipboard: Clipboard::new(), etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0, kekule_editor, builder: b, show_kekule_editor: true, show_hex_grid: true, show_ghost_hexes: true, edit_from_builder: false };
         app.rebuild_surface_cache();
         app
     }
@@ -679,9 +681,15 @@ impl App {
         self.line_renderer.render(&mut encoder, &view, depth_view, &cam, &lines);
 
         // --- egui overlay ---
-        let raw_input = self.egui_state.take_egui_input(&self.window);
+        let mut raw_input = self.egui_state.take_egui_input(&self.window);
+        // Clipboard bridge: inject Cut/Copy/Paste events (replaces egui-winit's clipboard feature)
+        let mods = raw_input.modifiers;
+        inject_cut_copy_if_needed(&mut raw_input.events, mods);
+        inject_paste_if_needed(&mut raw_input.events, mods, &mut self.clipboard);
         let egui_ctx = self.egui_ctx.clone();
         let full_output = egui_ctx.run(raw_input, |ctx| { self.draw_egui(ctx); });
+        // Clipboard bridge: write CopyText commands to OS clipboard
+        handle_output_commands(&full_output.platform_output, &mut self.clipboard);
         self.egui_state.handle_platform_output(&self.window, full_output.platform_output);
         let tris = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         for (id, image_delta) in &full_output.textures_delta.set { self.egui_renderer.update_texture(&*self.device, &self.queue, *id, image_delta); }

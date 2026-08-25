@@ -110,7 +110,8 @@ impl MolBrowserApp {
 }
 
 impl eframe::App for MolBrowserApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         // Render up to 4 thumbnails per frame to keep UI responsive
         for _ in 0..4 {
             self.render_next();
@@ -127,7 +128,7 @@ impl eframe::App for MolBrowserApp {
             }
         }
 
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        egui::TopBottomPanel::top("top_panel").show(&ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("MolBrowser");
                 ui.label(format!("Folder: {}", self.folder.display()));
@@ -136,7 +137,7 @@ impl eframe::App for MolBrowserApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(&ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let thumb_w = self.thumb_size as f32;
                 let spacing = 8.0;

@@ -10,7 +10,6 @@ moltopo = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 pollster = { workspace = true }
-nalgebra = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }
