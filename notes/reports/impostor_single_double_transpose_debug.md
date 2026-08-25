@@ -74,6 +74,74 @@ not deleted per YAGNI/preservation rules.
 - `cargo build -p molgui -p editor`: clean (only pre-existing warnings).
 - `cargo test -p molgui`: clean.
 
+## Why molbrowser atoms were visible despite the bug (2026-08-25 follow-up)
+
+User reported molecules were visible in molbrowser even before the fix.
+Verified empirically: temporarily restored `transpose4x4` in `MolThumbnailer`,
+ran thumbnail rendering:
+
+```
+WITH BUG: benzene    non_clear=2728/16384   (atoms visible!)
+WITH BUG: H2O        non_clear=5082/16384
+WITH BUG: NaCl_1x1_L3 non_clear=1830/16384
+```
+
+After fix:
+```
+FIXED:   benzene    non_clear=1460/16384
+FIXED:   H2O        non_clear=5186/16384
+FIXED:   NaCl_1x1_L3 non_clear=832/16384
+```
+
+**Root cause of the discrepancy: two different camera construction methods.**
+
+### `MolThumbnailer` (molbrowser, trackball) — direct basis construction
+
+Builds `vp` directly from camera basis vectors (right/up/forward), placing
+translations in the **4th column** of the row-major matrix:
+```
+vp = [
+    [sx*r.x, sx*r.y, sx*r.z, sx*tx],   // row 0
+    [sy*u.x, sy*u.y, sy*u.z, sy*ty],   // row 1
+    [sz*f.x, sz*f.y, sz*f.z, sz*tz+tz], // row 2
+    [0,     0,     0,     1],           // row 3
+]
+```
+After `transpose4x4`, translations move to the **4th row** of `M_wgsl`,
+affecting `clip.w`, NOT `clip.z`. For an atom at the origin (z=0):
+- `clip.z = sz * 0 = 0` → `ndc.z = 0` → exactly at near plane, NOT clipped.
+- `clip.w = 1` (translation terms multiply z=0) → no perspective distortion.
+- Atoms are visible, just slightly distorted for off-center atoms (clip.w ≠ 1
+  when z ≠ 0, causing a mild non-uniform scaling).
+
+### `impostor_single` test & `ThumbnailRenderer` (render_all) — `look_at × ortho`
+
+Uses `mul4x4(look_at(...), ortho(...))`. The `look_at` view matrix has a
+non-zero **4th row** translation: `[-dot(x,eye), -dot(y,eye), -dot(z,eye), 1]`.
+After `mul4x4(view, proj)` and `transpose4x4`, this z-translation ends up in
+`M_wgsl[2][3]` (the z-translation slot), making:
+- `clip.z = sz * world_z + M_wgsl[2][3] * 1` → a **constant negative offset**
+- For the test (eye at z=5, near=0.1): `clip.z ≈ -0.001` → `ndc.z ≈ -0.001 < 0`
+  → **outside Vulkan NDC [0,1]** → rasterizer clips the entire triangle → 0 pixels.
+
+For `ThumbnailRenderer` with an angled eye (not axis-aligned), the double-
+transpose also transposes the **rotation** part (inverting it), causing
+severe projection distortion on top of the clipping.
+
+### Summary table
+
+| Code path | Camera method | Bug effect | Result |
+|-----------|--------------|------------|--------|
+| `MolThumbnailer` (molbrowser) | direct basis, axis-aligned | translation → clip.w, ndc.z=0 | atoms visible (mild distortion) |
+| `TrackballCam` (editor) | direct basis, rotated | rotation transposed + translation → clip.w | atoms visible (distorted) |
+| `impostor_single` test | `look_at × ortho`, axis-aligned | z-translation → clip.z, ndc.z<0 | **0 pixels (clipped)** |
+| `ThumbnailRenderer` (render_all) | `look_at × ortho`, angled | rotation transposed + z-translation → clip.z | **0 pixels (clipped)** |
+
+The bug was **real and present everywhere**, but only caused visible failure
+(total clipping) in the `look_at × ortho` paths. The direct-basis paths were
+resilient because their translation layout survived the double-transpose
+without pushing fragments outside the near plane.
+
 ## Notes
 
 - `render_all` is a weak test (asserts `ok > 0` = "files were saved", not

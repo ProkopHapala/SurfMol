@@ -20,46 +20,60 @@ SurfMol/
 ├── Import_other_Repos.md     # Reference repos (FireCore, SPAMMM, learn_Rust, blood_of_civilization)
 ├── CODEMAP.md                # This file
 ├── README.md                 # Repo README (OKF)
-├── .gitignore
+├── Cargo.toml                # Workspace root (14 members, resolver 2)
+├── .cargo/config.toml        # Shared target dir fallback (CARGO_TARGET_DIR overrides)
 ├── data/                     # Molecular inputs (.xyz, .mol, .mol2) + FF params (.dat)
 ├── debug/                    # Diagnostic plots (gitignored except README)
 ├── doc/                      # Permanent developer docs + topical_audit/
 ├── notes/                    # Ephemeral work-in-progress (chats, designs, labbooks, reports, tasks, TODOs)
 ├── opencl/                   # OpenCL .cl kernel sources
-├── rust/                     # Primary Rust workspace (5 crates)
+├── crates/                   # Rust workspace (10 libs + 4 apps)
+│   ├── libs/                 # Library crates (no binary targets)
+│   └── apps/                 # Binary crates (CLI/GUI tools)
 └── userguide/                # End-user docs for finished modules
 ```
 
 ## 2. Rust workspace
 
-**Workspace root:** `rust/Cargo.toml` (5 members, resolver 2).
-**Shared target dir:** `rust/.cargo/config.toml` → `target-dir = "../../target"` (i.e. `/home/prokop/git/SurfMol/target`).
+**Workspace root:** `Cargo.toml` (14 members, resolver 2).
+**Shared target dir:** `CARGO_TARGET_DIR` env var (machine-local, typically `~/.cargo/shared_target`); repo `.cargo/config.toml` falls back to local `target/`.
+
+### Members
+
+```
+crates/libs/   (10 library crates, no binary targets)
+  numcore, moltopo, pgraph, pgraph_ops, spacc,
+  molff, surfff, surfmol, molrender, molgui
+
+crates/apps/   (4 binary crates)
+  buildff, molengine, editor, molbrowser
+```
 
 ### Crate dependency graph
 
 ```
-surfmol-common  (no internal deps; bytemuck)
-      ↑
-surfmol-topology  (→ common; serde, serde_json)
-      ↑
-surfmol-forcefields  (→ common, topology; rhai, clap, serde, serde_json, ndarray)
-      ↑
-surfmol-molrender  (→ common, topology; wgpu, bytemuck, pollster, nalgebra)
-      ↑
-surfmol-apps  (→ forcefields, common, topology, molrender; wgpu, winit, eframe, egui, egui-winit, egui-wgpu, glam, nalgebra, image)
+numcore ← moltopo ← molff ← surfmol
+         ↖ molrender ← molgui
+         ↖ surfff ↗
+         ↖ pgraph ← pgraph_ops
+         ↖ pgraph ← spacc
 ```
 
-### Workspace dependencies (`rust/Cargo.toml`)
+Apps depend on libs:
+- `buildff` → moltopo, numcore
+- `molengine` → surfmol, molff, moltopo, numcore
+- `editor` → surfmol, molff, surfff, moltopo, numcore, molgui, molrender
+- `molbrowser` → moltopo, numcore, molgui, molrender
+
+### Workspace dependencies (`Cargo.toml`)
 
 | Crate | Version | Notes |
 |-------|---------|-------|
-| `eframe` | 0.29 | `default-features=false`, `features=["default_fonts","glow"]` |
+| `eframe` | 0.34 | `default-features=false`, `features=["default_fonts","wgpu","wayland","x11"]` |
 | `egui` | 0.34 | Immediate-mode GUI |
-| `egui-winit` | 0.34 | egui ↔ winit bridge |
+| `egui-winit` | 0.34 | `default-features=false`, `features=["wayland","x11","links"]` |
 | `egui-wgpu` | 0.34 | egui ↔ wgpu backend |
-| `egui_plot` | 0.34 | Plotting (declared, not yet used) |
-| `ndarray` | 0.16 | N-d arrays (forcefields) |
-| `nalgebra` | 0.33 | Linear algebra (molrender, apps) |
+| `ndarray` | 0.16 | N-d arrays (molff, molengine) |
 | `rand` | 0.8 | RNG |
 | `ocl` | 0.19 | **OpenCL bindings — chosen crate** (see `DESIGN_GOALS.md` §10) |
 | `wgpu` | 29 | GPU compute/graphics |
@@ -67,97 +81,164 @@ surfmol-apps  (→ forcefields, common, topology, molrender; wgpu, winit, eframe
 | `bytemuck` | 1.21 | `features=["derive"]` — zero-cost casts for GPU buffers |
 | `winit` | 0.30 | Windowing |
 | `glam` | 0.29 | Math (apps: Quat, Vec3) |
+| `serde` | 1.0 | `features=["derive"]` — serialization |
+| `serde_json` | 1.0 | JSON I/O |
+| `rhai` | 1.19 | Scripting (molengine) |
+| `clap` | 4.5 | `features=["derive"]` — CLI parsing |
+| `image` | 0.25 | `default-features=false`, `features=["png"]` — PNG I/O (dev-dep in molrender, dep in molgui) |
+| `arboard` | 3.6 | `default-features=false` — clipboard (molgui, editor) |
 
-### Per-crate extra deps
+### Build profiles
 
-| Crate | Extra deps |
-|-------|------------|
-| `surfmol-topology` | `serde 1.0` (derive), `serde_json 1.0` |
-| `surfmol-forcefields` | `rhai 1.19` (scripting), `clap 4.5` (derive), `serde 1.0`, `serde_json 1.0`, `ndarray` (workspace) |
-| `surfmol-molrender` | `image 0.25` (dev-dep, `default-features=false`, `features=["png"]`) |
-| `surfmol-apps` | `egui_extras 0.29`, `glam` (workspace), `nalgebra` (workspace), `image 0.25` |
+Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_footprint_plan.md` A1:
+- `[profile.dev]`: `debug=1` (line tables only), `strip="debuginfo"` (~16× smaller debug binaries, `.eh_frame` survives for backtraces)
+- `[profile.release]`: `lto="thin"`, `codegen-units=1`, `debug=1`, `incremental=true`, `debug-assertions=true`, `overflow-checks=true`, `strip="debuginfo"`
 
 ## 3. File inventory by crate
 
-### `surfmol-common` (`rust/common/`, 8128 LOC total workspace)
+### `numcore` (`crates/libs/numcore/`, 437 LOC)
 *Bedrock: math + data structures. No chemistry/physics. `#[repr(C)]`, 64-byte aligned.*
 
 | File | LOC | Contents |
 |------|-----|----------|
-| `src/common.rs` | 4 | Crate root: `pub mod math; pub mod util; pub mod xyz; pub mod molecular;` |
+| `src/lib.rs` | 4 | Crate root: `pub mod math; pub mod util;` |
 | `src/util.rs` | 60 | `AlignedVec<T, A>` — cache-aligned allocator (64-byte), `as_slice`/`as_mut_slice`/`resize_fill`. `unsafe` for raw alloc. |
-| `src/xyz.rs` | 48 | `XyzSystem`, `read_xyz()`, `write_xyz_frame()` — XYZ file I/O. |
-| `src/molecular.rs` | 165 | `Atoms` (static: natoms, atypes, apos, neighs, neigh_bs; `make_neigh_bs()`), `DynamicAtoms` (Atoms + fapos + vapos; `move_atom_md()`, `run_md()`, `clean_force/velocity`). **SSOT for atomic state.** |
-| `src/math/mod.rs` | 6 | Module declarations. |
+| `src/math/mod.rs` | 7 | Module declarations: vec2, vec3, quat4, math3d, math4d, fastmath, linalg. |
 | `src/math/vec3.rs` | 43 | `Vec3d` (`#[repr(C)]`, f64), ops (add/sub/mul/dot/cross/norm/normalize), `VEC3_ZERO`, `VEC3_NAN`. |
 | `src/math/vec2.rs` | — | `Vec2d` with `mul_cmplx` (complex multiply for angle/dihedral Fourier series). |
 | `src/math/quat4.rs` | 31 | `Quat4d` (f64 xyzw), `Quat4i` (i32 xyzw), `QUAT4I_MINUS_ONES`. |
 | `src/math/math3d.rs` | 26 | f32 helpers: `normalize3`, `cross3`, `dot3`, `sub3`, `add3`, `mul3s` (for GPU rendering). |
 | `src/math/math4d.rs` | 37 | f32 4×4 matrices: `look_at`, `ortho` (Vulkan NDC), `mul4x4`, `transpose4x4`. |
 | `src/math/fastmath.rs` | 36 | `sq`, `dangle`, `clamp_abs`, `sincos_taylor2`, `sincos_r2_taylor` (Taylor approximations). |
+| `src/math/linalg.rs` | 92 | `symmetric_eigen_3x3` — analytical (closed-form) 3×3 symmetric eigendecomposition. Ported from FireCore `Mat3.h:Mat3T::eigenvals()` + `eigenvec()`. Replaces nalgebra for PCA in thumbnailer. |
 
-### `surfmol-topology` (`rust/topology/`)
-*Molecular graph SSOT. Bonds/angles/dihedrals/inversions. UFF type assignment.*
+### `moltopo` (`crates/libs/moltopo/`, 1855 LOC)
+*Molecular topology SSOT. Bonds/angles/dihedrals/inversions. UFF type assignment.*
 
 | File | LOC | Contents |
 |------|-----|----------|
-| `src/topology_lib.rs` | 5 | Crate root: `pub mod topology; builder; params; export; assign_uff;` |
+| `src/lib.rs` | 5 | Crate root: `pub mod topology; molecular; builder; params; assign_uff; export; xyz;` |
 | `src/topology.rs` | 173 | `Topology` (apos, bonds, angles, dihedrals, inversions), `ne_pairs()`, `hybridization()`, `build_bonds_by_cutoff()`, `build_angles/dihedrals/inversions_from_bonds()`. Diagnostic prints (parity with C++ `MMFFBuilderBase.h`). |
+| `src/molecular.rs` | 165 | `Atoms` (static: natoms, atypes, apos, neighs, neigh_bs; `make_neigh_bs()`), `DynamicAtoms` (Atoms + fapos + vapos; `move_atom_md()`, `run_md()`, `clean_force/velocity`). **SSOT for atomic state.** |
 | `src/builder.rs` | 599 | `Builder` — slot-based molecular graph with generational handles (`AtomH`, `BondH`), soft/hard remove, `cleanup_dead()`, `bake()` → `Topology`. Hex grid editing (`honeycomb_ring_nodes`, `snap_to_node`, `add_hex_ring`). `from_positions_cutoff()`, `from_positions_and_radii()`. |
-| `src/params.rs` | 664 | `Params` — loads `ElementTypes.dat`, `AtomTypes.dat`, `BondTypes.dat`, `AngleTypes.dat`, `DihedralTypes.dat`. Structs: `ElementType`, `AtomType`, `BondParam`, `AngleParam`, `DihedralParam`. Wildcard matching for angle/dihedral params. `assign_uff_types()` (duplicate, also in `assign_uff.rs`). |
+| `src/params.rs` | 664 | `Params` — loads `ElementTypes.dat`, `AtomTypes.dat`, `BondTypes.dat`, `AngleTypes.dat`, `DihedralTypes.dat`. Structs: `ElementType`, `AtomType`, `BondParam`, `AngleParam`, `DihedralParam`. Wildcard matching for angle/dihedral params. |
 | `src/assign_uff.rs` | 125 | `assign_uff_types()` — octet-rule hybridization → UFF suffix (_3/_R/_2/_1). Special cases: H_, nitro N_R/O_R, C=O O_2, alkyne C_1. |
 | `src/export.rs` | 74 | `TopologyData` (serde), `Topology::export_json()`, `import_json()`. TODO: .npy export. |
-| `src/bin/assign_uff.rs` | 290 | **CLI binary `assign-uff`**: reads XYZ → builds topology → assigns UFF types → outputs JSON and/or binary (`UFFTOPO` magic header + flat arrays). Flags: `--json`, `--bin`, `--tol`, `--rcut`. |
+| `src/xyz.rs` | 48 | `XyzSystem`, `read_xyz()`, `write_xyz_frame()` — XYZ file I/O. |
 
-### `surfmol-forcefields` (`rust/forcefields/`)
-*Forcefield eval, MD, relaxation, `MolWorld` coordinator. See `rust/forcefields/DESIGN.md`.*
+### `pgraph` (`crates/libs/pgraph/`, 280 LOC)
+*Positioned graph data contract — domain-agnostic foundation. See `notes/designs/topology_builder.md`.*
 
 | File | LOC | Contents |
 |------|-----|----------|
-| `src/forcefields.rs` | 6 | Crate root: `pub mod uff; nonbonded; surface; mol_world; import; rigid_sp3;` |
-| `src/mol_world.rs` | 140 | `MolWorld` — orchestrator. `BondedFFMode::{Uff, RigidSp3}`. Owns `DynamicAtoms`, `Uff`, `RigidSp3FF`, optional `NonBondedFF`, optional `SurfaceFolded`. `eval_forces()` → (eb,ea,ed,ei,enb,es). `run_md()`, `move_atom_md()`. Setup wrappers (`make_neigh_bs`, `bake_*_neighs`, `update_hneigh`, `setup_nacl_surface`). |
-| `src/uff.rs` | 665 | `Uff` — bonded forcefield. `Buckets` (spatial partition for force assembly). SoA `AlignedVec` arrays: `bon_atoms`, `ang_atoms`, `dih_atoms`, `inv_atoms`, `hneigh`, `fint/fbon/fang/fdih/finv`, params. `eval_atom_bonds()`, `eval_angle_prokop()`, `eval_dihedral_prokop()` (Fourier series via `Vec2d::mul_cmplx`). `map_atom_interactions()`, `assemble_forces()`, `update_hneigh()`. Diagnostic prints (parity with C++ `UFF.h`). |
-| `src/rigid_sp3.rs` | 237 | `RigidSp3FF` — **port-based rigid body FF (RAFF precursor)**. Per-atom quaternion (`quat`), angular velocity (`omega`), torque (`tau`), port geometry (`port_local`, `nport`). `set_sp3/sp2/sp1/point()`, `set_port_geometry_from_types()`. `eval_forces()` — port tip ↔ neighbor atom harmonic spring + torque. `move_atom_md()` — translational + quaternion rotation integration. `get_port_tip()`. |
-| `src/nonbonded.rs` | 300 | `NonBondedFF` — LJ + Coulomb + H-bond. `reqs` (RvdW, sqrt(EvdW), Q, Hb), `plqs` (Pauli, London, Q, Hb). `make_plqs()`, `make_second_neighs()` (1-2 + 1-3 exclusion, EXCL_MAX=16), `make_pbc_shifts()`. `eval()` / `eval_pbc()` — O(N²) with exclusion skip + force clamping. `check_req_limits()`. |
-| `src/surface.rs` | 512 | `SurfaceFolded` — separable tensor-product basis (Fourier in x/y, exp decay in z). Complex recurrence for harmonics (1 cos/sin + nmax complex muls). `eval_atom_scratch()` (no per-atom alloc), `eval_all_clamped()`. `setup_nacl_surface()` — NaCl checkerboard. `SurfaceScratch` (reusable buffers). Unit tests: harmonics recurrence, constant/cos/z-decay basis, req2plq. |
-| `src/import.rs` | 13 | `load_topology_from_json()` → `(Uff, Vec<String>)`. |
-| `src/mol_engine.rs` | 90 | **CLI binary `mol_engine`**: Rhai-scripted MD/relaxation. Registers `load_topology`, `eval_forces`, `step_md`, `relax`, `get_natoms`. `SimulationEngine` wraps `MolWorld` in `Arc<Mutex>`. |
-| `DESIGN.md` | — | Ownership model: "borrow, don't own". `DynamicAtoms` is single owner; FFs borrow slices. Data hierarchy diagram. |
-| `examples/md.rhai` | — | Rhai MD script example. |
-| `examples/relax.rhai` | — | Rhai relaxation script example. |
-| `tests/test_rigid_sp3.rs` | 110 | Tetrahedral sp3 center (CH4-like) test. |
+| `src/lib.rs` | 280 | `PGraph` (pos + edges), `PGraphView<'a>`, `Elements<N>`, `Ragged`, `Permutation`, `FixedRows<K>`/`FixedAdj<K>` (ELL-like, `-1` sentinel), `CsrAdj`, `Partition`/`IndexGroups`/`RangeGroups`. `Index = u32`, `INVALID = -1`. |
+
+### `pgraph_ops` (`crates/libs/pgraph_ops/`, 623 LOC)
+*Reusable graph algorithms on `pgraph` data. Ported from FireCore `MolecularGraph.h` without class ownership.*
+
+| File | LOC | Contents |
+|------|-----|----------|
+| `src/lib.rs` | 11 | Module declarations: adjacency, components, bridges, reorder, geometry. |
+| `src/adjacency.rs` | 155 | `build_csr_adj` (count→prefix→scatter), `build_fixed_adj::<K>` (fails loud on degree > K via `DegreeOverflow`). Both produce parallel `neigh` + `edge` arrays. |
+| `src/components.rs` | 85 | `connected_components(csr)` via iterative BFS → `Partition`. `split_by_component(csr)` → `Vec<Vec<Index>>`. |
+| `src/bridges.rs` | 130 | `find_bridges(csr)` via iterative Tarjan DFS (discovery times + low-link). No recursion → no stack overflow. |
+| `src/reorder.rs` | 154 | `partition_to_index_groups`, `group_aware_permutation` (→ `Permutation` + `RangeGroups`), `apply_permutation`, `permute_edges`. |
+| `src/geometry.rs` | 87 | `edge_vec`, `edge_length`, `edge_lengths`, `bounding_box`, `bounding_box_center`, `bounding_box_span`. |
+
+### `spacc` (`crates/libs/spacc/`, 256 LOC)
+*Spatial acceleration — rebuildable caches, no molecular semantics.*
+
+| File | LOC | Contents |
+|------|-----|----------|
+| `src/lib.rs` | 6 | Module declarations: aabb, buckets. |
+| `src/aabb.rs` | 130 | `Aabb` (lo/hi Vec3d), `fit_aabb(pos, ids)`, `fit_group_aabbs(pos, groups, out)`. Dataflow: `positions + IndexGroups → Aabb[group]`. |
+| `src/buckets.rs` | 117 | `Buckets` — spatial hashing via count→prefix→scatter (FireCore `Buckets.h` pattern). `build(cell_of_obj)`, `cell_objects(c)`. |
+
+### `molff` (`crates/libs/molff/`, 1205 LOC)
+*Intra-molecular forcefields. See `notes/designs/` for forcefield data ownership.*
+
+| File | LOC | Contents |
+|------|-----|----------|
+| `src/lib.rs` | 6 | Crate root: `pub mod uff; nonbonded; rigid_sp3;` |
+| `src/uff.rs` | 665 | `Uff` — bonded forcefield. `Buckets` (spatial partition for force assembly). SoA `AlignedVec` arrays. `eval_atom_bonds()`, `eval_angle_prokop()`, `eval_dihedral_prokop()` (Fourier series via `Vec2d::mul_cmplx`). |
+| `src/nonbonded.rs` | 300 | `NonBondedFF` — LJ + Coulomb + H-bond. `reqs`, `plqs`, `make_second_neighs()` (1-2 + 1-3 exclusion), `make_pbc_shifts()`. `eval()` / `eval_pbc()` — O(N²) with exclusion skip. |
+| `src/rigid_sp3.rs` | 237 | `RigidSp3FF` — port-based rigid body FF (RAFF precursor). Per-atom quaternion, angular velocity, torque, port geometry. |
+| `tests/test_rigid_sp3.rs` | 110 | Tetrahedral sp3 center (CH4-like) + water test. |
+
+### `surfff` (`crates/libs/surfff/`, 512 LOC)
+*Surface interaction forcefield.*
+
+| File | LOC | Contents |
+|------|-----|----------|
+| `src/lib.rs` | 512 | `SurfaceFolded` — separable tensor-product basis (Fourier in x/y, exp decay in z). Complex recurrence for harmonics. `eval_atom_scratch()`, `eval_all_clamped()`. `setup_nacl_surface()`. `SurfaceScratch`. Unit tests: harmonics recurrence, constant/cos/z-decay basis, req2plq. |
 | `tests/test_surface.rs` | 188 | Surface eval tests + SVG plot generator (pure Rust, no deps). |
 
-### `surfmol-molrender` (`rust/molrender/`)
+### `surfmol` (`crates/libs/surfmol/`, 155 LOC)
+*Integration engine: `MolWorld` orchestrator.*
+
+| File | LOC | Contents |
+|------|-----|----------|
+| `src/lib.rs` | 6 | Crate root: `pub mod mol_world; import;` |
+| `src/mol_world.rs` | 140 | `MolWorld` — orchestrator. `BondedFFMode::{Uff, RigidSp3}`. Owns `DynamicAtoms`, `Uff`, `RigidSp3FF`, optional `NonBondedFF`, optional `SurfaceFolded`. `eval_forces()`, `run_md()`, `move_atom_md()`. |
+| `src/import.rs` | 13 | `load_topology_from_json()` → `(Uff, Vec<String>)`. |
+
+### `molrender` (`crates/libs/molrender/`, 939 LOC)
 *wgpu rendering primitives. No simulation logic. WGSL shaders inline.*
 
 | File | LOC | Contents |
 |------|-----|----------|
-| `src/molrender.rs` | 154 | Crate root + `ThumbnailRenderer` — offscreen wgpu renderer (ImpostorRenderer wrapper). Auto-fitting ortho camera. RGBA readback. |
-| `src/impostor.rs` | 365 | `ImpostorRenderer` — raytraced sphere impostors (WGSL shader inline). `AtomInstance` (pos, radius, color), `CameraData` (view_proj, eye, right, up, forward). Re-exports `math3d`/`math4d` helpers. |
-| `src/line_renderer.rs` | 191 | `LineRenderer` — line segments (WGSL inline). `LineVertex` (pos, col). |
-| `src/surface_renderer.rs` | 229 | `SurfaceRenderer` — textured quad for surface potential visualization (WGSL inline). |
+| `src/lib.rs` | 154 | Crate root + `ThumbnailRenderer` — offscreen wgpu renderer. Auto-fitting ortho camera. RGBA readback. |
+| `src/impostor.rs` | 365 | `ImpostorRenderer` — raytraced sphere impostors (WGSL inline). `AtomInstance`, `CameraData`. Re-exports `math3d`/`math4d` helpers. |
+| `src/line_renderer.rs` | 191 | `LineRenderer` — line segments (WGSL inline). `LineVertex`. |
+| `src/surface_renderer.rs` | 229 | `SurfaceRenderer` — textured quad for surface potential (WGSL inline). |
 | `tests/debug_simple.rs` | — | Single-atom render debug. |
 | `tests/debug_single.rs` | — | Single-atom render with full params. |
 | `tests/debug_eico.rs` | 69 | Eicosanediol thumbnail debug. |
-| `tests/impostor_single.rs` | 112 | Direct ImpostorRenderer test. |
+| `tests/impostor_single.rs` | 112 | Direct ImpostorRenderer test (known GPU headless failure). |
 | `tests/render_all.rs` | 74 | Render all XYZ thumbnails. |
 | `tests/render_thumbs.rs` | 69 | Sample thumbnail render. |
 
-### `surfmol-apps` (`rust/apps/`)
-*GUI applications. No simulation logic — wires backend crates together.*
+### `molgui` (`crates/libs/molgui/`, 795 LOC)
+*GUI support: trackball camera, thumbnailer, Kekule editor, clipboard.*
 
 | File | LOC | Contents |
 |------|-----|----------|
 | `src/lib.rs` | 1 | Crate root: `pub mod gui;` |
-| `src/editor.rs` | 1153 | **Binary `editor`** — 3D molecular editor. winit + wgpu + egui. TrackballCam, atom picking (ray-sphere), bond drawing, hex-grid Kekule editing, MD relaxation (RigidSp3 + NonBonded + NaCl surface), surface potential visualization. Constants: `LATTICE_A=5.66` (NaCl), `BETA_CHARGE=0.3`, etc. |
-| `src/mol_browser.rs` | 249 | **Binary `mol_browser`** — XYZ directory browser with egui thumbnail grid. `MolEntry`, `MolBrowserApp`. |
-| `src/gui/mod.rs` | 4 | `pub mod gizmos; kekule_editor; thumbnailer; trackball;` |
+| `src/gui/mod.rs` | 4 | `pub mod gizmos; kekule_editor; thumbnailer; trackball; clipboard;` |
 | `src/gui/gizmos.rs` | — | `make_bond_segments()` — multi-segment bond line generation. |
-| `src/gui/kekule_editor.rs` | 338 | `KekuleEditor` — hex-grid molecular editor. `EditMode::{Select,HexPaint,HexToggle,AtomDraw,BondDraw}`. `collect_hex_grid_points()`, `collect_builder_bonds/atoms()`, `export_xyz()`, `builder_summary()`, `element_color()`. |
-| `src/gui/thumbnailer.rs` | 234 | `MolThumbnailer` — wraps `ImpostorRenderer` + `LineRenderer` for egui thumbnail textures. |
+| `src/gui/kekule_editor.rs` | 338 | `KekuleEditor` — hex-grid molecular editor. `EditMode`, `collect_hex_grid_points()`, `collect_builder_bonds/atoms()`, `export_xyz()`, `element_color()`. |
+| `src/gui/thumbnailer.rs` | 234 | `MolThumbnailer` — wraps `ImpostorRenderer` + `LineRenderer` for egui thumbnail textures. PCA alignment via `numcore::math::linalg::symmetric_eigen_3x3`. |
 | `src/gui/trackball.rs` | 63 | `TrackballCam` — orbit camera (target, rotation Quat, zoom, lerp). |
+| `src/gui/clipboard.rs` | — | `Clipboard` — arboard wrapper. `inject_cut_copy_if_needed`, `inject_paste_if_needed`, `handle_output_commands`. Replaces egui-winit's clipboard feature. |
 | `tests/test_thumb.rs` | — | MolThumbnailer integration test (saves PNG via `image` crate). |
+
+### `buildff` (`crates/apps/buildff/`, 290 LOC)
+*CLI tool: XYZ → topology → UFF type assignment → JSON or binary export.*
+
+| File | LOC | Contents |
+|------|-----|----------|
+| `src/main.rs` | 290 | Reads XYZ → builds topology → assigns UFF types → outputs JSON and/or binary (`UFFTOPO` magic header + flat arrays). Flags: `--json`, `--bin`, `--tol`, `--rcut`. |
+
+### `molengine` (`crates/apps/molengine/`, 90 LOC)
+*CLI MD/relaxation engine. Rhai-scripted.*
+
+| File | LOC | Contents |
+|------|-----|----------|
+| `src/main.rs` | 90 | Rhai-scripted MD/relaxation. Registers `load_topology`, `eval_forces`, `step_md`, `relax`, `get_natoms`. `SimulationEngine` wraps `MolWorld` in `Arc<Mutex>`. |
+
+### `editor` (`crates/apps/editor/`, 1161 LOC)
+*Interactive molecular editor and on-surface MD simulator. wgpu + egui + winit.*
+
+| File | LOC | Contents |
+|------|-----|----------|
+| `src/main.rs` | 1161 | 3D molecular editor. TrackballCam, atom picking (ray-sphere), bond drawing, hex-grid Kekule editing, MD relaxation (RigidSp3 + NonBonded + NaCl surface), surface potential visualization, clipboard support. |
+
+### `molbrowser` (`crates/apps/molbrowser/`, 250 LOC)
+*Gallery browser for XYZ molecule files. eframe (egui).*
+
+| File | LOC | Contents |
+|------|-----|----------|
+| `src/main.rs` | 250 | `MolBrowserApp` — XYZ directory browser with egui thumbnail grid. Batched GPU thumbnail generation with PCA alignment, responsive grid layout, incremental loading. |
 
 ## 4. OpenCL kernels (`opencl/`)
 
@@ -173,7 +254,7 @@ Ported from FireCore / SPAMMM. See `opencl/README.md` and `Import_other_Repos.md
 | `Surface.cl` | 33 KB | Surface interactions (Morse/LJ/Coulomb), Ewald2D | FireCore/SPAMMM |
 | `Assembly.cl` | 7 KB | Rigid-body assembly / packing / clash | SPAMMM |
 
-**Note:** These kernels are not yet wired into the Rust crates (no `ocl` usage in any crate yet). The Rust CPU implementations in `surfmol-forcefields` are the current authoritative references.
+**Note:** These kernels are not yet wired into the Rust crates (no `ocl` usage in any crate yet). The Rust CPU implementations in `molff` are the current authoritative references.
 
 ## 5. Data files (`data/`)
 
@@ -189,7 +270,7 @@ Ported from FireCore / SPAMMM. See `opencl/README.md` and `Import_other_Repos.md
 
 ## 6. Build & test commands
 
-All commands run from `rust/`:
+All commands run from repo root (`/home/prokop/git/SurfMol`):
 
 ```bash
 # Build
@@ -197,43 +278,49 @@ cargo build                              # build all crates
 cargo build --release                    # release build
 
 # Run binaries
-cargo run -p surfmol-apps --bin editor          # 3D molecular editor
-cargo run -p surfmol-apps --bin mol_browser     # XYZ directory browser
-cargo run -p surfmol-topology --bin assign-uff -- <xyz> --json out.json --bin out.bin  # topology CLI
-cargo run -p surfmol-forcefields --bin mol_engine -- --script examples/relax.rhai     # Rhai MD engine
+cargo run -p editor                      # 3D molecular editor
+cargo run -p molbrowser                  # XYZ directory browser
+cargo run -p buildff -- <xyz> --json out.json --bin out.bin  # topology CLI
+cargo run -p molengine -- --script examples/relax.rhai       # Rhai MD engine
 
 # Test
 cargo test                               # all tests
-cargo test -p surfmol-forcefields        # forcefield tests only
-cargo test -p surfmol-molrender          # render tests only
-cargo test -p surfmol-apps               # GUI/composite tests
+cargo test -p molff                      # forcefield tests
+cargo test -p molrender                  # render tests
+cargo test -p pgraph -p pgraph_ops -p spacc  # graph/spatial tests
 
 # Check
 cargo check --workspace                  # fast type check
 cargo clippy --workspace                 # lints
 ```
 
-**Test data paths:** tests use relative paths like `../../data/ElementTypes.dat` — run from `rust/` or the crate dir.
+**Test data paths:** tests use `CARGO_MANIFEST_DIR` + `../../..` to reach `data/` from crate dirs.
 
 ## 7. Key data structures (cross-crate)
 
 | Struct | Crate | Role |
 |--------|-------|------|
-| `Vec3d`, `Quat4d`, `Quat4i` | common | `#[repr(C)]` math primitives, f64 |
-| `AlignedVec<T, 64>` | common | 64-byte aligned allocator for SIMD-friendly arrays |
-| `Atoms` | common | Static atomic data (apos, atypes, neighs, neigh_bs) |
-| `DynamicAtoms` | common | Atoms + fapos + vapos + MD integrators. **Single owner of per-atom state.** |
-| `Topology` | topology | Flat arrays: apos, bonds, angles, dihedrals, inversions |
-| `Builder` | topology | Slot-based graph with generational handles (AtomH, BondH), hex-grid editing |
-| `Params` | topology | Loaded FF parameter tables (elements, atom types, bonds, angles, dihedrals) |
-| `Uff` | forcefields | Bonded FF: SoA arrays, Buckets force assembly, hneigh, eval_*_prokop |
-| `RigidSp3FF` | forcefields | Port-based rigid body: quat, omega, tau, port_local. **RAFF precursor.** |
-| `NonBondedFF` | forcefields | LJ+Coulomb+Hbond: reqs, plqs, excl, PBC shifts |
-| `SurfaceFolded` | forcefields | Separable Fourier basis surface potential |
-| `MolWorld` | forcefields | Coordinator: DynamicAtoms + Uff + RigidSp3FF + optional NonBondedFF/SurfaceFolded |
+| `Vec3d`, `Quat4d`, `Quat4i` | numcore | `#[repr(C)]` math primitives, f64 |
+| `AlignedVec<T, 64>` | numcore | 64-byte aligned allocator for SIMD-friendly arrays |
+| `symmetric_eigen_3x3` | numcore | Analytical 3×3 symmetric eigendecomposition (replaces nalgebra) |
+| `Atoms` | moltopo | Static atomic data (apos, atypes, neighs, neigh_bs) |
+| `DynamicAtoms` | moltopo | Atoms + fapos + vapos + MD integrators. **Single owner of per-atom state.** |
+| `Topology` | moltopo | Flat arrays: apos, bonds, angles, dihedrals, inversions |
+| `Builder` | moltopo | Slot-based graph with generational handles (AtomH, BondH), hex-grid editing |
+| `Params` | moltopo | Loaded FF parameter tables |
+| `PGraph`, `PGraphView` | pgraph | Positioned graph: pos + edges (domain-agnostic) |
+| `FixedAdj<K>`, `CsrAdj` | pgraph | Adjacency representations (ELL-like / CSR) |
+| `Partition`, `IndexGroups`, `RangeGroups` | pgraph | Group representations |
+| `Permutation` | pgraph | Bidirectional index remapping |
+| `Uff` | molff | Bonded FF: SoA arrays, Buckets force assembly, hneigh |
+| `RigidSp3FF` | molff | Port-based rigid body: quat, omega, tau. **RAFF precursor.** |
+| `NonBondedFF` | molff | LJ+Coulomb+Hbond: reqs, plqs, excl, PBC shifts |
+| `SurfaceFolded` | surfff | Separable Fourier basis surface potential |
+| `MolWorld` | surfmol | Coordinator: DynamicAtoms + Uff + RigidSp3FF + optional NonBondedFF/SurfaceFolded |
+| `Aabb`, `Buckets` | spacc | Spatial acceleration (AABB fitting, spatial hashing) |
 | `AtomInstance`, `CameraData` | molrender | GPU vertex/uniform layouts (match WGSL structs) |
 | `ImpostorRenderer`, `LineRenderer`, `SurfaceRenderer` | molrender | wgpu render pipelines |
-| `TrackballCam`, `KekuleEditor`, `MolThumbnailer` | apps | GUI utilities |
+| `TrackballCam`, `KekuleEditor`, `MolThumbnailer`, `Clipboard` | molgui | GUI utilities |
 
 ## 8. Parity references (C++ / Python)
 
@@ -248,17 +335,24 @@ Each ported module cites its reference (see `AGENTS.md` §Rule 6 — Parity Work
 | `Builder` hex grid | SPAMM Python | `KekuleBackend.py` |
 | `Topology` diagnostic prints | FireCore C++ | `MMFFBuilderBase.h` |
 | `Params` diagnostic prints | FireCore C++ | `MMFFparams.h` |
+| `symmetric_eigen_3x3` | FireCore C++ | `Mat3.h:Mat3T::eigenvals()` + `eigenvec()` |
+| `pgraph_ops::build_csr_adj` | FireCore C++ | `MolecularGraph.h::makeNeighbors()` |
+| `pgraph_ops::find_bridges` | FireCore C++ | `MolecularGraph.h::findBridges()` |
+| `pgraph_ops::partition_to_index_groups` | FireCore C++ | `Groups::setGroupMapping()` |
+| `spacc::Buckets` | FireCore/SSE C++ | `Buckets.h` |
+| `spacc::fit_group_aabbs` | FireCore C++ | `NBFF::initBBsFromGroups()` |
 
 See `Import_other_Repos.md` for the full cross-repo import map.
 
 ## 9. What's NOT yet implemented
 
 - **OpenCL integration:** `ocl` 0.19 is declared in workspace deps but no crate uses it yet. CPU Rust is authoritative.
-- **RAFF (RigidAtomFF):** `RigidSp3FF` is the precursor; full RAFF (ARAP ports, reactive/dissociative Morse, fixed vs reactive variants) not yet implemented. See `DESIGN_GOALS.md` §2.
+- **RAFF (RigidAtomFF):** `RigidSp3FF` is the precursor; full RAFF not yet implemented. See `DESIGN_GOALS.md` §2.
 - **Projective / Position-Based Dynamics:** not yet implemented. See `DESIGN_GOALS.md` §3.
-- **AABB collision acceleration:** not yet implemented (nonbonded is O(N²)). See `DESIGN_GOALS.md` §2.3.
+- **AABB collision acceleration in NonBondedFF:** `spacc` provides the structures but `NonBondedFF` is still O(N²). See `DESIGN_GOALS.md` §2.3.
 - **Global optimization (GOpt):** not yet implemented.
-- **`.npy` export:** `export.rs` has a TODO.
-- **Cargo profile overrides** (`debug=1`, `strip`, LTO): not yet applied to workspace root. See `Import_other_Repos.md` §4.
-- **xtask automation:** not yet created. See `Import_other_Repos.md` §4.
+- **NPZ format:** `buildff` output and `molengine` input planned to support NPZ (currently JSON only).
+- **`pgraph_ops` P2 modules:** `loops.rs` (cycle/ring detection), `selection.rs` (SDF selection), `picking.rs` (ray picking), `edit.rs` (editing helpers) not yet implemented.
+- **`spacc` P1 modules:** `uniform_grid.rs`, `morton.rs` not yet implemented.
+- **`moltopo` migration to `pgraph`:** `moltopo` still uses its own `Topology`/`Builder` structs; planned to build on `pgraph`/`pgraph_ops` per `notes/designs/topology_builder.md`.
 - **`CODEMAP.md` status:** this file is current as of 2026-08-25.

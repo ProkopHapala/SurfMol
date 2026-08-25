@@ -19,9 +19,9 @@ Reusable library crates — no binary targets, only `lib.rs`. Imported by `crate
 - **`surfmol`** — integration engine: `MolWorld` orchestrator coordinates all forcefields, owns `DynamicAtoms`, runs MD with convergence detection.
 - **`molrender`** — wgpu rendering primitives: sphere impostors (fragment-shader raytracing), line renderer, textured quad surface renderer. No molecular semantics.
 - **`molgui`** — GUI support: trackball camera, PCA-aligned GPU thumbnailer, Kekule hex-grid editor, line gizmos.
-- **`pgraph`** — *(stub)* positioned graph data contract: positions + edges + index containers. Domain-agnostic.
-- **`pgraph_ops`** — *(stub)* reusable graph algorithms: adjacency, components, bridges, loops, picking.
-- **`spacc`** — *(stub)* spatial acceleration: AABB, Buckets, uniform grids, Morton codes.
+- **`pgraph`** — positioned graph data contract: `PGraph` (pos + edges), `PGraphView`, `Elements<N>`, `Ragged`, `Permutation`, `FixedAdj<K>` (ELL-like), `CsrAdj`, `Partition`/`IndexGroups`/`RangeGroups`. Domain-agnostic.
+- **`pgraph_ops`** — reusable graph algorithms: `build_csr_adj`, `build_fixed_adj<K>`, `connected_components`, `find_bridges` (iterative Tarjan), `partition_to_index_groups`, `group_aware_permutation`, geometry helpers.
+- **`spacc`** — spatial acceleration: `Aabb` + `fit_aabb`/`fit_group_aabbs`, `Buckets` (count→prefix→scatter spatial hashing). Uniform grid and Morton codes planned.
 
 ## Dependency graph
 
@@ -29,8 +29,8 @@ Reusable library crates — no binary targets, only `lib.rs`. Imported by `crate
 numcore ← moltopo ← molff ← surfmol
          ↖ molrender ← molgui ↗
          ↖ surfff ↗
-         ↖ pgraph → pgraph_ops ↘
-         ↖ spacc ↗
+         ↖ pgraph ← pgraph_ops
+         ↖ pgraph ← spacc
 ```
 
-See `ARCHITECTURE.md` for the full crate dependency graph and `notes/designs/topology_builder.md` for the planned `pgraph`/`pgraph_ops`/`spacc` refactor.
+See `ARCHITECTURE.md` for the full crate dependency graph and `notes/designs/topology_builder.md` for the `pgraph`/`pgraph_ops`/`spacc` design.

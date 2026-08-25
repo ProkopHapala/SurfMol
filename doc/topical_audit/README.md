@@ -30,6 +30,11 @@ When implementing or debugging a topic (e.g. "UFF bond evaluation", "AABB collis
 - `ewald2d.md` — 2D Ewald summation for periodic surfaces
 - `opencl_device.md` — OpenCL device selection and buffer management
 
+## Populated topics
+
+- **`graph_algorithms.md`** — Positioned graph data contract (`pgraph`) + algorithms (`pgraph_ops`): adjacency (CSR/ELL), components, bridges, reorder. Parity with FireCore `MolecularGraph.h`, `Groups.h`, `CMesh.h`.
+- **`spatial_acceleration.md`** — `spacc` crate: AABB fitting, spatial hashing (Buckets). Parity with FireCore `Buckets.h`, `NBFF::initBBsFromGroups()`.
+
 ## Status
 
-Empty — populate per topic as implementations are ported. Cross-reference `Import_other_Repos.md` for source locations in reference repos.
+Two topics populated (`graph_algorithms`, `spatial_acceleration`). Remaining topics are placeholders — populate per topic as implementations are ported. Cross-reference `Import_other_Repos.md` for source locations in reference repos.
