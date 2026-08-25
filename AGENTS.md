@@ -67,7 +67,7 @@ SurfMol: on-surface molecular manipulation, global optimization, scanning-probe 
 ## Performance
 
 - **Rust is the engine** — all simulation logic in Rust. Flat arrays, cache-aware, preallocate; prefer `&[T]`/`&mut [T]` over `Vec<T>` in hot paths; SoA/data-oriented layouts; be explicit about `f32` vs `f64`.
-- **OpenCL is the accelerator** — only the OpenCL crate uses `unsafe`. **CPU Rust references are authoritative** for correctness; GPU must match CPU within tolerance. Always prefer **NVIDIA GPU**; never report PoCL/CPU timings as GPU timings.
+- **OpenCL is the accelerator** — GPU must match CPU within tolerance. Prefer **NVIDIA GPU**; never report PoCL/CPU timings as GPU timings. GPU is single precision f32 by default (f64 much workse preformance), packed float4 arrays prefered, workgroupsize ~32 prefered.
 - **Minimal orchestration** — push heavy compute into OpenCL kernels; Python only orchestrates, never hot loops.
 - **GPU kernels:** design for memory latency; gather > scatter; minimize branching/atomics/sync; maximize shared/local memory; avoid host-device transfers; **fuse secondary checks into existing kernels** (add clash flags in a loop that already computes distance — never recompute on host). See skill:`port-to-opencl`.
 

@@ -11,12 +11,15 @@ Reference repositories we import algorithms, kernels, and project-organization p
 
 ## 1. FireCore — `/home/prokop/git/FireCore/`
 
-**Role:** Oldest repo for on-surface molecular dynamics and global optimization. Messy/disorganized C++ + Python(pyOpenCL) but contains many jewels. **SurfMol is its successor** — we import only the most useful forcefields and features, with a more organized GUI and OpenCL interface. **FireCore is the performance benchmark**: SurfMol must be at least as fast as this C++ code.
+**Role:** Oldest and still most relevant reference for SurfMol's molecular topology, force-field data layout, fragment/group machinery, spatial broad phase, and performance. FireCore is messy because several generations of design accumulated in one inheritance tree, but it contains the closest tested implementations of what SurfMol needs. **Import the data-layout and algorithmic ideas; do not reproduce the class hierarchy.**
+
+> **Filename note:** current GitHub `master` contains the builder in `cpp/common/molecular/MMFFBuilder.h`. Some local/older branches refer to the same lineage as `MMFFBuilderBase.h`; when porting, verify the exact local file/function and cite that.
 
 ### Top-level layout
 | Dir | Purpose |
 |-----|---------|
-| `cpp/common/` | High-performance C++ core: math, forcefields, data structures |
+| `cpp/common/molecular/` | Molecular topology builders, force fields, groups, graph algorithms |
+| `cpp/common/dataStructures/` | Buckets, hash maps, sparse/index structures |
 | `cpp/common_resources/cl/` | Canonical OpenCL kernels |
 | `cpp/apps_OCL/`, `cpp/apps_CUDA/` | GPU-accelerated apps |
 | `pyBall/OCL/` | Pure pyOpenCL implementations |
@@ -24,32 +27,203 @@ Reference repositories we import algorithms, kernels, and project-organization p
 | `tests/` | Test scripts and validation (START HERE) |
 | `doc/` | Technical docs, derivations |
 
-### Jewels to import (high priority)
+### 1.1. Molecular topology / positioned-graph references — P0
+
+| What | File | What to reuse / reconsider |
+|------|------|----------------------------|
+| **Minimal positioned particles** | `cpp/common/molecular/Atoms.h` | `atypes[] + apos[]`, aligned flat arrays, plus simple geometry (`getAABB`, transforms). Important precedent for the new **`pgraph` = positions + connectivity** boundary. Do **not** inherit force fields from it. |
+| **Dynamic molecular builder** | `cpp/common/molecular/MMFFBuilder.h` (`MM::Atom`, `AtomConf`, `Bond`, `Angle`, `Dihedral`, `Inversion`, `Fragment`, `Builder`) | Main source for topology construction, cap/e-pair geometry, atom typing, bond/angle/torsion generation, fragment insertion and export. Critically simplify it in Rust: **every atom gets a Conf**; no `iconf=-1` branch for caps. |
+| **CSR molecular graph algorithms** | `cpp/common/molecular/MolecularGraph.h` | `makeNeighbors()` builds both atom→neighbor and atom→bond CSR; `fillSubGraph`, `splitByBond`, `findBridges`, `maskCaps`. Port algorithms to **`pgraph_ops`**, not the scratch buffers/class ownership. |
+| **Group/partition mapping** | `cpp/common/molecular/Groups.h` | `a2g` (atom→group) plus `g2a` + `{i0,n}` group ranges. `setGroupMapping()` is another count→prefix→scatter CSR build. Strong reference for a generic `Partition`/`IndexGroups` primitive. |
+| **Group AABB broad phase** | `cpp/common/molecular/NBFF.h::initBBsFromGroups` | Converts `atom2group` into `Buckets`, then maintains one bounding box per group. This is the key reference for **`Partition -> group members -> spacc bounds`**. Keep groups independent of bounds; bounds are derived acceleration caches. |
+| **Fixed-stride force-field topology** | `cpp/common/molecular/UFF.h` | `Quat4i neighs[natoms]` + `Quat4i neighBs[natoms]`, both padded with `-1`, plus flat bond/angle/dihedral/inversion arrays. Excellent CPU/GPU compiled representation. |
+| **Localized fixed-neighbor FF** | `cpp/common/molecular/MMFFsp3_loc.h` | `nneigh_max=4`, `nnode*4` local arrays, per-node `Quat4d` parameters. Strong evidence for a generic **fixed-row adjacency (`FixedAdj<K>`)** representation for bounded-degree kernels. |
+
+### 1.2. FireCore entity model: keep the chemistry, remove the indirection
+
+`MMFFBuilder.h` separates `MM::Atom` from `MM::AtomConf`; `Atom::iconf==-1` means a cap atom has no configuration. This produces many conditional paths (`getAtomConf`, `tryAddConfToAtom`, bond insertion, type assignment, sorting, cap handling). It also forces fragments to carry both `atomRange` and `confRange`.
+
+**SurfMol redesign:** every atom has the configuration fields, including H caps and explicit e-pair dummies. In the dynamic builder the extra bytes are irrelevant compared with the simplification:
+
+- no `iconf` indirection;
+- no separate `confs[]` array or `confRange`;
+- no cap-specific topology path;
+- one neighbor-maintenance path for all atoms;
+- sorting/compaction remaps one atom array rather than atom+conf arrays.
+
+Keep the chemically useful concepts, but distinguish **primary topology** from **derived force-field terms**:
+
+| FireCore entity | SurfMol interpretation |
+|-----------------|------------------------|
+| `Atom + AtomConf` | one dynamic `MolAtom` record / parallel slot-indexed sidecars |
+| `Bond` | primary molecular edge; atom endpoints + order/PBC + optional builder params |
+| `Angle` | derived 3-vertex interaction unless explicitly overridden |
+| `Dihedral` | derived 4-vertex path/interaction unless explicitly overridden |
+| `Inversion` | derived local interaction unless explicitly overridden |
+| `Fragment` | molecular metadata referencing a generic group/partition; AABB is **not** intrinsic fragment state |
+
+### 1.3. Neighbor representations: FireCore already uses both builder and hot forms
+
+There are two distinct useful meanings of "neighbors" in FireCore:
+
+1. **Builder-side `AtomConf.neighs[4]`: bond indices.** This makes bond insertion/removal and lookup of bond metadata natural.
+2. **Compiled UFF/NBFF arrays:** `neighs` stores neighboring **atom indices**, while `neighBs` stores the corresponding **bond indices**. Both are fixed stride (`K=4`) and padded with `-1`.
+
+This distinction should survive in SurfMol. Do not force one representation to serve both editing and kernels.
+
+For the generic libraries use explicit structures:
+
+```rust
+pub struct FixedRows<const K: usize> {
+    pub data: Vec<[i32; K]>,   // valid entries packed first, rest = -1
+}
+
+pub struct FixedAdj<const K: usize> {
+    pub neigh: FixedRows<K>,    // vertex/atom indices
+    pub edge:  FixedRows<K>,    // corresponding edge/bond indices
+}
+
+pub struct CsrAdj {
+    pub offsets: Vec<u32>,      // nvert + 1
+    pub neigh:   Vec<u32>,      // 2*nedges for undirected graph
+    pub edge:    Vec<u32>,      // matching edge ids
+}
+```
+
+**Terminology:** `FixedAdj<K>` is an ELLPACK/ELL-like padded row representation, **not CSR**. It is excellent for GPU kernels when degree is bounded. `CsrAdj` is compact and better for arbitrary/high-degree meshes and general graph algorithms. `pgraph_ops` should build either from the same edge list.
+
+Initial policy:
+- organic molecular kernels: `FixedAdj<4>`;
+- broader chemistry: allow `K=8` if required by a particular model;
+- mesh/truss kernels: choose `K=8/16/32/64` only when the workload benefits; otherwise CSR;
+- if overflow becomes common, add a hybrid fixed-prefix + overflow representation later rather than complicating v1.
+
+### 1.4. `MolecularGraph.h`: algorithms yes, ownership no
+
+`MolecularGraph` is valuable because it is already almost a pure topology algorithm playground: edge list → CSR → flood fill / split / bridges. But it mixes **primary graph data**, **derived adjacency**, and **algorithm scratch** (`visited`, `disc`, `low`, `parent`, fronts, masks) in one object.
+
+Rust split:
+
+```text
+pgraph       primary positions + edge indexes + fundamental index containers
+pgraph_ops   build adjacency, components, bridges, loops, selection, edits
+spacc        AABB / Buckets / hash-grid / Morton / broad-phase caches
+moltopo      chemistry-specific builder + atom/bond/valence/type semantics
+```
+
+Port `findBridges` as an algorithm with caller-owned/reusable workspace; do not copy the recursive/static-state implementation literally.
+
+### 1.5. Groups, fragments and spatial acceleration
+
+FireCore contains two nearly identical mappings:
+
+- `Groups.h`: `a2g` plus packed `g2a` ranges;
+- `NBFF::initBBsFromGroups`: `atom2group` passed through `Buckets` to obtain group members, then one AABB per group.
+
+This suggests a reusable generic primitive rather than a molecule-specific fragment container:
+
+```rust
+pub struct Partition {
+    pub item_group: Vec<i32>,   // one group per item, -1 = none
+}
+
+pub struct IndexGroups {
+    pub offsets: Vec<u32>,      // group -> packed item range
+    pub items:   Vec<u32>,
+}
+
+pub struct RangeGroups {
+    pub ranges: Vec<[u32; 2]>,  // [i0,n], after reordering groups contiguously
+}
+```
+
+- `Partition` is convenient while editing / assigning fragments.
+- `IndexGroups` is the reverse CSR view built by count→prefix→scatter.
+- `RangeGroups` is the fastest baked form when fragments have been reordered contiguously.
+- `spacc` takes positions + any packed group view and computes `Aabb[]`, bounding spheres, group overlap tables, etc. These are **derived caches**, not members of `PGraph` or `Fragment`.
+
+A molecular `Fragment` then stores semantic metadata (molecule type, rigid pose, color, maybe reference geometry) and a group id/range. A collision broad-phase may use the same grouping or a different computational grouping without changing molecular semantics.
+
+### 1.6. Force-field class hierarchy — performance reference, architectural anti-pattern
+
+FireCore hierarchy:
+
+```text
+Atoms
+  └── ForceField
+        └── NBFF
+              ├── UFF
+              └── MMFFsp3_loc
+```
+
+This makes the force field *be* particle state: positions, velocities, forces, integrator state, non-bonded parameters, topology and spatial caches accumulate through inheritance. SurfMol should preserve the flat hot arrays and kernels but reject the ownership hierarchy.
+
+**Target:** composition and explicit data flow. `MolWorld` in `surfmol` orchestrates state + force fields; each force-field implementation owns only what its kernel needs.
+
+### 1.7. Other FireCore jewels
+
 | What | File | Notes |
 |------|------|-------|
-| **UFF force field** | `cpp/common/molecular/UFF.h`, `UFFbuilder.h`, `common_resources/cl/UFF.cl` | SoA layout, 64-byte aligned, OpenMP parallel. Core MM foundation. |
-| **NBFF non-bonded** | `cpp/common/molecular/NBFF.h`, `common_resources/cl/Forces.cl` | LJ + Morse + Coulomb + H-bond with damping; AABB short-range; PBC. |
-| **GridFF B-spline grid** | `cpp/common/molecular/GridFF.h`, `cl/GridFF.cl` | Tricubic B-spline interpolation; substrate surface potential. |
-| **Buckets spatial partition** | `cpp/common/dataStructures/Buckets.h` (+ `Buckets2D/3D.h`, `HashMap2D.h`) | Spatial hashing, bi-directional object↔bucket. Core for neighbor search / collision. |
-| **Projective Dynamics** | `cpp/common/math/ProjectiveDynamics_d.h` (+ `.cpp`, `_frag.cpp`) | Position-based dynamics for stiff springs; implicit, stable. |
-| **MolWorld_sp3 MD loop** | `cpp/common/molecular/MolWorld_sp3.h` (`MDloop()` ~L2124-2169) | Reference MD/relaxation loop with `getCPUticks()` timing — **perf benchmark target**. |
-| **Ewald2D surface electrostatics** | `common_resources/cl/Surface.cl` | 2D Ewald summation for periodic surfaces. |
-| **RigidBodyFF quaternion dynamics** | `cpp/common/molecular/RigidBodyFF.h` | Quaternion rigid body integration, torque eval. |
-| **RRsp3 rigid PBD + ARAP ports** | `pyBall/RigidAtomFF/RRsp3/` (`RRsp3.cl` 1311 lines, `RRsp3.py` 624) | Cluster-sorted PBD with ARAP ports, multiple rotation solvers. **Directly relevant to RAFF design** (see `notes/ToDo_user.md`). |
+| **UFF force field** | `cpp/common/molecular/UFF.h`, `common_resources/cl/UFF.cl` | Performance/data-layout reference; flat aligned arrays, fixed neighbors, explicit interaction lists. |
+| **NBFF non-bonded** | `cpp/common/molecular/NBFF.h`, `common_resources/cl/Forces.cl` | LJ + Morse + Coulomb + H-bond; PBC; group AABB broad phase. |
+| **GridFF B-spline grid** | `cpp/common/molecular/GridFF.h`, `cl/GridFF.cl` | Tricubic B-spline substrate potential. |
+| **Projective Dynamics** | `cpp/common/math/ProjectiveDynamics_d.h` (+ `.cpp`, `_frag.cpp`) | Position-based dynamics for stiff springs. |
+| **MolWorld_sp3 MD loop** | `cpp/common/molecular/MolWorld_sp3.h` | Reference MD/relaxation loop and performance benchmark. |
+| **Ewald2D** | `common_resources/cl/Surface.cl` | 2D periodic surface electrostatics. |
+| **RigidBodyFF** | `cpp/common/molecular/RigidBodyFF.h` | Quaternion rigid-body integration, torque evaluation. |
+| **RRsp3 / ARAP ports** | `pyBall/RigidAtomFF/RRsp3/` | Cluster-sorted PBD, multiple rotation solvers. |
+| **GOpt / optimizers** | `cpp/common/molecular/GOpt.h`, `GlobalOptimizer.h`, `DynamicOpt.h`, `CG.h`, `lineSearch.h` | Basin hopping + local optimization. |
+| **RARFF** | `cpp/common/molecular/RARFF_SR.h`, `FlexibleAtomReactiveFF.h` | Reactive/dissociative reference. |
 
-### Jewels (medium priority)
-| What | File |
-|------|------|
-| MMFFsp3_loc force field | `cpp/common/molecular/MMFFsp3_loc.h` |
-| GOpt global optimization (basin-hopping) | `cpp/common/molecular/GOpt.h`, `GlobalOptimizer.h` |
-| `relax_multi.cl` unified multi-system kernel | `common_resources/cl/relax_multi.cl` |
-| RARFF reactive force field (Morse, bond making/breaking) | `cpp/common/molecular/RARFF_SR.h`, `FlexibleAtomReactiveFF.h` |
-| DynamicOpt / CG / lineSearch optimizers | `cpp/common/math/DynamicOpt.h`, `CG.h`, `lineSearch.h` |
+### 1.8. Perf/parity harness
+- `getCPUticks()` cycle counter (used in `MolWorld_sp3.h`, `MolGUI.h`) with `tick2second` calibration.
+- `tests/tMMFF/`, `tests/tSiNCs/`, `tests/tEFF/` for parity and timing.
+- Fixed-neighbor export should be parity-tested against FireCore `UFF::neighs/neighBs` and builder neighbor output.
+- Target: match or beat FireCore hot loops; **do not benchmark builder/editor operations as if they were force-field kernels**.
 
-### Perf benchmark harness
-- `getCPUticks()` cycle counter (used in `MolWorld_sp3.h:2130`, `MolGUI.h:1197`) with `tick2second` calibration.
-- `tests/tMMFF/`, `tests/tSiNCs/` (timing reports in `OUT_nc_ensemble_v2/out/timing_report.md`), `tests/tEFF/` (CPU vs GPU parity).
-- Target: match or beat `MolWorld_sp3::MDloop()` (~1–10 μs/iter for small systems).
+### 1.9. Porting notes — specific algorithms, constants, and line citations
+
+Concrete implementation details verified by reading the source. Per `AGENTS.md` Rule 6, cite these when porting. Line numbers are from `MMFFBuilderBase.h` (local file); verify against `MMFFBuilder.h` on `master` as noted in the filename note above.
+
+**Key algorithms with line citations** (all in `cpp/common/molecular/MMFFBuilderBase.h` unless noted):
+
+| Algorithm | Line | What it does | Port note |
+|-----------|------|--------------|-----------|
+| `autoBonds(R)` | L680 | Distance-based bond finding: two atoms bonded if `\|d\| < (Ri+Rj)*Rfac`. `Rfac = -R` (negative R = use params radii). Skips cap-cap bonds via `capping_types`. | Port to `moltopo`. Use covalent radii from `Params`. |
+| `autoBondsPBC(R, npbc)` | L721 | PBC variant: loops over lattice images `(ix,iy,iz)`, stamps `bond.ipbc = Vec3i8{ix,iy,iz}`. | Port to `moltopo`. `ipbc` is essential for PBC systems. |
+| `makeConfGeom(nb, npi, hs)` | L932 | **The cap geometry engine.** Generates 4 neighbor directions for an atom given existing sigma bonds + hybridization. Hardcoded constants (see below). | Port to `moltopo`. Constants must be exact for parity. |
+| `makeSPConf(ia, npi, ne)` | L859 | Assign hybridization (sp3/sp2/sp) + calls `makeConfGeom` + `addCaps`. | Port to `moltopo`. |
+| `addCaps(ia, ncap, ne, nb, hs)` | L792 | Insert capping H / epair dummies at computed directions. Uses `Hmask[]` to decide H vs epair placement. | Port to `moltopo`. |
+| `addCap(ia, hdir, capAtom, l)` | L882 | Insert one capping atom at `atoms[ia].pos + hdir*l`. | Port to `moltopo`. |
+| `addEpair(ia, hdir, l)` | L903 | Insert lone-pair dummy. Type from `params->atypes[host].ePairType`. | Port to `moltopo`. |
+| `makeNeighs(&neighs, perAtom)` | L1064 | Export bond topology to flat `neighs[natoms*perAtom]` (atom indices). **Special-case:** `if(jc==-1){ neighs[ja*perAtom]=ia; }` — cap inherits neighbor from host. | Port to `moltopo`/`pgraph_ops`. **This special-case is eliminated** when every atom gets a Conf. |
+| `findBridges()` | `MolecularGraph.h:175` | Tarjan's bridge-finding (DFS with `disc[]`/`low[]`/`parent[]`). Identifies bonds whose removal disconnects the graph. | Port to `pgraph_ops`. Use iterative DFS + caller-owned workspace, not recursive/static-state. |
+| `fillSubGraph(ia, color)` | `MolecularGraph.h:106` | BFS flood-fill from atom `ia`, coloring reachable atoms. Uses front-buffer swapping (`if0/if1/if2`). | Port to `pgraph_ops`. |
+| `splitByBond(ib, color)` | `MolecularGraph.h:118` | Color one side of bond `ib`. | Port to `pgraph_ops`. |
+| `makeNeighbors()` | `MolecularGraph.h:49` | Two-pass CSR: count neighbors per atom, then scatter `atom2bond[]` + `atom2neigh[]`. | Port to `pgraph_ops::build_csr_adj`. |
+
+**`NeighType` sentinels** (`MMFFBuilderBase.h:78-82`):
+```cpp
+enum class NeighType: int { pi = -2, epair = -3, H = -4 };
+```
+FireCore packs non-bond neighbors (pi orbitals, lone pairs, capping H) into the same `neighs[4]` array using negative sentinels. Positive values = bond indices. When merging Conf into every atom, decide whether to keep this packing (compact, 4 bytes/neighbor) or use a separate `neigh_kinds: [u8; 4]` array (clearer, +4 bytes/atom).
+
+**`makeConfGeom` geometry constants** (`MMFFBuilderBase.h:932-998`) — must be ported exactly for cap placement parity:
+- **sp3 (npi=0):** tetrahedral directions. `sqrt(2/3)=0.81649658092`, `sqrt(1/3)=0.57735026919`, `1/3=0.33333333333`. For `nb=2`: `hs = c*cc ± b*cb`. For `nb=1`: three caps at `c*cc + b*cb*2`, `c*cc - b*cb ± a*ca`.
+- **sp2 (npi=1):** trigonal planar. `sqrt(3)/2=0.86602540378`, `-0.5`. For `nb=1`: two caps at `c*cc ± a*ca`, one pi at `b`.
+- **sp (npi=2):** linear. For `nb=1`: cap at `c*-1`, pi at `b` and `a`.
+- For `nb=3` (sp3): cap direction = cross product of bond-edge vectors, normalized, flipped to oppose the sum of existing bonds.
+
+**`Bond.ipbc`** (`MMFFBuilderBase.h:213`): `Vec3i8` (3× `int8_t`) — periodic image index. `(0,0,0)` = no PBC shift. Set by `autoBondsPBC`. Essential for PBC bond evaluation — the forcefield must know which periodic image a bond crosses.
+
+**`Atom.bTypeFixed`** (`MMFFBuilderBase.h:64`): if true, the atom type was explicitly set (e.g., from file) and must not be overridden by topology-based auto-assignment. Port this flag to prevent silent type overwrites.
+
+**`Atom::HcapREQ` / `Atom::defaultREQ`** (`MMFFBuilderBase.h:58-59`):
+```cpp
+constexpr static Quat4d HcapREQ    = { 1.4870, 0.026095977, 0., 0. }; // sqrt(0.000681)
+constexpr static Quat4d defaultREQ = { 1.7,    0.061067605, 0., 0. }; // sqrt(0.0037292524)
+```
+Default non-covalent parameters for capping H and generic atoms. Port to `moltopo::Params` defaults.
 
 ---
 
@@ -199,29 +373,165 @@ SurfMol `editor` already uses **wgpu + winit + egui** (14 MiB stripped release, 
 
 ---
 
+## 5. SimpleSimulationEngine — `/home/prokop/git/SimpleSimulationEngine/`
+
+**Role:** General simulation/geometry reference. FireCore is the primary source for molecular topology and hot force-field layouts; SimpleSimulationEngine is complementary: it contains the **mesh/editor/topological algorithms and generic geometry utilities** that motivate extracting a reusable positioned-graph layer.
+
+### 5.1. Revised architectural lesson: `pgraph`, `pgraph_ops`, `spacc`
+
+The important common denominator of a molecule, polygon mesh, truss, circuit-like structure or particle network is **not a pure abstract graph**. It is a **positioned graph**:
+
+```text
+positions[i]             geometry
+edges[e] = (i,j)         1-skeleton / connectivity
+sidecar attributes       arbitrary domain meaning
+```
+
+This motivates the name **`pgraph`** (positioned/physical graph) more clearly than `mgraph`. `mgraph` is ambiguous (molecule / mesh / material graph) and previously mixed the data contract with the editor implementation.
+
+Keep two levels separate:
+
+- **`pgraph`** — tiny fundamental containers and borrowed views. Intended to be cheap enough that renderer, GUI, molecular topology, mesh/truss code can all depend on it.
+- **`pgraph_ops`** — transferable algorithms that operate on those containers: adjacency builds, compaction/remapping, loops, geometry, picking, SDF selection, connected components, etc.
+- **`spacc`** — spatial acceleration: AABB, Buckets/CSR binning, hash grids, Morton ordering, broad phase. It should not be embedded in `PGraph`; these structures are derived caches with different invalidation/lifetimes.
+
+### 5.2. Fundamental `pgraph` containers
+
+Suggested minimal set (names provisional):
+
+```rust
+pub struct PGraph {
+    pub pos:   Vec<Vec3d>,
+    pub edges: Vec<[u32; 2]>,
+}
+
+pub struct Elements<const N: usize> {
+    pub verts: Vec<[u32; N]>,
+}
+
+pub struct Ragged {
+    pub offsets: Vec<u32>,
+    pub items:   Vec<u32>,
+}
+
+pub struct FixedRows<const K: usize> {
+    pub data: Vec<[i32; K]>,
+}
+
+pub struct CsrAdj {
+    pub offsets: Vec<u32>,
+    pub neigh:   Vec<u32>,
+    pub edge:    Vec<u32>,
+}
+```
+
+`PGraph` does **not** own atom types, mesh materials, force-field parameters, selections, bounding boxes or algorithm scratch. Those are sidecars indexed by vertex/edge/element id.
+
+### 5.3. Higher-order elements: share storage, not semantics
+
+Do **not** hard-code `triangles == angles` or `polygons == rings` into `PGraph`.
+
+- A mesh triangle is an explicitly declared 2-cell/face.
+- A molecular angle is normally a derived length-2 path through the bond graph.
+- A polygon is an explicit face boundary.
+- A molecular ring is a discovered cycle; a graph may contain many cycles and there is no unique set of "faces" without additional embedding/chemical rules.
+
+They can nevertheless reuse the same containers:
+
+```text
+Elements<3>   triangle indices / molecular angle triples
+Elements<4>   tetrahedra / dihedral atom quadruples
+Ragged        polygon loops / rings / arbitrary groups
+```
+
+`pgraph_ops` should provide operations on generic tuples/loops, while `moltopo` or a mesh module decides what those tuples *mean* and how they are generated.
+
+### 5.4. Relevant SSE data structures
+
+| File | Reuse | Target | Priority |
+|------|-------|--------|----------|
+| **`Buckets.h`** | count→prefix→scatter CSR primitive | `spacc` (and generic CSR builder helpers) | P0 |
+| **`MeshBuilder2.h`** | flat index topology, soft-remove/compact, edge lookup, loop ordering, extrusion/bridge patterns | `pgraph_ops::edit/topology` | P0 |
+| **`CMesh.h`** | tiny non-owning positions/edges/faces view | inspiration for `PGraphView` / slice APIs | P1 |
+| **`NeighChunks.h`** | fixed local storage + overflow concept | reference for future dynamic/high-degree adjacency; **not default molecular hot layout** | P1 |
+| **`Slots.h`** | small bounded inline association | concept for builder atom bond slots | P1 |
+| **`SDfuncs.h`** | inlinable SDF predicates | `pgraph_ops::selection` / `numcore::geom` | P1 |
+| **`Selection.h`** | ordered selection + fast membership idea | `pgraph_ops::selection` | P1 |
+| **`HashMap.h`** | specialized integer/spatial hashing idea | `spacc` | P1 |
+| **`geom3D.h`, `raytrace.h`** | distances, ray-sphere/capsule/AABB/triangle | `numcore::geom` + `pgraph_ops::picking` | P1/P2 |
+| **`Table.h`, `BatchBuff.h`** | debug table / sparse batched storage concepts | later, only if demanded | P2 |
+
+**Port policy:** several SSE implementations contain edge-case hazards; port the *idea* and tests, not a mechanical translation.
+
+### 5.5. `MeshBuilder2` patterns worth sharing
+
+- positions and connectivity stay as flat index-based arrays;
+- soft removal keeps indices stable during editing;
+- compaction uses an old→new permutation and remaps every sidecar;
+- edge deduplication uses endpoint-pair lookup;
+- edge-loop ordering generalizes directly to cycle/ring ordering;
+- selection/picking depend fundamentally on geometry, which is why `PGraph` must contain positions;
+- variable-length polygons/groups use flat packed index storage instead of one heap allocation per object.
+
+The C++ `VertT` union itself is **not** a requirement. Rust should keep the common data contract explicit and use sidecars/views rather than overlaying unrelated metadata in the same bytes.
+
+### 5.6. Fixed adjacency vs CSR vs dynamic overflow
+
+Three representations serve different workloads:
+
+1. **`FixedAdj<K>` (ELL-like):** constant stride `K`, packed valid entries, `-1` padding. Best for bounded molecular valence and simple GPU indexing. FireCore UFF/MMFFsp3 is the stronger reference here than SSE.
+2. **`CsrAdj`:** compact arbitrary degree. Best for general graph algorithms and irregular meshes.
+3. **Dynamic overflow (`NeighChunks`-like):** useful when topology changes frequently and degree is unbounded. Keep as an optional editor structure; do not make every `PGraph` pay for it.
+
+`pgraph_ops::build_fixed_adj::<K>(edges)` and `build_csr_adj(edges)` should be sibling conversions with strict overflow validation.
+
+### 5.7. Geometry, selection, groups and spatial caches
+
+Generic algorithms should mostly accept slices/views rather than require a large smart object:
+
+```rust
+edge_vectors(pos, edges, out)
+build_csr(nvert, edges)
+build_fixed_adj::<4>(nvert, edges)
+select_sdf(pos, sdf, out)
+pick_edges(pos, edges, ray, radius)
+fit_group_aabbs(pos, group_offsets, group_items, out)
+```
+
+Group membership is generic indexing/topology data; AABBs/Buckets/hash grids are `spacc` caches. This keeps the primary representation transferable to rendering/editing while spatial acceleration can be rebuilt independently after geometry changes.
+
+---
+
 ## Cross-repo import priority summary
 
 | Priority | Source | What | Target in SurfMol |
 |----------|--------|------|-------------------|
-| P0 | blood_of_civilization | Cargo profile overrides (`debug=1`, `strip`, LTO) | workspace `Cargo.toml` |
-| P0 | blood_of_civilization | Shared `target-dir` in `~/.cargo/config.toml` | global cargo config |
-| P0 | blood_of_civilization | `.codeiumignore` / IDE indexing guard | repo root |
-| P0 | learn_Rust | OpenCL-GL zero-copy interop (`demo06`) | `surfmol-apps` GUI rendering |
-| P0 | learn_Rust | AlignedVec + Vec3d/Quat4d | `surfmol-common` |
-| P0 | FireCore | UFF + NBFF + Buckets | `surfmol-forcefields` + `surfmol-common` |
-| P0 | FireCore | `MolWorld_sp3::MDloop()` | **perf benchmark target** |
-| P0 | SPAMMM | `OpenCLBase` NVIDIA-first device selection | Rust OpenCL crate |
-| P1 | FireCore | RRsp3 rigid PBD + ARAP ports | `surfmol-forcefields` (RAFF, see `notes/ToDo_user.md`) |
-| P1 | FireCore | Projective Dynamics | `surfmol-forcefields` |
-| P1 | SPAMMM | `rigid.cl` 6-DOF rigid body | `surfmol-forcefields` |
-| P1 | SPAMMM | `nonbonded.cl` `getNonBond_ex2` | `opencl/` kernels |
-| P1 | learn_Rust | Group AABB broad phase + uniform grid scan | `opencl/` collision kernels |
-| P1 | SPAMMM | AtomicGraph topology SSOT | `surfmol-topology` |
-| P2 | FireCore | GridFF, Ewald2D, RARFF, GOpt | `surfmol-forcefields` (later) |
-| P2 | SPAMMM | LFF projective Jacobi, contact_surface, gridFF | `opencl/` (later) |
-| P2 | blood_of_civilization | xtask automation, unsafe-isolation crate pattern | workspace tooling |
+| P0 | FireCore | `Atoms.h` positioned particle arrays + geometry | `pgraph` design reference |
+| P0 | FireCore | `MMFFBuilder.h` Atom/Conf/Bond builder algorithms | `moltopo` builder (every atom gets Conf) |
+| P0 | FireCore | `UFF.h` / `MMFFsp3_loc.h` fixed `K=4` adjacency layouts | `pgraph::FixedAdj<K>` + compiled `molff` layouts |
+| P0 | FireCore | `MolecularGraph.h` CSR + components/bridges | `pgraph_ops` |
+| P0 | FireCore | `Groups.h` + `NBFF::initBBsFromGroups` | `Partition/IndexGroups` + `spacc` bounds |
+| P0 | FireCore | UFF + NBFF kernels / `MolWorld_sp3::MDloop()` | `molff` / performance benchmark |
+| P0 | SimpleSimulationEngine | `Buckets` count→prefix→scatter | `spacc` / generic packed-index helpers |
+| P0 | SimpleSimulationEngine | `MeshBuilder2` edit/compact/loop algorithms | `pgraph_ops` |
+| P0 | blood_of_civilization | Cargo footprint/profile settings | workspace tooling |
+| P0 | learn_Rust | OpenCL-GL zero-copy interop + aligned Rust math | GPU/runtime layers |
+| P0 | SPAMMM | NVIDIA-first OpenCL device setup | Rust OpenCL layer |
+| P1 | SimpleSimulationEngine | SDF selection, picking, geometry | `pgraph_ops` + `numcore::geom` |
+| P1 | SimpleSimulationEngine | `NeighChunks` overflow idea | optional dynamic adjacency, later |
+| P1 | learn_Rust | group AABB broad phase / uniform grid / Morton | `spacc` + OpenCL kernels |
+| P1 | FireCore | RRsp3 / Projective Dynamics / rigid-body code | `molff` / RAFF |
+| P1 | SPAMMM | `rigid.cl`, nonbonded, AtomicGraph lessons | relevant runtime/topology layers |
+| P2 | FireCore | GridFF, Ewald2D, RARFF, GOpt | later force-field features |
+| P2 | SSE | `Table`, `BatchBuff` | only if concrete need appears |
 
-## Resolved design decisions
-1. **OpenCL crate:** **`ocl` 0.19** (from learn_Rust). Higher-level ProQue/Buffer API; the OpenCL-GL interop demo already works with it. Adopt the unsafe-isolation-in-a-single-feature-gated-crate pattern from blood_of_civilization regardless of crate choice.
-2. **Fragment memory layout:** **contiguous fragments** — each fragment's atoms (node + capping) contiguous in memory for best cache/workgroup locality. Trade-off: harder to update topology, accepted.
-3. **Capping atoms (H, epairs):** **rigid appendix fixed to a host-atom port** (no independent DOF). Simpler, fewer DOF, faster. Revisit if H-relaxation fidelity becomes an issue.
+## Resolved / current design decisions
+1. **OpenCL crate:** **`ocl` 0.19** (from learn_Rust). Higher-level ProQue/Buffer API; keep unsafe isolated in the OpenCL boundary.
+2. **Common geometry/topology core:** use a tiny **`pgraph`** concept (positions + edges + fundamental index containers), not a pure abstract graph and not a molecule-specific editor object.
+3. **Transferable algorithms:** keep in **`pgraph_ops`** so consumers that only need the data contract do not pull editing/selection/topology machinery.
+4. **Spatial acceleration:** **`spacc`** is separate (`Aabb`, Buckets, grids, Morton, broad phase). Spatial structures are rebuildable caches, not intrinsic `PGraph` fields.
+5. **Higher-order elements:** triangles/angles and polygons/rings may reuse `Elements<N>`/`Ragged` storage, but are **not semantically identified** in the core.
+6. **Neighbor hot layout:** bounded kernels use `FixedAdj<K>` (ELL-like padded rows, `-1` invalid); arbitrary-degree algorithms can use `CsrAdj`.
+7. **Dynamic molecular Conf:** every atom, including caps, gets the Conf/valence fields; eliminate FireCore's optional `iconf` indirection.
+8. **Fragment memory layout:** bake/reorder to **contiguous fragments** when performance benefits; retain generic group/partition representation while editing.
+9. **Capping atoms (H, epairs):** the topology builder may represent explicit caps uniformly; whether they carry independent dynamics or are rigid appendices is a force-field/integrator choice, not a `pgraph` rule.
