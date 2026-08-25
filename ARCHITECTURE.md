@@ -53,6 +53,48 @@ SurfMol/
 └── libs/                # (Future) Python bindings and FFI wrappers
 ```
 
+## Folder Roles & Metadata (OKF)
+
+Every folder **MUST** have a `README.md` in [OKF format](https://okf.md/) — YAML frontmatter (required `type`, recommended `title`/`description`/`tags`/`timestamp`) + markdown body. The README is the folder's self-description for both humans and agents. Update it when the folder's role or contents change.
+
+### Folder roles (binding)
+| Folder | Role | Permanence |
+|--------|------|------------|
+| `userguide/` | End-user docs for **finished, polished** modules: how to run the program, features, GUI controls (mouse/keys), CLI options, usage examples, didactic theory accessible to a student. | Permanent |
+| `doc/` | Permanent polished info **for developers** that helps navigation and understanding of the code. | Permanent |
+| `doc/topical_audit/` | Cross-implementation maps per scientific topic (where each algorithm/feature lives across files/crates/repos). | Permanent |
+| `notes/` | **Temporary** work-in-progress info about what we are doing right now. Not polished. | Ephemeral |
+| `notes/chats/` | Chat logs / transcripts relevant to current work. | Ephemeral |
+| `notes/designs/` | Work-in-progress design sketches and proposals. | Ephemeral |
+| `notes/labbooks/` | Per-task debugging labbooks (updated continuously — see `AGENTS.md` §Testing & Validation). | Ephemeral |
+| `notes/reports/` | Per-task debug/investigation reports. | Ephemeral |
+| `notes/tasks/` | Active task definitions and checklists. | Ephemeral |
+| `notes/ToDo_user.md` | User-facing TODO list and design decisions. | Ephemeral |
+| `notes/ToDo_agents.md` | Agent-facing TODO list. | Ephemeral |
+| `data/` | Molecular input files (`.xyz`, `.mol`, `.mol2`), FF parameter files (`.dat`). Read-only inputs. | Permanent |
+| `opencl/` | OpenCL `.cl` kernel sources for GPU acceleration. | Permanent |
+| `rust/` | Primary Rust workspace root. | Permanent |
+| `rust/common/` | `surfmol-common`: core math, data structures, `DynamicAtoms`, `AlignedVec`. | Permanent |
+| `rust/topology/` | `surfmol-topology`: molecular graph SSOT (bonds, angles, atom types). | Permanent |
+| `rust/forcefields/` | `surfmol-forcefields`: forcefield energy/force eval, MD, relaxation, `MolWorld`. See `rust/forcefields/DESIGN.md`. | Permanent |
+| `rust/molrender/` | `surfmol-molrender`: wgpu rendering primitives (meshes, gizmos, surfaces). | Permanent |
+| `rust/apps/` | `surfmol-apps`: GUI applications (`editor`, `mol_browser`) + shared GUI utils. No simulation logic. | Permanent |
+| `debug/` | Diagnostic plots (`.png`/`.svg`) and visual artifacts. **Gitignored** except `debug/README.md`. Cleaned regularly. | Ephemeral |
+
+### OKF frontmatter conventions for this repo
+- `type`: use one of `repository`, `userguide`, `developer-docs`, `topical-audit`, `work-notes`, `data`, `opencl-kernels`, `rust-workspace`, `rust-crate`.
+- `title`: human-readable folder name.
+- `description`: one sentence on the folder's role.
+- `tags`: lowercase, e.g. `[forcefield, gpu, rust]`.
+- `timestamp`: ISO 8601 of last significant update.
+
+
+## Relation To other repos
+
+See `Import_other_Repos.md` for the full list of reference repos (FireCore, SPAMMM, learn_Rust, blood_of_civilization) and what to import from each.
+
+- **FireCore is the perf benchmark** — SurfMol (Rust+OpenCL) must be ≥ as fast as FireCore C++ for any ported algorithm. Measure, don't assume.
+
 ## Component Details
 
 ### 1. `surfmol-common` (rust/common)
@@ -111,3 +153,4 @@ Will provide wrappers and Python bindings mapping Python calls to the underlying
 
 ## Crate Naming Strategy
 To integrate cleanly with the global Rust ecosystem (crates.io) and enable code sharing across repositories, crates should drop generic `mol_*` prefixes and use globally recognizable names (e.g., `surfmol-common`, `surfmol-topology`, `surfmol-forcefields`).
+

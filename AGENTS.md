@@ -1,62 +1,90 @@
+# SurfMol — Agent Rules of Conduct
 
-## Core Philosophy: Scientific & Performance Focus
+SurfMol: on-surface molecular manipulation, global optimization, scanning-probe microscopy. Numerical correctness, physical consistency, debuggability, and performance are paramount.
 
-We develop rigorous scientific software where debuggability, numerical correctness, and physical consistency are paramount. Follow these principles:
+**Languages:** Rust (simulation, GUI, orchestration) + OpenCL (GPU). Python is a minor glue layer only — never a hot path. C++ (FireCore) is legacy reference for parity/perf comparison.
 
-1. **Debuggability:** Code must be transparent, inspectable, and prioritize trace-ability over user experience (never hide issues).
-2. **Simplicity:** Clear, clean, direct logic. Elegant design that avoids branching, excessive special conditions, and defensive abstractions.
-3. **Performance:** Streamlined execution with minimal overhead (avoid Python loops), data-oriented memory layouts, and cache awareness.
+## Core Principles
 
-## Rule 1 — Fail Loudly
+- **KISS** — simplest solution that works; one-liner > ten-liner.
+- **AHA** — avoid hasty abstractions and boilerplate.
+- **YAGNI** — surgical edits; touch only what's needed; no unrelated cleanup; comment out, don't delete; ask if ambiguous.
+- **DRY** — inventory existing code before writing new; generalize rather than duplicate.
+- **SoC** — separate compute from presentation. Domain crates (`surfmol-common`, `surfmol-topology`, `surfmol-forcefields`) have no GUI dependency; `surfmol-apps` is the only GUI crate; no plotting/rendering in core libs.
+- **SSOT** — one authoritative source of truth. Topology SSOT lives in `surfmol-topology` (`AtomicGraph`); all other representations derive from it. `MolWorld` does not own positions/forces — those live in `DynamicAtoms` (`surfmol-common`); each forcefield owns only its params. See `rust/forcefields/DESIGN.md`.
+- **TDD** — define verification before coding; parity vs reference/analytical/physical invariants; run tests after every change.
+- **Fail Fast, Fix the Physics** — **silent fallbacks are strictly prohibited.** Anything unexpected (NaN, Inf, out-of-range value, missing file, shape mismatch, failed convergence, violated invariant) must **fail loud and early** with a full stack trace — panics > silent `Ok`. Never mask a bug by clamping divergent values, returning a default, retuning until `Ok`, or broad error-swallowing. **Rust:** no `.unwrap_or(default)`/`.ok()` that drops an `Err` you didn't diagnose; no `let _ = result;`; propagate with `?` or `panic!`/`assert!`/`expect("context")` instead. **Python:** no bare `except:` or `except Exception:` that passes/logs-and-continues; catch only the specific error you handle, else let it raise. If a solver fails, **fix the solver, not the scenario**. Everything emerges from fundamental interactions, not scripts.
+- Compact code, unlimited line length; short names for math/physics symbols (`E_tot`, `T_ij`, `m_i`, `F_ij`).
 
-- **No silent fallbacks**, catch-all passes, or try-except blocks that mask bugs. Unexpected states must terminate with explicit errors and full stack traces. See `general-debug-guidelines.md`.
-- **Root Cause Identification:** Find and fix the fundamental issue. Never apply "quick-fixes" that hide the root cause.
+## ⚑ Tests Are Diagnostics, Not the Goal (most-violated rule)
 
-## Rule 2 — Surgical Edits & Simplicity
+**Passing tests is NOT the endgoal.** A green test suite says nothing about physical correctness. Tests are a tool to **locate where the program is wrong**, in order to **understand and fix the physics**. The goal is root cause, not green-at-any-cost.
 
-- **Minimum Intervention:** Write only the code necessary to solve the task. Touch only what is required; never perform unrelated formatting, cleanup, or aesthetic edits on adjacent code.
-- **No Guessing:** If requirements, behavior, or architecture are ambiguous, stop and ask for clarification.
-- **Strict Checkpointing:** After every significant step, summarize what changed, what was verified, and what remains unresolved.
-- **Preservation & Backups:** Create a backup copy before major module changes. Comment out old, experimental, or deprecated code using `#` or `//` instead of deleting it to allow instant reversion. Mark unfinished code clearly with `# TODO` or `# DEBUG`.
+- **Do NOT make tests green at all cost.** A red test is a diagnostic: it tells you *where the physics is wrong*. Keep it red if necessary to document broken physics — a known problem is better than a masked one.
+- **Never cheat a test green** by violating physics, suppressing errors, loosening tolerances, or picking cautious parameters.
+- When a test fails, the response is to **investigate the physics**, not to silence the test. If the test itself is wrong, fix the test — but say so explicitly and justify it.
 
-## Rule 3 — Reusable Architecture
+## Never Do This
 
-- **Inventory First:** Thoroughly review reference source-code files to identify existing functions, modules, and data structures before writing anything from scratch. Use `CODEMAP.md` and `/doc/topical_audit/topical_audit.md` for guidance.
-- **Composability Over Bloat:** Build integrated systems, not isolated scripts. Refactor into reusable functions in shared modules.
-- **Separation of Concerns:**
-   - Separate compute algorithms from plotting/diagnostics (no plotting in core libraries).
-   - Separate GUI, CLI test scripts, and backend modules. Test scripts are thin wrappers that call functions from shared backend modules.
-   - Consolidate related test scripts into one with CLI routing parameters for different execution paths.
-- **Generalization Over Duplication:** Try to generalize an existing function if it almost fits your needs. If generalization requires risky major changes that threaten backward compatibility, **stop and report it immediately for approval.**
+- **NEVER use `rm`, `sed -i`, `cat >`, `echo >>`, heredocs, or shell redirects to delete/modify files.** Use the Devin `edit`/`write`/`read` tools so changes appear in the diff viewer. If an edit tool fails, do smaller targeted edits — never fall back to shell.
+- Never delete/rearrange existing code, or make unrelated aesthetic edits, without explicit permission.
+- Never apply quick-fixes that hide root causes (hard-coded outputs, clamping to hide divergence).
+- Never reinvent existing functionality — inventory first (`CODEMAP.md`, `Import_other_Repos.md`, sibling crates, reference repos: FireCore, SPAMMM, learn_Rust, blood_of_civilization).
+- Never copy-paste between crates — extract to a shared lib.
+- Never cheat a test green (see ⚑ Tests Are Diagnostics above).
+- **Ask, don't Guess** — when unsure, ask the user.
 
-## Rule 4 — Test-Driven Development & Validation
+## Surgical Edits & Checkpointing
 
-- **Numerical Range Sanity:** Strategically place checks throughout calculations to ensure values are within reasonable limits and are not `NaN`, infinity, or unexpected zeros.
-- **Test on Completion:** Run validation tests immediately after any code modification. Never claim code works unless tests run successfully.
-- **Physical & Analytical Parity:** Define how correctness will be verified *before* coding via parity checks against reference code, known analytical solutions, physical conservation laws, symmetry checks, or known physical limits. See `numerical-parity/SKILL.md`.
-- **Foreground Execution:** Run tests synchronously with full output. Never use background commands, pipes (`| tail`, `| head`). Full stdout must be visible.
-- **Visual Review & Diagnostics:** Use shared utilities for plotting, debugging, and diagnostics instead of ad-hoc code. See `visual-debugging/SKILL.md` for `plotUtils.py`, `VispyUtils.py`, `TestUtils.py`, and `testUtils.h`.
-- **Invoke Relevant Skills:** When task matches skill description (numerical-parity, visual-debugging, gpu-debugging, forcefield-validation, port-to-opencl), invoke the skill tool to get detailed guidance.
+- **Minimum intervention:** write only what the task needs.
+- **Strict checkpointing:** after every significant step, summarize what changed, what was verified, what remains.
+- **Preservation:** back up before major module changes; comment out (`//`/`#`) deprecated/experimental code instead of deleting; mark unfinished with `// TODO` / `// DEBUG`.
+- **Never mark "fixed"/"done" without explicit USER confirmation.** A code change is not proof. You must: (1) run a test demonstrating the fix, (2) show the result, (3) wait for confirmation. When in doubt, leave status as "investigating"/"unverified".
 
-## Rule 5 — Performance Optimization
+## Reusable Architecture
 
-- **Minimal Orchestration:** Keep Python orchestration minimal. Push heavy computations into optimized C/C++/OpenCL/CUDA/Compute Shader kernels.
-- **Memory Optimization:** Prefer flat, contiguous arrays and data-oriented layouts. Be explicit about dtypes and shapes. Preallocate and reuse buffers; avoid repeated allocations in hot paths.
-- **Low-Level & GPU Kernel Guidelines:** Design around memory latency, prefer gather over scatter, minimize branching/atomics/synchronization, maximize shared/local memory usage, avoid unnecessary host-device transfers. See `port-to-opencl/SKILL.md`.
+- **Inventory first** — review reference sources before writing anything new (see Never Do This).
+- **Composability over bloat** — build integrated systems, not isolated scripts; refactor into shared-crate functions.
+- **Generalize over duplicate** — if a function almost fits, generalize it; if generalization risks backward compatibility, stop and report for approval.
+- Separate GUI (`surfmol-apps`), CLI tools (in their backend crate's `src/bin/`), and backend modules. Test scripts are thin wrappers calling shared-crate functions; consolidate related scripts into one with CLI routing.
 
-## Rule 6 — Concise Style
+## Testing & Validation
 
-- **No Micro-Abstractions:** Do not create 1 line function stubs or wrappers. If it is simple, inline it.
-- **Clean Interfaces:** Avoid passing excessive numbers of arguments. Group related state into structs/dicts, or utilize globals and class properties. Use default named arguments to avoid long call strings.
-- **Compact Layout:** Prefer compact code with long lines and minimal empty lines or whitespace. Avoid line wrapping that disrupts the readability of expressions; assume infinite line length.
-- **Naming & Comments:** Use short, clear variable names for math/physics symbols (e.g., `E_tot`, `T_ij`, `m_i`). Avoid comments that state the obvious; use them for intent, rationale, or math/physics derivations. Place inline comments behind the code line.
-- **Language-Specific Rules:**
-- **C++:** Use `printf` for debugging instead of `std::cout`. Prefer plain C arrays (`double*`) in hot paths.
-- **Doxygen:** Document using `///`; avoid `/* ... */` formatting.
-- **Parity Work:** When mirroring features across languages (e.g., Python $\leftrightarrow$ JS), explicitly cite the reference file and function in the comments.
+- **Numerical sanity:** place checks ensuring values are finite, in-range, not unexpected zeros.
+- **Diagnostic tests, not pass/fail:** print actual numbers (per-atom residuals, per-cell energies, worst contributor, sign of deviation). Assert on physical invariants (energy conservation, sign convention, monotonicity, symmetry). On failure, output should locate the bug without re-running. `assert_eq!` is a smoke check, not a scientific test.
+- **Parity before coding:** define correctness checks vs reference code (FireCore C++ is the perf+correctness benchmark), analytical solutions, conservation laws, symmetry, physical limits. See skill:`numerical-parity`.
+- **Foreground execution:** run tests synchronously with full output — never background, `| tail`, `| head`, `| grep`, or `&`.
+- **Three review levels:** L0 `cargo test` (automated regression) · L1 agent reads `.out`/`.log` artifacts unfiltered · L2 human reviews `.png`/`.svg` plots in `debug/` or `artifacts/`.
+- **Labbook:** every debugging session gets `notes/reports/<task>_debug.md`, updated continuously (after each todo, each failed run, each dead-end) — what was tried, what happened (with numbers), what it means. See skill:`debug`.
+- **Refactoring discipline:** before refactoring, run each old test and show results to USER; delete old files only after explicit approval; never delete plots.
+- **Visual review:** use shared plotting utilities, not ad-hoc code. See skill:`visual-debugging`.
+- **Images in chat:** use `<ref_file file="/abs/path/to/image.png" />` — the only format that renders as a clickable image. Markdown `![]()`/`[]()` do NOT render. Save PNGs to `debug/`/`artifacts/`.
+- **Long-running scripts MUST print unbuffered progress** (`eprintln!`/`println!` with flush, or `PYTHONUNBUFFERED=1`) — print starts, accepted steps with energy decrease, and finish. Never run silently for minutes.
+- **Debug prints are gated, not deleted.** Use verbosity-gated logging (Rust: `log` crate macros `error!`/`warn!`/`info!`/`debug!`/`trace!` filtered via `RUST_LOG`; or `eprintln!` behind a `const VERBOSE: bool`/`--verbose` flag) so output is controlled by level, not by removing lines. **Do NOT remove debug prints until the program is functioning correctly.** If output is too noisy, **lower the debug level** (e.g. `RUST_LOG=warn`) — do not delete the print statements. Silent code is undebuggable; gated prints let you re-raise verbosity the moment something breaks again.
+- **Informative messages, not "it broke".** Every error, panic, assertion, and debug print must carry enough context to locate the bug without re-running: **where** (function/module/file:line — Rust's `panic!`/`expect` and `#[track_caller]` give this; Python's `logging` with `%(funcName)s:%(lineno)d`), **what** happened (the violated invariant / unexpected state, in plain words), and the **values of all relevant variables** (inputs, indices, shapes, energies, residuals — print the numbers, not just names). Bad: `"failed"`, `"NaN error"`, `unwrap()`. Good: `expect(&format!("bond {i}-{j} stretched: |r|={r:.3} > cutoff {c:.3}"))`, `panic!("energy non-finite at step {step}: E={E}, max|F|={fmax}");`. A message that doesn't let you reconstruct the failure is a bug in the message.
+- **Invoke relevant skills** when a task matches: `numerical-parity`, `visual-debugging`, `gpu-debugging`, `forcefield-validation`, `port-to-opencl`.
 
-## Practical Navigation, Compilation, testing Protocols
+## Performance
 
-- **Repository Navigation:** Review `CODEMAP.md` for structure and build instructions. For forcefield data-ownership and module-composability rationale, see `rust/forcefields/DESIGN.md`.
-- **Test Location:** Place all test scripts within `/test`.
-- **Automation Scripts:** Use provided `run.sh`/`make.sh` scripts in the test directory; never invoke `make` directly if helpers exist. Run tests from inside the test directory to ensure paths are set.
+- **Rust is the engine** — all simulation logic in Rust. Flat arrays, cache-aware, preallocate; prefer `&[T]`/`&mut [T]` over `Vec<T>` in hot paths; SoA/data-oriented layouts; be explicit about `f32` vs `f64`.
+- **OpenCL is the accelerator** — only the OpenCL crate uses `unsafe`. **CPU Rust references are authoritative** for correctness; GPU must match CPU within tolerance. Always prefer **NVIDIA GPU**; never report PoCL/CPU timings as GPU timings.
+- **Minimal orchestration** — push heavy compute into OpenCL kernels; Python only orchestrates, never hot loops.
+- **GPU kernels:** design for memory latency; gather > scatter; minimize branching/atomics/sync; maximize shared/local memory; avoid host-device transfers; **fuse secondary checks into existing kernels** (add clash flags in a loop that already computes distance — never recompute on host). See skill:`port-to-opencl`.
+
+## Style
+
+- **No micro-abstractions** — no 1-line stubs/wrappers; inline if simple.
+- **Clean interfaces** — group related state into structs; use builder/default named args to avoid long call strings.
+- **Compact layout** — long lines, minimal blank lines; no wrapping that disrupts readability.
+- **Naming & comments** — short math/physics symbol names; comments for intent/rationale/derivations only, placed inline behind the code line.
+- **Rust:** gated debug logging (see Testing & Validation §Debug prints); `&[f32]`/`&mut [f32]` in hot paths; `bytemuck` for zero-copy OpenCL casts; `///` rustdoc (not `/* */`).
+- **OpenCL:** kernels in `.cl` under `opencl/`; CPU reference authoritative; only OpenCL crate uses `unsafe`.
+- **Python:** support scripts/illustrations only; NumPy for array glue; `plt.show()` only in CLI/main, never in libs.
+- **Parity work:** when porting from FireCore/SPAMMM/learn_Rust, cite the reference file+function in a comment (e.g. `// ported from FireCore/src/forcefields/uff.cpp:Uff::eval`).
+
+## Navigation & Folder Roles
+
+- **Key docs:** `CODEMAP.md` (structure, file inventory, crate graph) · `ARCHITECTURE.md` (crate layout, file naming, **folder roles & OKF metadata**) · `Import_other_Repos.md` (reference repos) · `DESIGN_GOALS.md` · `rust/forcefields/DESIGN.md` (forcefield data ownership) · `notes/ToDo_user.md`.
+- **Test location:** backend module tests → crate `tests/`; GUI/composite app tests → `apps/tests/`. See `ARCHITECTURE.md` §File Naming.
+- **Folder metadata (OKF):** every folder must have a `README.md` in [OKF format](https://okf.md/) (YAML frontmatter: required `type`; recommended `title`/`description`/`tags`/`timestamp` + markdown body). The binding folder-role table and frontmatter conventions live in `ARCHITECTURE.md` §Folder Roles.
+- **Docs hygiene:** before writing, search existing implementations; after implementing, update the folder's `README.md` and `CODEMAP.md` if structure changed.
