@@ -33,24 +33,36 @@ SOLVER_STYLE = {
     'XPBD-dt0.2':             ('XPBD dt=0.2 (no inertia)',  '#4daf4a', '-.'),
     'Projective-dt0.05':      ('Proj dt=0.05 (no inertia)', '#984ea3', '--'),
     'Projective-dt0.2':       ('Proj dt=0.2 (no inertia)',  '#984ea3', '-.'),
-    # Proper PD with outer inertia + heavy-ball
-    'PD-Proj-dt0.05-i4':      ('PD-Proj dt=0.05 i4',   '#a65628', '--'),
-    'PD-Proj-dt0.1-i4':       ('PD-Proj dt=0.1 i4',    '#a65628', '-'),
-    'PD-Proj-dt0.2-i4':       ('PD-Proj dt=0.2 i4',    '#a65628', '-.'),
-    'PD-Proj-dt0.1-i2':       ('PD-Proj dt=0.1 i2',    '#f781bf', '--'),
-    'PD-Proj-dt0.1-i8':       ('PD-Proj dt=0.1 i8',    '#f781bf', '-'),
-    'PD-XPBD-dt0.1-i4':       ('PD-XPBD dt=0.1 i4',    '#999999', '--'),
-    'PD-XPBD-dt0.2-i4':       ('PD-XPBD dt=0.2 i4',    '#999999', '-'),
+    # Proper PD with outer inertia; reset/free and active/no heavy-ball are explicit
+    'PD-Proj-dt0.05-i4-reset':      ('PD-Proj dt=.05 i4 HB reset', '#a65628', '--'),
+    'PD-Proj-dt0.1-i4-reset':       ('PD-Proj dt=.1 i4 HB reset',  '#a65628', '-'),
+    'PD-Proj-dt0.1-i4-nohb-reset':  ('PD-Proj adiabatic dt=.1 i4', '#1b9e77', '-'),
+    'PD-Proj-dt0.1-i3-nohb-reset':  ('PD-Proj adiabatic dt=.1 i3', '#1b9e77', '--'),
+    'PD-Proj-dt0.15-i3-nohb-reset': ('PD-Proj adiabatic dt=.15 i3','#1b9e77', ':'),
+    'PD-Proj-dt0.2-i4-reset':       ('PD-Proj dt=.2 i4 HB reset',  '#a65628', '-.'),
+    'PD-Proj-dt0.2-i4-free':        ('PD-Proj dt=.2 i4 HB free',   '#d95f02', '-'),
+    'PD-Proj-dt0.2-i4-nohb':        ('PD-Proj dt=.2 i4 free',      '#7570b3', '-'),
+    'PD-Proj-dt0.1-i2-reset':       ('PD-Proj dt=.1 i2 reset',     '#f781bf', '--'),
+    'PD-Proj-dt0.1-i8-reset':       ('PD-Proj dt=.1 i8 HB reset',  '#f781bf', '-'),
+    'PD-XPBD-dt0.1-i4-reset':       ('PD-XPBD dt=.1 i4 reset',     '#999999', '--'),
+    'PD-XPBD-dt0.2-i4-reset':       ('PD-XPBD dt=.2 i4 reset',     '#999999', '-'),
+    'PD-ProjDyn-dt0.005-i4-reset':  ('PD-Proj dynamic dt=.005 i4', '#e6ab02', ':'),
+    'PD-ProjDyn-dt0.01-i4-reset':   ('PD-Proj dynamic dt=.01 i4',  '#e6ab02', '--'),
+    'PD-ProjDyn-dt0.02-i4-reset':   ('PD-Proj dynamic dt=.02 i4',  '#e6ab02', '-.'),
+    'PD-ProjDyn-dt0.05-i4-reset':   ('PD-Proj dynamic dt=.05 i4',  '#e6ab02', '-'),
+    'PD-ProjDyn-dt0.1-i4-reset':    ('PD-Proj dynamic dt=.1 i4',   '#d95f02', '-'),
 }
 
 def load_csv(path):
-    """Load CSV -> structured array with step, rmsd, max_f, n_evals."""
+    """Load CSV -> structured array with step, rmsd, max_f, optional max_t, n_evals."""
     return np.genfromtxt(path, delimiter=',', names=True, dtype=None, encoding='utf-8')
 
 def plot_convergence(traces, xlabel, xkey, ylabel, ykey, title, fname, ref_line=None):
     """Plot one figure: y vs x for all traces (log Y)."""
     fig, ax = plt.subplots(figsize=(8, 5))
     for label, data in traces.items():
+        if xkey not in data.dtype.names or ykey not in data.dtype.names:
+            continue
         x = data[xkey]
         y = np.maximum(data[ykey], 1e-16)  # clamp for log scale
         style = SOLVER_STYLE.get(label, (label, '#999', '-'))
@@ -112,6 +124,12 @@ def main():
                          f'{mol} / {dist}: max force vs macrostep (PRIMARY)',
                          f'{mol}_{dist}_force_vs_step.png',
                          ref_line=(0.1, 'T2 (rough)'))
+        # Rotational residual for new-format traces; required for dynamic-orientation convergence.
+        if any('max_t' in data.dtype.names for data in traces.values()):
+            plot_convergence(traces, 'macrostep', 'step', 'max|tau| [eV]', 'max_t',
+                             f'{mol} / {dist}: max torque vs macrostep',
+                             f'{mol}_{dist}_torque_vs_step.png',
+                             ref_line=(0.1, 'T2 (rough)'))
         # PRIMARY: max|F| vs n_evals (cross-solver perf, DOF-independent)
         plot_convergence(traces, 'n_evals (port-force evals)', 'n_evals', 'max|F| [eV/A]', 'max_f',
                          f'{mol} / {dist}: max force vs soft evals (PRIMARY)',
@@ -141,7 +159,10 @@ def main():
                 data = traces[solver]
                 max_f = np.atleast_1d(data['max_f'])
                 steps = np.atleast_1d(data['step'])
-                hit = np.where(max_f < thresh)[0]
+                converged = max_f < thresh
+                if 'max_t' in data.dtype.names:
+                    converged &= np.atleast_1d(data['max_t']) < thresh
+                hit = np.where(converged)[0]
                 vals.append(int(steps[hit[0]]) if len(hit) > 0 else int(max(steps) * 2))
             style = SOLVER_STYLE.get(solver, (solver, '#999', '-'))
             ax.bar(x + si * width, vals, width, label=style[0], color=style[1])

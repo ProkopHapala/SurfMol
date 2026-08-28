@@ -177,9 +177,9 @@ Wall time per step varies significantly between solvers. Position-based solvers 
 | Accurate geometry optimization | PBD-compliance or=1.9 (small) / Projective (large) | dt=0.05 / 0.2 |
 | Reference relaxation | FIRE | dt0=0.001, dtmax=0.02 |
 
-## 9. ⚠ CRITICAL CAVEAT — position-based solvers are missing the outer inertial loop
+## 9. ⚠ Historical-result caveat — original inertial-PD and heavy-ball labels were invalid
 
-**All PBD/XPBD/Projective results in this report are WITHOUT inertia and WITHOUT heavy-ball momentum.** They measure pure constraint projection (Gauss-Seidel/Jacobi iteration), not real Projective Dynamics. See labbook Session 2 for details.
+**All original PBD/XPBD/Projective results in this report are projection-only baselines.** The first follow-up runs labeled `PD+inertia` were also not valid inertial-PD measurements: their benchmark configuration passed `cdamp=0.0`, while RAFF defines `cdamp` as a velocity-retention multiplier (`0` kills velocity, `1` preserves it). Those runs therefore discarded velocity after every outer step. In addition, the `i4` cases used `bmix_istart=3` while mixing was disabled on the last iteration, so heavy-ball was never active. The focused corrected subset below supersedes those labels; see labbook Sessions 2–4.
 
 ### The architectural error
 
@@ -191,7 +191,7 @@ Three bugs in our `step_xpbd` (raff.rs:1115-1146), identified by comparison with
 
 2. **No heavy-ball momentum in the inner solver.** FireCore's `updateIterativeMomentum` applies `p_{k+1} = p'_k + bmix·d_k` (bmix ramps 0→0.75 via `SmartMixer`). Our `solve_projective_jacobi` does plain Jacobi with no momentum.
 
-3. **`cdamp` semantics are wrong.** In FireCore, `Cdrag=0` = no drag (full inertia). In our code, `cdamp=0` = no velocity at all (kill inertia). The velocity update `v = (x_new - x_old) * (cdamp/dt)` with cdamp=0 gives v=0. Should be `v = (x_new - x_old) / dt` always.
+3. **The benchmark used the wrong `cdamp` convention.** FireCore expresses drag as a damping amount, while RAFF's `cdamp` is a velocity-retention multiplier (`0` kills velocity, `1` preserves it). The corrector itself now computes `v = (x_new - x_old)/dt`, after which RAFF applies the retention factor. Therefore true undamped inertia requires `cdamp=1`, not zero.
 
 ### Impact on results
 
@@ -199,6 +199,41 @@ Three bugs in our `step_xpbd` (raff.rs:1115-1146), identified by comparison with
 - The comparison with FIRE was **unfair** — FIRE has inertia, our "PD" doesn't.
 - The poor scaling of position-based solvers on large molecules may be because without inertia, the inner solver does all the work (16 iters), whereas with inertia, 1-2 inner iters per outer step might suffice.
 - **All position-based results in §3-§7 must be re-measured after fixing the outer loop.**
+
+### Focused corrected result (tree100 / D2 stretch)
+
+A short follow-up corrected the retention factor (`cdamp=1.0` for full inertia), activated HB inside the four-iteration solve, and compared controls:
+
+| Solver | T2 steps | T1 steps | Wall to T1 |
+|---|---:|---:|---:|
+| Legacy Projective dt=.2 i16, projection-only | 50 | 251 | 267 ms |
+| True PD dt=.1 i4, reset, HB=.75 | **32** | 152 | 46.1 ms |
+| True PD dt=.1 i4, reset, no HB | 38 | **109** | **33.8 ms** |
+| FIRE dtmax=.02 | 314 | 581 | 4.14 ms |
+
+Correct outer inertia improves Projective T1 step count by 2.3× and wall time by 7.9× relative to the prior Projective baseline. Fixed HB helps rough convergence but hurts accurate convergence, indicating that momentum should restart/disable automatically when the residual stops decreasing. FIRE remains faster in wall time because a PD outer step performs several local/global updates and repeated orientation solves.
+
+### Follow-up inner-loop optimization
+
+The redundant overwritten Jacobi pass was removed; the constant diagonal is precomputed; owned/incoming RHS contributions are fused into one port traversal; and inner buffers are reused. All convergence diagnostics pass and the focused case preserves T2/T1 exactly at 38/109. Wall time changed only 33.8→33.1 ms (~2%), proving that this waste was not the dominant bottleneck. Repeated adiabatic Wahba solves and diagnostic force evaluations are stronger suspects.
+
+A proposed automatic HB restart based on `Jacobi correction · previous momentum > 0` failed its diagnostic: it disabled every HB update on CH4 (`|x_hb-x_plain|=0`). The change was reverted. A valid restart must use the true linear residual `||b-Ax||` (or spectral bounds), not displacement alignment.
+
+### Orientation algorithm correction and comparison
+
+The old adiabatic Wahba solver used warm-started power iteration. A 180° bad start can be an exact non-dominant eigenvector, leaving the solver trapped at `E=266.7` regardless of iteration count. It was replaced by deterministic cyclic Jacobi diagonalization of the full symmetric Davenport 4×4 matrix. The bad-start case now reaches `E=0`; equilibrium energy is `1.54e-29`; perturbed torque residual is `1.22e-14`.
+
+Projective dynamic orientation was also implemented: once per outer step it evaluates torque, advances `ω`, integrates `q`, then holds `q` fixed during four translational inner sweeps. Convergence now requires both max force and max torque thresholds.
+
+| Orientation | dt | T2 outer | T1 outer | force evals | inner sweeps | orientation ops |
+|---|---:|---:|---:|---:|---:|---:|
+| Adiabatic Davenport/Wahba | .10 | **38** | **113** | 226 | **452** | 566 |
+| Dynamic torque/ω | .01 | 523 | 1203 | 3609 | 4812 | 1203 |
+| Dynamic torque/ω | .02 | 242 | 593 | 1779 | 2372 | 593 |
+| Dynamic torque/ω | .05 | **109** | **251** | **753** | **1004** | **251** |
+| Dynamic torque/ω | .10 | -- | -- | 30000 | 40000 | 10000 |
+
+Adiabatic orientation is the stronger relaxation preconditioner for tree100/D2. Dynamic orientation preserves physical angular memory but has an explicit rotational stability limit between dt=.05 and .1. **Multirate rotational subcycling was tested (Session 9) and does NOT help:** subcycling the rotation at `dt_rot = dt/n` while keeping the translational dt large causes divergence even at dt=0.05/sub2 (single-rate dt=0.05 converges). Root cause: the port constraints couple rotational and translational displacement — subcycling reduces `Δθ` without reducing `Δx`, breaking the coupled displacement ratio. **The correct fix (Session 10): inner-coupled rotational Jacobi.** The inner loop accumulates both translational RHS and torque in ONE port traversal, then updates both x and q together. No outer torque integration — the inner loop IS the substep for both DOFs. This extends the dynamic stability limit from dt=.05–.1 to dt=.1–.15, and dynamic PD at dt=0.1/i8+HB now beats adiabatic in T2 steps (30 vs 32) at 4× lower wall time (5.7ms vs 23ms).
 
 ### Reference implementation
 
@@ -210,21 +245,23 @@ FireCore/cpp/common/math/ProjectiveDynamics_d.h + .cpp:
 
 ## 10. Artifacts
 
-- **CSVs**: `debug/raff_bench/{molecule}_{distortion}_{solver}.csv` (180 files, per-step step/rmsd/max_f/n_evals)
-- **PNGs**: `debug/raff_bench/{molecule}_{distortion}_{plot}.png` (46 files)
+- **CSVs**: `debug/raff_bench/{molecule}_{distortion}_{solver}.csv` (generated configurations vary; columns step/rmsd/max_f/n_evals)
+- **PNGs**: `debug/raff_bench/{molecule}_{distortion}_{plot}.png` (46 plot files for the 15 molecule/distortion groups plus summary)
   - `force_vs_step.png` — max|F| vs macrostep (PRIMARY)
-  - `force_vs_evals.png` — max|F| vs soft evals (PRIMARY, cross-solver)
+  - `force_vs_evals.png` — currently max|F| vs an outer-step proxy; **not a valid cross-family work metric** until soft/local/linear evaluations are counted separately
   - `rmsd_vs_step.png` — RMSD vs macrostep (SECONDARY — plateaus for free-DOF molecules)
   - `summary_steps_to_target.png` — bar chart overview
 - **Plotting script**: `scripts/plot_raff_bench.py`
 - **Benchmark binary**: `crates/libs/molff/src/bin/raff_bench.rs`
 - **FIRE implementation**: `crates/libs/molff/src/raff.rs` (`step_fire`, `FireState`)
 
-## 11. Next steps
+## 11. Prioritized next steps after solver audit
 
-1. **Fix the outer inertial loop in `step_xpbd`** (CRITICAL) — always predict, always update velocity, separate cdamp from predict/corrector. Add dot(v,F)<0 velocity reset for relaxation.
-2. **Add heavy-ball momentum to the inner Jacobi/GS solver** — port FireCore's SmartMixer (bmix 0→0.75).
-3. **Re-run benchmark with proper PD** — compare with/without inertia, 1-2 inner iters vs 16.
-4. **Add torsion term to RAFF** — the H2O2 D3a result shows the port model has no dihedral constraint.
-5. **Test on real molecules** (benzoic acid dimer, surface adsorbates).
-6. **Consider the "fly" variant** — recompute RHS each iteration (nonlinear), may converge better for port model rotations.
+1. **Completed for the focused tree100/D2 case: validate true outer inertia.** With the current retention-factor convention, `cdamp=1.0` preserves velocity. Reset stabilized the tested outer loop; the no-reset `dt=.2` case diverged.
+2. **Partially completed: test genuinely active heavy-ball.** Active HB improved rough T2 convergence (38→32 steps) but worsened T1 convergence (109→152). A displacement-alignment restart failed and was reverted; the next restart must monitor the true linear residual `||b-Ax||`.
+3. **Make work counters physically meaningful.** Record expensive soft-force evaluations separately from local projections, linear iterations, Wahba solves, and final diagnostic force evaluations. Current `n_evals=outer_steps` makes the cross-family evaluation plot misleading.
+4. **Completed, low impact: remove inner-loop waste.** Fused RHS accumulation, constant diagonal, and reused inner buffers preserve 38/109 convergence but improve this focused wall time by only ~2%. Profile orientation and diagnostic evaluations next.
+5. **Prefer a reusable global solve over more Jacobi tuning.** The PD matrix is constant for fixed topology/stiffness/dt; sparse LDLT/Cholesky or preconditioned CG can be reused. FireCore already provides the reference architecture. This is especially promising for bounded-degree molecular trees.
+6. **Implement the intended IMEX split.** Evaluate long-range nonbonded forces once per outer step, build `y=x+v·dt+M⁻¹F_soft·dt²`, and keep only ports/contact projections inside the cheap loop.
+7. **Automate parameters from diagnostics.** The focused comparison supports `i4` for minimum outer iterations and `i3` for similar CPU work, but two sweeps are insufficient. ~~Estimate rotational stability separately (`dt_rot ≲ c/sqrt(k_rot/I)`) and use subcycling/multirate integration.~~ **Subcycling tested and rejected (Session 9); inner-coupled rotational Jacobi implemented (Session 10).** The inner loop now updates both translation and rotation in one port traversal, extending the dynamic stability limit to dt=.1–.15. Dynamic PD at dt=0.1/i8+HB beats adiabatic in T2 steps (30 vs 32) at 4× lower wall time. Stop inner iterations using the true linear residual.
+8. **Add the missing torsion physics and test real molecules.** Without an explicit torsion term, dihedral benchmarks probe a null space rather than nonlinear torsional convergence.

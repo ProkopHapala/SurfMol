@@ -67,7 +67,7 @@ pub struct RaffConfig {
     /// Should be true for proper Projective Dynamics. False = legacy projection-only mode.
     pub pd_inertia: bool,
     /// When true: reset velocity to zero when dot(v,F) < 0 (uphill). Like FIRE/inertial-reset.
-    /// For relaxation with full inertia (cdamp=0), this prevents energy buildup.
+    /// For relaxation with full inertia (cdamp=1 in the retention-factor convention), this prevents energy buildup.
     pub vel_reset: bool,
     // --- Heavy-ball momentum for inner Jacobi/GS solver (port from FireCore SmartMixer) ---
     pub bmix_start: f64,  // momentum mixing at start of ramp (typically 0)
@@ -209,6 +209,58 @@ pub struct RaffTopology {
         Vec3d::new(2.0*(x*y+w*z), 1.0 - 2.0*(x*x+z*z), 2.0*(y*z-w*x)),
         Vec3d::new(2.0*(x*z-w*y), 2.0*(y*z+w*x), 1.0 - 2.0*(x*x+y*y)),
     )
+}
+
+/// Dominant eigenvector of a real symmetric 4×4 matrix by cyclic Jacobi diagonalization.
+/// Unlike power iteration this is independent of the initial vector and cannot remain trapped
+/// in a non-dominant eigenvector. `q_ref` is used only to choose the equivalent quaternion sign.
+fn dominant_eigenvector_sym4(mut a: [f64; 16], q_ref: [f64; 4]) -> [f64; 4] {
+    assert!(a.iter().all(|x| x.is_finite()), "dominant_eigenvector_sym4: non-finite matrix {a:?}");
+    let mut v = [0.0f64; 16];
+    for i in 0..4 { v[i*4+i] = 1.0; }
+    for _ in 0..12 {
+        let mut off_max = 0.0f64;
+        for p in 0..3 {
+            for q in (p+1)..4 {
+                let apq = a[p*4+q];
+                off_max = off_max.max(apq.abs());
+                if apq.abs() < 1e-30 { continue; }
+                let app = a[p*4+p];
+                let aqq = a[q*4+q];
+                let tau = (aqq - app) / (2.0 * apq);
+                let t = if tau >= 0.0 { 1.0 / (tau + (1.0 + tau*tau).sqrt()) } else { -1.0 / (-tau + (1.0 + tau*tau).sqrt()) };
+                let c = 1.0 / (1.0 + t*t).sqrt();
+                let s = t * c;
+                for r in 0..4 {
+                    if r == p || r == q { continue; }
+                    let arp = a[r*4+p];
+                    let arq = a[r*4+q];
+                    let nrp = c*arp - s*arq;
+                    let nrq = s*arp + c*arq;
+                    a[r*4+p] = nrp; a[p*4+r] = nrp;
+                    a[r*4+q] = nrq; a[q*4+r] = nrq;
+                }
+                a[p*4+p] = app - t*apq;
+                a[q*4+q] = aqq + t*apq;
+                a[p*4+q] = 0.0; a[q*4+p] = 0.0;
+                for r in 0..4 {
+                    let vrp = v[r*4+p];
+                    let vrq = v[r*4+q];
+                    v[r*4+p] = c*vrp - s*vrq;
+                    v[r*4+q] = s*vrp + c*vrq;
+                }
+            }
+        }
+        let scale = (0..4).map(|i| a[i*4+i].abs()).fold(0.0f64, f64::max);
+        if off_max <= 1e-14 * (1.0 + scale) { break; }
+    }
+    let imax = (1..4).fold(0usize, |best, i| if a[i*4+i] > a[best*4+best] { i } else { best });
+    let mut q = [v[imax], v[4+imax], v[8+imax], v[12+imax]];
+    let n = q.iter().map(|x| x*x).sum::<f64>().sqrt();
+    assert!(n > 1e-30 && n.is_finite(), "dominant_eigenvector_sym4: invalid eigenvector norm {n}");
+    for x in &mut q { *x /= n; }
+    if q.iter().zip(q_ref).map(|(x, y)| x*y).sum::<f64>() < 0.0 { for x in &mut q { *x = -*x; } }
+    q
 }
 
 // ==================================================================
@@ -525,9 +577,8 @@ pub fn eval_port_forces(
 /// using the cross-covariance H = Σ k_α d_α r_α^T (NO centroid subtraction).
 /// Returns the optimal quaternion.
 ///
-/// Uses Newton-Schulz polar decomposition: R* = polar(H), then converts to quaternion.
-/// This is more robust than Horn K-matrix power iteration (which can converge to the
-/// wrong eigenvector when the largest-magnitude eigenvalue is negative).
+/// Uses the Davenport/Horn symmetric 4×4 K-matrix with cyclic Jacobi diagonalization.
+/// Solving the full eigenproblem avoids power iteration's dependence on the initial quaternion.
 /// d_α = x_j - x_i (neighbor direction), r_α = l_α · a_α (body-frame port arm).
 pub fn solve_rotation_wahba(
     i: usize, state: &RaffState, topo: &RaffTopology,
@@ -571,45 +622,19 @@ pub fn solve_rotation_wahba(
         h.add_outer(r * k, d);                         // M += k * r * d^T
     }
 
-    // Horn K-matrix method with shifted power iteration.
-    // The K-matrix has eigenvalues summing to 0, so the largest-magnitude eigenvalue
-    // can be negative. We shift K' = K + cI to make all eigenvalues positive,
-    // ensuring power iteration converges to the largest (optimal rotation).
+    // Davenport/Horn K-matrix. The largest algebraic eigenvalue gives the global Wahba optimum.
     let (hxx, hxy, hxz) = (h.a.x, h.a.y, h.a.z);
     let (hyx, hyy, hyz) = (h.b.x, h.b.y, h.b.z);
     let (hzx, hzy, hzz) = (h.c.x, h.c.y, h.c.z);
     let tr = hxx + hyy + hzz;
-    let mut k = [0.0f64; 16];
-    k[0] = tr;                     k[1] = hyz - hzy;          k[2] = hzx - hxz;          k[3] = hxy - hyx;
-    k[4] = hyz - hzy;              k[5] = hxx - hyy - hzz;    k[6] = hxy + hyx;          k[7] = hzx + hxz;
-    k[8] = hzx - hxz;              k[9] = hxy + hyx;          k[10] = hyy - hxx - hzz;   k[11] = hyz + hzy;
-    k[12] = hxy - hyx;             k[13] = hzx + hxz;         k[14] = hyz + hzy;         k[15] = hzz - hxx - hyy;
-    // Shift: c = 2 * Frobenius norm of K (upper bound on |eigenvalues|)
-    let k_frob = k.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let shift = 2.0 * k_frob;
-    for i in 0..4 { k[i*5] += shift; }  // add shift to diagonal
-
-    // Power iteration on shifted K. K-matrix uses [w, x, y, z] ordering (scalar first).
+    let k = [
+        tr,          hyz-hzy,       hzx-hxz,       hxy-hyx,
+        hyz-hzy,     hxx-hyy-hzz,   hxy+hyx,       hzx+hxz,
+        hzx-hxz,     hxy+hyx,       hyy-hxx-hzz,   hyz+hzy,
+        hxy-hyx,     hzx+hxz,       hyz+hzy,       hzz-hxx-hyy,
+    ];
     let q_warm = state.quat[i];
-    let mut q = [q_warm.w, q_warm.x, q_warm.y, q_warm.z];  // [w, x, y, z]
-    { let n = (q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]).sqrt(); if n > 1e-30 { for x in q.iter_mut() { *x /= n; } } }
-    for _ in 0..64 {
-        let mut qnew = [0.0f64; 4];
-        for row in 0..4 {
-            for col in 0..4 { qnew[row] += k[row*4+col] * q[col]; }
-        }
-        let n = (qnew[0]*qnew[0]+qnew[1]*qnew[1]+qnew[2]*qnew[2]+qnew[3]*qnew[3]).sqrt();
-        if n < 1e-30 { break; }
-        let inv = 1.0 / n;
-        let mut max_delta: f64 = 0.0;
-        for idx in 0..4 {
-            qnew[idx] *= inv;
-            max_delta = max_delta.max((qnew[idx] - q[idx]).abs());
-            q[idx] = qnew[idx];
-        }
-        if max_delta < 1e-14 { break; }
-    }
-    // Horn K-matrix eigenvector is [w, x, y, z] (scalar first), but Quat4d is (x, y, z, w)
+    let q = dominant_eigenvector_sym4(k, [q_warm.w, q_warm.x, q_warm.y, q_warm.z]);
     Quat4d::new(q[1], q[2], q[3], q[0])
 }
 
@@ -885,7 +910,7 @@ pub fn step_force_md(
 }
 
 /// One inertial relaxation step with velocity reset (simple FIRE variant).
-/// Full inertia (cdamp=0): v += F/m*dt; x += v*dt.
+/// Full inertia (independent of `cdamp`): v += F/m*dt; x += v*dt.
 /// When dot(v,F) < 0 (moving uphill): reset v=0 (kill kinetic energy).
 /// No adaptive dt, no mixing — just plain momentum + velocity reset.
 /// Uses Dynamic orientation (smooth rotation — Adiabatic snaps pump energy).
@@ -1125,7 +1150,7 @@ pub fn step_xpbd(
 /// 2. **Solve** (inner, linear): Jacobi/GS on the constraint system, with optional heavy-ball
 ///    momentum. Typically 1-16 inner iterations per outer step.
 /// 3. **Corrector**: `v = (x_new - x_old) / dt`. Always done (not multiplied by cdamp).
-///    Then optional damping (`v *= cdamp`) and velocity reset (`dot(v,F)<0 → v=0`).
+///    Then optional damping and generalized-power reset (`v·F + ω·τ < 0`).
 pub fn step_position_based(
     state: &mut RaffState, topo: &RaffTopology, cfg: &RaffConfig,
     nbcfg: &NbConfig,
@@ -1133,13 +1158,24 @@ pub fn step_position_based(
     let dt2 = cfg.dt * cfg.dt;
     let np = topo.natoms;
 
-    // For adiabatic mode: solve rotations first (before any position changes)
+    // Rotational outer step: adiabatic = full Wahba re-solve; dynamic = predict q += ω·dt only.
+    // The inner Jacobi loop then corrects BOTH translation and rotation together (coupled substeps).
+    // No outer torque integration for dynamic Projective — the inner loop handles rotation.
     if cfg.orient_mode == OrientMode::Adiabatic {
         solve_all_rotations(state, topo);
+    } else if cfg.pos_solver == PosSolver::Projective {
+        // Predict rotation only: q_pred = exp(ω·dt/2) ⊗ q. No torque here — inner loop corrects.
+        for i in 0..np {
+            if topo.inv_inertia[i] <= 0.0 || topo.nport[i] == 0 { continue; }
+            state.omega[i].mul(cfg.rot_damp);
+            let dq = quat_from_omega_dt(state.omega[i], cfg.dt);
+            state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
+        }
     }
 
-    // Save old positions for velocity update
+    // Save old positions and quaternions for velocity/omega update
     let pos_old = state.pos.clone();
+    let quat_old = if cfg.orient_mode == OrientMode::Dynamic { state.quat.clone() } else { Vec::new() };
 
     // (1) Predict: x_pred = x + v·dt
     //     pd_inertia=true: always predict (proper PD — carries momentum between outer steps)
@@ -1160,8 +1196,20 @@ pub fn step_position_based(
 
     // (3) Corrector: v = (x_new - x_old) / dt  (ALWAYS — not multiplied by cdamp)
     //     This is the key fix: velocity carries momentum from the position change.
+    //     For dynamic mode: ω = (q_new - q_old) / dt  (quaternion difference → angular velocity)
     for i in 0..np {
         state.vel[i] = (state.pos[i] - pos_old[i]) * (1.0 / cfg.dt);
+    }
+    if cfg.orient_mode == OrientMode::Dynamic && !quat_old.is_empty() {
+        for i in 0..np {
+            if topo.inv_inertia[i] <= 0.0 || topo.nport[i] == 0 { continue; }
+            // ω from quaternion difference: dq = q_new ⊗ q_old⁻¹ → ω = 2*imag(dq)/dt
+            let dq = quat_mul(state.quat[i], quat_conj(quat_old[i]));
+            // Ensure shortest path (w >= 0)
+            let (wx, wy, wz, ww) = if dq.w < 0.0 { (-dq.x, -dq.y, -dq.z, -dq.w) } else { (dq.x, dq.y, dq.z, dq.w) };
+            let _ = ww;
+            state.omega[i] = Vec3d::new(wx, wy, wz) * (2.0 / cfg.dt);
+        }
     }
 
     // (3b) Optional damping: v *= cdamp (cdamp=0 = kill velocity, cdamp=1 = no damping)
@@ -1172,23 +1220,22 @@ pub fn step_position_based(
         }
     }
 
-    // (3c) Optional velocity reset: when dot(v,F) < 0 (moving uphill), kill velocity.
-    //     Like FIRE/inertial-reset — prevents energy buildup in relaxation with full inertia.
-    if cfg.vel_reset {
-        let mut fapos = vec![VEC3D_ZERO; np];
-        let mut tau = vec![VEC3D_ZERO; np];
-        eval_port_forces(state, topo, &mut fapos, &mut tau);
-        let mut v_dot_f = 0.0f64;
-        for i in 0..np { v_dot_f += Vec3d::dot(state.vel[i], fapos[i]); }
-        if v_dot_f < 0.0 {
-            for i in 0..np { state.vel[i] = VEC3D_ZERO; }
-        }
-    }
-
-    // Report final energy
+    // (3c) Evaluate final residual once; reset translational and angular momentum when total
+    // generalized power v·F + ω·τ is negative.
     let mut fapos = vec![VEC3D_ZERO; np];
     let mut tau = vec![VEC3D_ZERO; np];
-    eval_port_forces(state, topo, &mut fapos, &mut tau)
+    let e = eval_port_forces(state, topo, &mut fapos, &mut tau);
+    if cfg.vel_reset {
+        let mut power = 0.0f64;
+        for i in 0..np {
+            power += Vec3d::dot(state.vel[i], fapos[i]);
+            if cfg.orient_mode == OrientMode::Dynamic { power += Vec3d::dot(state.omega[i], tau[i]); }
+        }
+        if power < 0.0 {
+            for i in 0..np { state.vel[i] = VEC3D_ZERO; state.omega[i] = VEC3D_ZERO; }
+        }
+    }
+    e
 }
 
 /// PBD with compliance (the original `step_xpbd` behavior, kept as a benchmark variant).
@@ -1346,101 +1393,86 @@ fn solve_projective_jacobi(
     nbcfg: &NbConfig, dt2: f64,
 ) {
     let np = topo.natoms;
-    let h2 = dt2;                       // H² = dt²
-    // Predicted/target positions y = current pos (predict already applied by caller).
+    assert!(dt2 > 0.0, "solve_projective_jacobi: dt² must be positive, got {dt2}");
+    assert!(cfg.xpbd_iters > 0, "solve_projective_jacobi: xpbd_iters must be positive");
+    let inv_h2 = 1.0 / dt2;
+    // Predicted target y and constant Jacobi diagonal A_ii = m_i/H² + Σ_owned k + Σ_incoming k.
     let y = state.pos.clone();
-    // Momentum buffer for heavy-ball: d_k = p_k - p_{k-1}. Starts at zero.
-    let mut momentum = vec![VEC3D_ZERO; np];
-    for iter in 0..cfg.xpbd_iters {
-        // Linearize r_arm from current quat (fixed during this sweep's Jacobi update).
-        // We compute new positions into a fresh buffer (Jacobi = simultaneous update).
-        let mut x_new = state.pos.clone();
-        for i in 0..np {
-            let mut a_ii = topo.mass[i] / h2;
-            let mut b = y[i] * (topo.mass[i] / h2);
-            // Ports owned by i: spring between tip_i = x_i + r_arm_i and x_j
-            let npi = topo.nport[i] as usize;
-            if npi > 0 {
-                let ns = topo.neighs[i].as_array();
-                let bs = topo.neigh_bs[i].as_array();
-                for s in 0..npi {
-                    let j = ns[s];
-                    if j < 0 { continue; }
-                    let ib = bs[s];
-                    if ib < 0 { continue; }
-                    let par = topo.bond_params[ib as usize];
-                    if par.k_p <= 0.0 { continue; }
-                    let r0 = topo.port_local[i * 4 + s] * par.l0;
-                    let r_arm = quat_rotate(state.quat[i], r0);
-                    a_ii += par.k_p;
-                    b.add_mul(state.pos[j as usize] - r_arm, par.k_p);
-                }
-            }
-            x_new[i] = b * (1.0 / a_ii);
+    let mut inv_diag: Vec<f64> = topo.mass.iter().map(|m| m * inv_h2).collect();
+    for i in 0..np {
+        let ns = topo.neighs[i].as_array();
+        let bs = topo.neigh_bs[i].as_array();
+        for s in 0..topo.nport[i] as usize {
+            let j = ns[s];
+            let ib = bs[s];
+            if j < 0 || ib < 0 { continue; }
+            let k = topo.bond_params[ib as usize].k_p;
+            if k <= 0.0 { continue; }
+            inv_diag[i] += k;
+            inv_diag[j as usize] += k;
         }
-        // Reverse pass: incoming port contributions (atom k's port points at j)
-        let mut a_diag = vec![0.0f64; np];
-        let mut b_incoming = vec![VEC3D_ZERO; np];
-        for k in 0..np {
-            let npk = topo.nport[k] as usize;
-            if npk == 0 { continue; }
-            let ns = topo.neighs[k].as_array();
-            let bs = topo.neigh_bs[k].as_array();
-            for s in 0..npk {
+    }
+    for a in &mut inv_diag { *a = 1.0 / *a; }
+
+    // Scratch allocated once per outer step and reused by all inner iterations.
+    let mut rhs = vec![VEC3D_ZERO; np];
+    let mut tau = vec![VEC3D_ZERO; np];       // torque accumulator (dynamic mode only)
+    let mut k_rot = vec![0.0f64; np];         // rotational stiffness diagonal (dynamic mode only)
+    let mut x_new = vec![VEC3D_ZERO; np];
+    let mut momentum = vec![VEC3D_ZERO; np];
+    let dynamic = cfg.orient_mode == OrientMode::Dynamic;
+    for iter in 0..cfg.xpbd_iters {
+        // --- ONE port traversal: accumulate translational RHS and rotational torque together ---
+        for i in 0..np { rhs[i] = y[i] * (topo.mass[i] * inv_h2); }
+        if dynamic { for t in tau.iter_mut() { *t = VEC3D_ZERO; } for k in k_rot.iter_mut() { *k = 0.0; } }
+        for i in 0..np {
+            let ns = topo.neighs[i].as_array();
+            let bs = topo.neigh_bs[i].as_array();
+            let npi = topo.nport[i] as usize;
+            if npi == 0 { continue; }
+            let qi = state.quat[i];
+            for s in 0..npi {
                 let j = ns[s];
-                if j < 0 { continue; }
                 let ib = bs[s];
-                if ib < 0 { continue; }
+                if j < 0 || ib < 0 { continue; }
                 let par = topo.bond_params[ib as usize];
                 if par.k_p <= 0.0 { continue; }
-                let r0 = topo.port_local[k * 4 + s] * par.l0;
-                let r_arm = quat_rotate(state.quat[k], r0);
-                a_diag[j as usize] += par.k_p;
-                b_incoming[j as usize].add_mul(state.pos[k] + r_arm, par.k_p);
-            }
-        }
-        // Recompute x_new with both owned + incoming port contributions
-        for i in 0..np {
-            let mut a_ii = topo.mass[i] / h2 + a_diag[i];
-            let mut b = y[i] * (topo.mass[i] / h2);
-            let npi = topo.nport[i] as usize;
-            if npi > 0 {
-                let ns = topo.neighs[i].as_array();
-                let bs = topo.neigh_bs[i].as_array();
-                for s in 0..npi {
-                    let j = ns[s];
-                    if j < 0 { continue; }
-                    let ib = bs[s];
-                    if ib < 0 { continue; }
-                    let par = topo.bond_params[ib as usize];
-                    if par.k_p <= 0.0 { continue; }
-                    let r0 = topo.port_local[i * 4 + s] * par.l0;
-                    let r_arm = quat_rotate(state.quat[i], r0);
-                    a_ii += par.k_p;
-                    b.add_mul(state.pos[j as usize] - r_arm, par.k_p);
+                let r_arm = quat_rotate(qi, topo.port_local[i * 4 + s] * par.l0);
+                rhs[i].add_mul(state.pos[j as usize] - r_arm, par.k_p);
+                rhs[j as usize].add_mul(state.pos[i] + r_arm, par.k_p);
+                if dynamic && topo.inv_inertia[i] > 0.0 {
+                    let e = state.pos[j as usize] - (state.pos[i] + r_arm);  // port residual
+                    tau[i].add_mul(Vec3d::cross(r_arm, e), par.k_p);
+                    k_rot[i] += par.k_p * r_arm.norm2();
                 }
             }
-            b.add(b_incoming[i]);
-            x_new[i] = b * (1.0 / a_ii);
         }
-        // Heavy-ball momentum: p_{k+1} = x_new + bmix * d_k
-        //   d_k = p_k - p_{k-1} (stored in momentum buffer)
-        //   bmix from SmartMixer: 0 for first bmix_istart iters, then bmix_end
-        //   bmix=0 on first and last iteration (clean start/stop)
+        // --- Update both translation and rotation (cheap; force accumulation was the expensive part) ---
+        for i in 0..np { x_new[i] = rhs[i] * inv_diag[i]; }
+        if dynamic {
+            for i in 0..np {
+                if topo.inv_inertia[i] <= 0.0 || topo.nport[i] == 0 { continue; }
+                // Rotational Jacobi: δθ = τ / (I/dt² + K_rot). Inertia term pulls toward prediction (q_pred).
+                let denom = topo.inv_inertia[i] * inv_h2 + k_rot[i] + 1e-12;
+                let dtheta = tau[i] * (1.0 / denom);
+                let dq = quat_from_omega_dt(dtheta, 1.0);
+                state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
+            }
+        }
+
+        // Heavy-ball momentum: p_{k+1} = x_new + bmix*d_k; first/last iterations are unmixed.
         let bmix = if iter == 0 || iter >= cfg.xpbd_iters - 1 { 0.0 }
                    else if iter < cfg.bmix_istart { cfg.bmix_start }
                    else if iter >= cfg.bmix_iend { cfg.bmix_end }
                    else { cfg.bmix_start + (cfg.bmix_end - cfg.bmix_start) *
                           (iter - cfg.bmix_istart) as f64 / (cfg.bmix_iend - cfg.bmix_istart) as f64 };
         for i in 0..np {
-            let p = x_new[i] + momentum[i] * bmix;  // p' + bmix*d
-            momentum[i] = p - state.pos[i];          // d_new = p_new - p_old
-            state.pos[i] = p;
+            let p = x_new[i] + momentum[i] * bmix;
+            momentum[i] = p - state.pos[i];
+            x_new[i] = p;
         }
-        // Adiabatic: re-solve rotations (r_arm changes) every sweep
-        if cfg.orient_mode == OrientMode::Adiabatic {
-            solve_all_rotations(state, topo);
-        }
+        std::mem::swap(&mut state.pos, &mut x_new);
+        if cfg.orient_mode == OrientMode::Adiabatic { solve_all_rotations(state, topo); }
     }
     // Collisions after the global sweeps (PD can't fold a changing active set into the prefactor)
     if nbcfg.enabled && nbcfg.k_coll > 0.0 {

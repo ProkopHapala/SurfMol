@@ -19,7 +19,7 @@
 //! and the worst contributor so the bug is locatable without re-running.
 
 use molff::raff::*;
-use numtypes::Vec3d;
+use numtypes::{Quat4d, Vec3d};
 
 fn nb_off() -> NbConfig { NbConfig { enabled: false, ..Default::default() } }
 
@@ -218,4 +218,94 @@ fn test_kabsch_invariants() {
     let r = kabsch_rmsd(&a, &d);
     assert!(r > 1e-6, "different config RMSD should be > 0, got {:.2e}", r);
     eprintln!("kabsch invariants OK (different-config RMSD = {:.4e})", r);
+}
+
+#[test]
+fn test_wahba_single_call_from_bad_orientation() {
+    let (mut s, topo) = make_ch4();
+    s.quat[0] = Quat4d::new(1.0, 0.0, 0.0, 0.0); // 180° about x: deliberately poor warm start
+    solve_all_rotations(&mut s, &topo);
+    let mut f = vec![Vec3d::new(0.0, 0.0, 0.0); s.natoms];
+    let mut tau = f.clone();
+    let e = eval_port_forces(&s, &topo, &mut f, &mut tau);
+    let tmax = tau.iter().map(|t| t.norm()).fold(0.0f64, f64::max);
+    eprintln!("Wahba bad-start diagnostic: E={:.6e} max|tau|={:.6e}", e, tmax);
+    assert!(e < 1e-10 && tmax < 1e-8, "one Wahba solve did not recover equilibrium from a poor quaternion: E={:.3e}, max|tau|={:.3e}", e, tmax);
+}
+
+#[test]
+fn test_projective_dynamic_orientation_carries_omega() {
+    let (state, topo) = make_ch4();
+    let mut s = perturb(&state);
+    let q0 = s.quat[0];
+    let cfg = RaffConfig { orient_mode: OrientMode::Dynamic, dyn_mode: DynMode::Xpbd, pos_solver: PosSolver::Projective,
+        dt: 0.001, cdamp: 1.0, rot_damp: 1.0, flim: 0.0, xpbd_iters: 1, xpbd_over_relax: 1.0,
+        pd_inertia: true, vel_reset: false, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 0, bmix_iend: 1 };
+    let e = step_position_based(&mut s, &topo, &cfg, &nb_off());
+    let w = s.omega[0].norm();
+    let dq = ((s.quat[0].x-q0.x).powi(2) + (s.quat[0].y-q0.y).powi(2) + (s.quat[0].z-q0.z).powi(2) + (s.quat[0].w-q0.w).powi(2)).sqrt();
+    eprintln!("Projective dynamic rotation diagnostic: E={:.6e} |omega_0|={:.6e} |dq_0|={:.6e}", e, w, dq);
+    assert!(e.is_finite() && w > 1e-12 && dq > 1e-12, "Projective dynamic orientation did not advance torque/omega state: E={e}, |omega|={w}, |dq|={dq}");
+}
+
+#[test]
+fn test_pd_dynamic_inner_rotation_converges() {
+    // Dynamic PD with inner-loop rotational Jacobi: translation and rotation updated together
+    // each inner iteration. Converges at dt=0.1 (where outer-only dynamic diverged).
+    let (state, topo) = make_ch4();
+    let mut s = perturb(&state);
+    let cfg = RaffConfig { orient_mode: OrientMode::Dynamic, dyn_mode: DynMode::Xpbd, pos_solver: PosSolver::Projective,
+        dt: 0.1, cdamp: 1.0, rot_damp: 1.0, flim: 0.0, xpbd_iters: 4, xpbd_over_relax: 1.0,
+        pd_inertia: true, vel_reset: true, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 1, bmix_iend: 2 };
+    let mut e_last = f64::INFINITY;
+    let mut max_f = f64::INFINITY;
+    let n = s.natoms;
+    let mut fapos = vec![Vec3d::new(0.0,0.0,0.0); n];
+    let mut tau = vec![Vec3d::new(0.0,0.0,0.0); n];
+    for _ in 0..2000 {
+        e_last = step_position_based(&mut s, &topo, &cfg, &nb_off());
+        eval_port_forces(&s, &topo, &mut fapos, &mut tau);
+        max_f = 0.0;
+        for f in &fapos { max_f = max_f.max(f.norm()); }
+        if max_f < 1e-3 { break; }
+    }
+    eprintln!("Dynamic PD with inner rotation (dt=0.1, i4): E={:.6e} max|F|={:.6e}", e_last, max_f);
+    assert!(e_last.is_finite() && max_f < 0.1, "Dynamic PD with inner rotation did not converge at dt=0.1: E={:.3e}, max|F|={:.3e}", e_last, max_f);
+}
+
+#[test]
+fn test_pd_outer_inertia_retains_velocity() {
+    let topo = RaffTopology::new(1);
+    let mut s = RaffState::new(1);
+    s.vel[0] = Vec3d::new(2.0, -1.0, 0.5);
+    let cfg = RaffConfig { orient_mode: OrientMode::Adiabatic, dyn_mode: DynMode::Xpbd, pos_solver: PosSolver::Projective,
+        dt: 0.1, cdamp: 1.0, rot_damp: 1.0, flim: 0.0, xpbd_iters: 1, xpbd_over_relax: 1.0,
+        pd_inertia: true, vel_reset: false, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 0, bmix_iend: 1 };
+    step_position_based(&mut s, &topo, &cfg, &nb_off());
+    step_position_based(&mut s, &topo, &cfg, &nb_off());
+    let p_ref = Vec3d::new(0.4, -0.2, 0.1);
+    let dp = (s.pos[0] - p_ref).norm();
+    let dv = (s.vel[0] - Vec3d::new(2.0, -1.0, 0.5)).norm();
+    eprintln!("PD inertia diagnostic: pos=({:.6},{:.6},{:.6}) |pos-ref|={:.3e} |vel-ref|={:.3e}", s.pos[0].x, s.pos[0].y, s.pos[0].z, dp, dv);
+    assert!(dp < 1e-12 && dv < 1e-12, "PD outer loop did not preserve unconstrained inertial motion: dp={:.3e}, dv={:.3e}", dp, dv);
+}
+
+#[test]
+fn test_pd_i4_heavy_ball_is_active() {
+    let (state, topo) = make_ch4();
+    let mut s0 = perturb(&state);
+    let mut sh = s0.clone();
+    solve_all_rotations(&mut s0, &topo);
+    solve_all_rotations(&mut sh, &topo);
+    let base = RaffConfig { orient_mode: OrientMode::Adiabatic, dyn_mode: DynMode::Xpbd, pos_solver: PosSolver::Projective,
+        dt: 0.2, cdamp: 0.0, rot_damp: 0.0, flim: 0.0, xpbd_iters: 4, xpbd_over_relax: 1.0,
+        pd_inertia: false, vel_reset: false, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 1, bmix_iend: 2 };
+    let accelerated = RaffConfig { bmix_start: 0.75, bmix_end: 0.75, ..base };
+    step_position_based(&mut s0, &topo, &base, &nb_off());
+    step_position_based(&mut sh, &topo, &accelerated, &nb_off());
+    let mut dx2 = 0.0;
+    for i in 0..s0.natoms { dx2 += (sh.pos[i] - s0.pos[i]).norm2(); }
+    let dx = dx2.sqrt();
+    eprintln!("PD heavy-ball schedule diagnostic: |x_hb-x_plain|={:.6e}", dx);
+    assert!(dx > 1e-10, "i4 heavy-ball schedule was inactive: |x_hb-x_plain|={:.3e}", dx);
 }
