@@ -336,11 +336,20 @@ Reset `Δx_prev` at the start of each physics time step.
 
 ### 3.3 Projective Dynamics (PD)
 
+> **⚠ Critical architectural note (2026-08-28):** PD is NOT just iterative constraint projection. It has a **two-loop structure**:
+> - **Outer loop** (nonlinear, inertial): `x_pred = x + v·dt + F_ext·dt²/m` → solve → `v = (x_new - x)/dt`. This carries real dynamics between steps. The linear sub-steps alone cannot solve nonlinear problems (rotations, dihedral torsions) — the outer loop with real dynamics is necessary for global convergence.
+> - **Inner loop** (linear, fast): Jacobi/Gauss-Seidel on the prefactored PD matrix `A = M/dt² + L`. Typically only **1-2 inner iterations** per outer step. The inner loop is a local smoother — much cheaper than force-based because it doesn't evaluate costly O(n²) long-range interactions (Coulomb, PME).
+> - **Heavy-ball momentum** in the inner loop: `p_{k+1} = p'_k + bmix·d_k` where `d_k = p_k - p_{k-1}`. FireCore's `SmartMixer` ramps bmix from 0 (first 3 iters) to 0.75 (after). This dramatically accelerates the linear solver convergence.
+>
+> **Current SurfMol bug:** `step_xpbd` skips the predict step when `cdamp=0` and sets velocity to zero — so our "PD" is just plain constraint projection with no inertia and no heavy-ball momentum. See labbook `2026-08-28_raff_solver_optimization.md` Session 2. Reference: FireCore `ProjectiveDynamics_d::run_LinSolve` (line 686-801) + `updateIterativeMomentum` (line 461-503).
+
 Energy minimization formulation (`ProjectiveDynamics_d.h`; `RRsp3_momentum_design.md` §2.2):
 
 $$
 E(x) = \frac{1}{2 \, dt^2} (x - y)^T M (x - y) + \sum_c W_c(x)
 $$
+
+where `y = x^n + v^n·dt + F_ext·dt²/m` is the **inertial prediction** (NOT just `x^n`). This is the key — the `M/dt²` anchor term provides implicit-Euler inertia.
 
 **Linearized solve:**
 $$
@@ -350,7 +359,18 @@ $$
 where `L` is the Laplacian of the constraint stiffness matrix. Solved via:
 - **Cholesky** (exact, expensive)
 - **Jacobi** (diagonal, cheap, iterative)
-- **Jacobi + momentum** (heavy-ball acceleration)
+- **Jacobi + heavy-ball momentum** (accelerated: `p_{k+1} = p'_k + bmix·d_k`, bmix 0→0.75)
+
+**Outer loop (run_LinSolve):**
+$$
+y_i = x_i^n + v_i^n \cdot dt + F_i^{ext} \cdot \frac{dt^2}{m_i} \quad \text{(predict)}
+$$
+$$
+x^{n+1} = \text{solve}(A, b(y)) \quad \text{(inner linear solve, 1-2 iters)}
+$$
+$$
+v^{n+1} = \frac{x^{n+1} - x^n}{dt} \quad \text{(corrector — always, not multiplied by cdamp)}
+$$
 
 > **Corrected 2026-08-28 (PD characterization):** The previous version characterized PD as essentially "linear constraints only." This is too narrow. PD supports **nonlinear geometric constraints** through nonlinear **local projections** — what is fixed is the global step's quadratic structure, not the constraints. The original Bouaziz et al. 2014 paper explicitly describes nonlinear constraint manifolds and local projection followed by a global quadratic compromise. Dynamic collisions are awkward mainly because the active contact set changes, destroying the pre-factored global system — not because PD fundamentally requires linear constraints.
 
@@ -927,3 +947,77 @@ Then XPBD, PD, VBD, analytical rotations, and the short-range split are all diff
 | **Plot `U, U', U''` for every nonbonded split** | Immediately exposes bad stiffness splits |
 
 > **The last diagnostic is especially important.** Looking only at `U(r)` can make two potentials look similar while their timestep behavior differs dramatically. For this project, **`U''(r)` may be the most important plot.**
+
+### 11.8 Distortion types for relaxation benchmarks
+
+The initial geometry perturbation determines **which mode of the Hessian** the
+optimizer must dissipate. Different distortions probe different failure modes.
+A solver that relaxes random noise quickly may stall on a low-frequency stretch
+— the benchmark must cover both.
+
+#### Three distortion classes
+
+**D1 — Random displacement (high-frequency white noise).**
+Each atom gets an independent random displacement ~0.1-0.3 Å. This excites the
+**high-frequency end** of the vibrational spectrum (bond stretches, angle
+bends). Most optimizers relax this well: the stiff modes have large gradients
+and the Newton/XPBD local solve captures them directly. **Easy case** — if a
+solver fails here, it is fundamentally broken.
+
+**D2 — Uniaxial stretch along the long axis (low-frequency, pathological).**
+Scale the molecule along its principal axis (PCA longest component) by 1.2-1.5×.
+This excites the **lowest-frequency acoustic mode** — a collective, nearly
+zero-curvature deformation. The optimizer must propagate information across the
+entire molecule to relax it. This is the **long-narrow-valley pathology**
+(continuous analogue of the Rosenbrock function): the gradient is small along
+the valley floor and the Hessian is ill-conditioned (λ_max/λ_min ≫ 1).
+Traditional local solvers (force-MD, Gauss-Seidel XPBD) converge slowly here
+because each step only fixes local bonds, and the global compression must
+diffuse atom-by-atom. **This is the pathological case that motivates
+multi-grid / coarse-to-fine strategies.** Projective Dynamics' global solve
+should handle this better than Gauss-Seidel XPBD — the benchmark must verify.
+
+**D3 — Soft degrees of freedom (near-zero curvature).**
+Two sub-cases:
+
+  - **D3a — Dihedral rotation (e.g. H2O2).** The O-O bond has a torsional
+    barrier but the curvature at the minimum is very low. The port model alone
+    (bond constraints) does NOT constrain the dihedral — it is a genuine free
+    DOF unless an explicit torsion term is added. H2O2 is the minimal test case:
+    4 atoms, one dihedral, well-studied equilibrium (~111° HOOH torsion).
+    **Without an explicit dihedral term, all solvers reach E≈0 at any dihedral**
+    — the benchmark documents this null space, same as chain4.
+
+  - **D3b — Non-covalent assembly (e.g. benzoic acid dimer).** Two monomers
+    held by hydrogen bonds. Requires either explicit electron-pair sites
+    (sigma-hole + lone pair) or at minimum atom-atom electrostatics + LJ.
+    The RAFF port model only covers covalent bonds; non-bonded interactions
+    (`eval_nonbonded`) must be enabled. **Not yet benchmarkable** — H-bond
+    directionality needs the electron-pair site system (roadmap Phase 2c).
+    The `benzoicacid_dimer.xyz` file (30 atoms, 2 H-bonds) is staged for this.
+
+#### Two convergence targets
+
+**T1 — Accurate convergence.** Residual geometry RMSD < 0.0001 Å, or
+max|F| < 0.001 meV/Å (~1.6e-5 eV/Å). Required for final geometry output,
+frequency analysis, and any downstream QM calculation. All solvers must reach
+this eventually — the question is **how many soft evaluations** it costs.
+
+**T2 — Rough geometry, fast.** Residual RMSD < 0.05 Å, or max|F| < 0.1 eV/Å.
+This is the target for **interactive pre-optimization** (user drags an atom,
+the structure snaps to a reasonable shape in <100 ms) and for **global
+relaxation** inside a larger optimization loop (basin hopping, simulated
+annealing) where many candidate geometries are evaluated and only the promising
+ones are refined to T1. **Currently the higher-priority target.** The benchmark
+must report steps-to-T2 separately from steps-to-T1, because a solver that
+reaches T2 in 10 steps but T1 in 10000 may be the right choice for interactive
+use even if another solver reaches T1 in 500.
+
+#### What the benchmark must report
+
+Per solver × distortion × molecule:
+  - **Convergence curve**: residual RMSD (log-scale) vs macrostep / soft-eval count
+  - **Force curve**: max|F| (log-scale) vs macrostep / soft-eval count
+  - **Steps-to-T2** (rough) and **steps-to-T1** (accurate) — both, separately
+  - **`N_soft`** (soft evaluations) — the cross-solver performance objective
+  - **`t_wall`** — single-thread wall time (CPU reference for GPU port)

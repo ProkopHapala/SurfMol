@@ -60,8 +60,19 @@ See [`/doc/topical_audit/raff.md`](/doc/topical_audit/raff.md) for the full cros
 - [x] Editor port rendering synced with RAFF quaternions (`topo.port_tip(state, i, s)`)
 - [x] Camera orthographic projection fix (column-major `view_proj` matrix in `trackball.rs`)
 - [x] Default damping (0.1) and per_frame (20) for `--raff` mode
+- [x] **All 3 position-based solver variants** (Axis 2) — `PosSolver::{PbdCompliance, Xpbd, Projective}` selectable via `RaffConfig.pos_solver`. `step_position_based` dispatcher; `step_xpbd` kept as PbdCompliance wrapper. True XPBD has lagged `λ_acc`; Projective Dynamics uses Jacobi global solve with linearized `r_arm`. (2026-08-28)
+- [x] **Convergence-to-same-geometry test** (Q2a) — `tests/test_raff_convergence.rs`: force-MD + all 3 position-based solvers relax to the same geometry (Kabsch RMSD < 1e-3 vs exact input reference). 4 tests, all passing. Documents the chain4 dihedral null space. (2026-08-28)
+- [x] **Kabsch rigid-body alignment** (`kabsch_rmsd`) — optimal rotation RMSD for comparing solver outputs invariant to translation/rotation drift. (2026-08-28)
+- [x] **Parameter-sweep benchmark binary** (Q2b) — `src/bin/raff_bench.rs`: sweeps `{dt, iters, over_relax}` × `{PBD, XPBD, Projective}` × `{ForceMD}` on CH4/water/tree-20/tree-100. Reports `n_steps`, `n_port_evals`, `t_wall_us` (single-thread). First results: PBD-compliance fastest (7-31 macrosteps with over-relax), XPBD/Projective ~3-10x more iterations but stable everywhere; Force-MD 100-1000x slower. PBD diverges at dt=0.1+or=1.9. (2026-08-28)
 
 **TODO (remaining):**
+- [ ] **Wire position-based solvers to editor** — `do_raff_step` currently inlines force-MD only; add `PosSolver` selector to GUI + dispatch to `step_position_based`. (Q2b follow-up)
+- [ ] **Benchmark: non-bonded split + position-based** — once split-collision (Phase 2b) is implemented, re-run `raff_bench` with non-bonded enabled to measure the IMEX proximal split (theory doc §11).
+- [ ] **Benchmark: `H_max` stability map** — theory doc §11.5/§11.7 calls for `H_max` (max stable macrostep) per solver, not just steps-to-tolerance. Add to `raff_bench`.
+- [ ] **Benchmark: `U''(r)` plot for non-bonded splits** — theory doc §11.7 "most important plot". Add a plotting utility (Phase 2).
+- [ ] **Benchmark: distortion types (D1/D2/D3)** — theory doc §11.8. Three distortion classes: (D1) random displacement [done], (D2) uniaxial stretch along PCA long axis [done] — the long-narrow-valley / Rosenbrock pathology that motivates multi-grid, (D3a) dihedral soft DOF (H2O2) [done], (D3b) non-covalent assembly (benzoic acid dimer) [blocked on H-bond/electron-pair system, Phase 2c]. The benchmark must cover D1+D2+D3a; D3b is staged.
+- [ ] **Benchmark: two convergence targets (T1/T2)** — theory doc §11.8. T1 = accurate (RMSD < 0.0001 Å, max|F| < 0.001 meV/Å). T2 = rough/interactive (RMSD < 0.05 Å, max|F| < 0.1 eV/Å). Report steps-to-T2 and steps-to-T1 separately. **T2 is the higher-priority target** (interactive pre-opt + global relaxation). [done]
+- [ ] **Benchmark: convergence + force curves (log-scale plots)** — residual RMSD and max|F| vs macrostep/soft-eval count, log-scale, per solver × distortion × molecule. PNG plots in `debug/raff_bench/`. [done]
 - [ ] Polar decomposition rotation solver (Newton–Schulz, `RRsp3.cl:1089`)
 - [ ] Newton-in-ω rotation solver (`RRsp3.cl:916`)
 - [ ] Central-force recoil for analytical rotation (conserve `L_trans`)
@@ -74,7 +85,6 @@ See [`/doc/topical_audit/raff.md`](/doc/topical_audit/raff.md) for the full cros
 - [ ] **Per-type port reindexing** — `set_port_geometry_from_types` uses idealized sp2/sp3 directions, but `build_neighs_from_bonds` assigns ports in bond-list order, causing geometrically inconsistent port-to-neighbor pairing. Fix: add `reindex_ports_by_direction` that permutes neighbor slots to match idealized port directions. Per-atom ARAP (`set_port_geometry_from_reference`) is the current workaround/default. See `raff_theory_equations.md` §1.4.
 - [ ] Capping atoms as rigid appendix (H = host_pos + host_quat · port · l_H)
 - [ ] Electron-pair / sigma-hole site system
-- [ ] Projective dynamics wiring to editor + end-to-end test
 - [ ] Side-by-side forcefield comparison mode in editor
 - [ ] Energy/momentum HUD in editor (E_pot, E_kin, |P|, |L| real-time)
 - [x] **AABB broad-phase collision** (per-cluster AABB cull → narrow phase) — `spacc::broad_phase_pairs`, `molff::BroadPhase`, `eval_broad`/`eval_nonbonded_broad`, editor `--nmols`/`--layout`/`--show-aabb`. Parity tests pass.
@@ -169,7 +179,11 @@ These are the **independent axes** we want to test combinations of. The architec
 - [x] XPBD impulse: `λ = −C / (α + invM_i + invM_j + w_ang)`, where `w_ang = |r×n|²·invI`.
 - [x] Apply `dpos_i += λ·invM_i·n`, `dpos_j -= λ·invM_j·n`, `dθ_i += (r×(λ·n))·invI`.
 - [x] Velocity update from position delta (XPBD standard).
-- [x] Collision solver (`solve_collisions`). → **Done in `raff.rs:step_xpbd`.**
+- [x] Collision solver (`solve_collisions`). → **Done in `raff.rs:step_xpbd` (PbdCompliance variant).**
+- [x] **True XPBD with lagged `λ_acc`** (Macklin 2016) — `PosSolver::Xpbd` in `solve_xpbd_lagged`. Stiffness-independent convergence. (2026-08-28)
+- [x] **Projective Dynamics (Jacobi)** — `PosSolver::Projective` in `solve_projective_jacobi`. Nonlinear local projection + fixed global quadratic step. (2026-08-28)
+- [x] **Convergence-to-same-geometry test** — all 3 position-based variants + force-MD reach the same geometry (Kabsch RMSD < 1e-3). `tests/test_raff_convergence.rs`. (2026-08-28)
+- [x] **Parameter-sweep benchmark** — `src/bin/raff_bench.rs`: steps/evals/wall-time per solver × params. First results show PBD-compliance fastest (with over-relax), XPBD/Projective more stable, Force-MD 100-1000x slower. (2026-08-28)
 
 **1c. Analytical + Force MD** — implement central-force recoil + memoryless rotation:
 - [ ] Eval port spring force along **center–center line** `n = (x_j − x_i)/|...|` (not tip→atom), to conserve `L_trans`. **TODO — current force uses tip→atom, violates L_trans for analytical.**

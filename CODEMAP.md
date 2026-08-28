@@ -163,7 +163,7 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | `src/aabb.rs` | 155 | `fit_aabb(pos, ids)`, `fit_group_aabbs(pos, RaggedIndex, out)`, `fit_range_aabbs(pos, ranges, out)`. **`broad_phase_pairs(cluster_aabbs, margin)`** — O(N²) over clusters, returns overlapping `(i,j)` pairs. **`aabb_edges(bb)`** — 12 edge segments for line rendering. Uses `numtypes::Aabb3d` and `numtypes::RaggedIndex`. |
 | `src/buckets.rs` | 95 | `Buckets` — spatial hashing via count→prefix→scatter (FireCore `Buckets.h` pattern). `build(cell_of_obj)`; `cell_objects(c)`. Single `counts` buffer doubles as cursor; no extra allocation during rebuild. |
 
-### `molff` (`crates/libs/molff/`, 2500 LOC)
+### `molff` (`crates/libs/molff/`, 2900 LOC)
 *Intra-molecular forcefields. See `notes/designs/` for forcefield data ownership. See `/doc/topical_audit/raff.md` for RAFF cross-implementation map and `/doc/topical_audit/spatial_acceleration.md` for broad-phase collision.*
 
 | File | LOC | Contents |
@@ -172,9 +172,11 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | `src/uff.rs` | 665 | `Uff` — bonded forcefield. `Buckets` (spatial partition for force assembly). SoA `AlignedVec` arrays. `eval_atom_bonds()`, `eval_angle_prokop()`, `eval_dihedral_prokop()` (Fourier series via `Vec2d::mul_cmplx`). |
 | `src/nonbonded.rs` | 400 | `NonBondedFF` — LJ + Coulomb + H-bond. `reqs`, `plqs`, `make_second_neighs()` (1-2 + 1-3 exclusion), `make_pbc_shifts()`. `eval()` / `eval_pbc()` — O(N²) with exclusion skip. **`BroadPhase`** struct (cluster ranges + AABB cache + rcut). **`eval_broad()`** — AABB-culled eval, identical results to `eval()`. |
 | `src/rigid_sp3.rs` | 237 | `RigidSp3FF` — **legacy** port-based rigid body FF (single variant: Dynamic+ForceMD). Superseded by `raff.rs`. |
-| `src/raff.rs` | 1200 | **RAFF** — multi-variant port-based rigid-atom FF. `RaffTopology`/`RaffState`/`RaffConfig`/`NbConfig`. Port forces, Wahba/Horn rotation solver, `step_force_md`, `step_xpbd`, `step_proximal`, `solve_collisions`, `eval_nonbonded`, **`eval_nonbonded_broad`**, FD checks. See `/doc/topical_audit/raff.md`. |
+| `src/raff.rs` | 1500 | **RAFF** — multi-variant port-based rigid-atom FF. `RaffTopology`/`RaffState`/`RaffConfig`/`NbConfig`/`PosSolver`. Port forces, Wahba/Horn rotation solver, `step_force_md`, `step_position_based` (dispatches to `PbdCompliance`/`Xpbd`/`Projective`), `step_proximal`, `solve_collisions`, `eval_nonbonded`, **`eval_nonbonded_broad`**, `kabsch_rmsd`, FD checks. See `/doc/topical_audit/raff.md`. |
+| `src/bin/raff_bench.rs` | 185 | **Benchmark binary** — parameter sweep of all 3 position-based solvers + force-MD. Reports n_steps, n_port_evals, t_wall_us. Run: `cargo run --release -p molff --bin raff_bench`. |
 | `tests/test_rigid_sp3.rs` | 110 | Tetrahedral sp3 center (CH4-like) + water test. |
 | `tests/test_raff.rs` | 607 | 22 tests: port forces, rotation convergence, energy/momentum conservation, XPBD constraints, collisions, adiabatic torque residual. All passing. |
+| `tests/test_raff_convergence.rs` | 216 | 4 tests: force-MD + all 3 position-based solvers converge to same geometry (Kabsch RMSD < 1e-3). Kabsch invariants. chain4 dihedral null space. All passing. |
 | `tests/test_broad_phase.rs` | 177 | **3 parity tests**: broad-phase vs O(N²) for `NonBondedFF::eval_broad` and `raff::eval_nonbonded_broad`. Near/far molecule configurations. All passing. |
 
 ### `surfff` (`crates/libs/surfff/`, 512 LOC)
@@ -328,7 +330,7 @@ cargo clippy --workspace                 # lints
 | `Params` | moltopo | Loaded FF parameter tables |
 | `Uff` | molff | Bonded FF: SoA arrays, Buckets force assembly, hneigh |
 | `RigidSp3FF` | molff | **Legacy** port-based rigid body: quat, omega, tau. Single variant (Dynamic+ForceMD). |
-| `RAFF` | molff | **Multi-variant** port-based rigid-atom FF: `RaffTopology`/`RaffState`, port forces, Wahba/Horn rotation, `step_force_md`/`step_xpbd`/`step_proximal`, `eval_nonbonded`, `solve_collisions`. 22 tests. See `/doc/topical_audit/raff.md`. |
+| `RAFF` | molff | **Multi-variant** port-based rigid-atom FF: `RaffTopology`/`RaffState`/`PosSolver`, port forces, Wahba/Horn rotation, `step_force_md`/`step_position_based` (PBD/XPBD/Projective)/`step_proximal`, `eval_nonbonded`, `solve_collisions`, `kabsch_rmsd`. 26 tests + benchmark binary. See `/doc/topical_audit/raff.md`. |
 | `NonBondedFF` | molff | LJ+Coulomb+Hbond: reqs, plqs, excl, PBC shifts. `eval_broad()` for AABB-culled eval. |
 | `BroadPhase` | molff | Per-cluster AABB broad-phase collision: cluster ranges + rebuildable AABB cache + rcut. Used by `eval_broad` / `eval_nonbonded_broad`. |
 | `SurfaceFolded` | surfff | Separable Fourier basis surface potential |

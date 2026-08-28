@@ -29,6 +29,7 @@ tmp/
 *.svg
 *.csv
 
-# Debug/diagnostic plots (gitignored) — but keep the folder README
+# Debug/diagnostic plots (gitignored) — but keep folder READMEs
 debug/*
 !debug/README.md
+!debug/raff_bench/README.md

@@ -19,7 +19,7 @@ See [`/notes/tasks/2026-08-28_roadmap_port_based_rigid_ff.md`](/notes/tasks/2026
 | Axis | Variants | SurfMol status |
 |---|---|---|
 | **1. Rotation solver** | Dynamic DOF (omega+tau+I) · Analytical (polar/eigen/newton) | Dynamic: **done** (`raff.rs` step_force_md). Analytical: **done** (`solve_rotation_wahba` — Horn quaternion eigen, used in Adiabatic mode). Polar + Newton: **not ported**. |
-| **2. Dynamics strategy** | Force-MD (symplectic Euler) · XPBD · Projective (Jacobi) | Force-MD: **done** (`step_force_md`). XPBD: **done** (`step_xpbd`). Projective: **stub** (`step_proximal`, not wired to editor). |
+| **2. Dynamics strategy** | Force-MD (symplectic Euler) · XPBD · Projective (Jacobi) | Force-MD: **done** (`step_force_md`). All 3 position-based variants **done**: `PosSolver::{PbdCompliance, Xpbd, Projective}` via `step_position_based` dispatcher. PBD-compliance = original `step_xpbd` (no lagged λ). True XPBD = lagged `λ_acc` (Macklin 2016). Projective = Jacobi global solve, linearized `r_arm`. **Convergence test passes** (all reach same geometry, Kabsch RMSD < 1e-3). **Benchmark binary** `raff_bench` measures steps/evals/wall-time. Not wired to editor yet. |
 | **3. Non-bonded model** | Full Morse+Coulomb · Compact-exp · Split-collision (3 sub-variants) | LJ+Coulomb: **done** (`eval_nonbonded`). Morse: **not ported**. Compact-exp: **not ported**. Split-collision: **not ported**. |
 | **4. GPU layout** | One-WG-per-body · Cluster-sorted · LFF-Jacobi · per-bond · single-WG | **Not started** — CPU reference authoritative first. |
 
@@ -36,6 +36,8 @@ See [`/notes/tasks/2026-08-28_roadmap_port_based_rigid_ff.md`](/notes/tasks/2026
 | **Collision solver (XPBD)** | `raff.rs:723` | — | **active** | `solve_collisions`: Jacobi sphere-sphere XPBD constraint, positional correction. |
 | **Finite-difference checks** | `raff.rs:907–1042` | — | **active** | `fd_check_forces`, `fd_check_torques`, `check_translation_invariance`, `check_rotation_invariance`, `check_adiabatic_torque_residual` — diagnostic tests, not pass/fail. |
 | **Tests** | `crates/libs/molff/tests/test_raff.rs` | 607 | **active** | 22 tests: port force parity, rotation solver convergence, energy conservation, momentum conservation, XPBD constraint satisfaction, collision resolution, adiabatic torque residual. All passing. |
+| **Convergence + Kabsch tests** | `crates/libs/molff/tests/test_raff_convergence.rs` | 216 | **active** | 4 tests: force-MD + all 3 position-based solvers converge to same geometry (Kabsch RMSD < 1e-3 vs exact input reference). Kabsch invariants (identity/translate/rotate → 0). chain4 dihedral null space documented. All passing. (2026-08-28) |
+| **Benchmark binary** | `crates/libs/molff/src/bin/raff_bench.rs` | 185 | **active** | Parameter sweep: `{dt, iters, over_relax}` × `{PBD, XPBD, Projective, ForceMD}` on CH4/water/tree-20/tree-100. Reports `n_steps`, `n_port_evals`, `t_wall_us` (single-thread). Run: `cargo run --release -p molff --bin raff_bench`. (2026-08-28) |
 | **Broad-phase parity tests** | `crates/libs/molff/tests/test_broad_phase.rs` | 177 | **active** | 3 tests: `eval_broad` vs `eval` (NonBondedFF), far molecules (0 BP pairs), `eval_nonbonded_broad` vs `eval_nonbonded` (RAFF). All passing. |
 | **Benzene diagnostic** | `crates/libs/molff/tests/test_benzene_diag.rs` | 178 | **active** | Regression test: per-atom ARAP port geometry gives E_port=0 and stable benzene structure. Documents the bug where idealized sp2 ports caused geometrically inconsistent port-to-neighbor assignment. |
 | **Editor integration** | `crates/apps/editor/src/main.rs` | 1600 | **active** | `BondedFFMode::Raff` in `MolWorld`. `do_raff_step()` runs per-frame relaxation with spring drag, 2D constraint, port sync. GUI panel for RAFF settings. CLI flags `--raff`, `--2d`, `--atom-scale`, `--nmols`, `--layout`, `--show-aabb`. Uses `set_port_geometry_from_reference` (per-atom ARAP). |
@@ -72,7 +74,9 @@ See [`/notes/tasks/2026-08-28_roadmap_port_based_rigid_ff.md`](/notes/tasks/2026
 | SurfMol `eval_port_forces` vs analytical | **yes** | 1e-10 | `test_raff.rs::test_port_force_*` |
 | SurfMol `solve_rotation_wahba` vs FD gradient | **yes** | 1e-6 | `test_raff.rs::test_adiabatic_torque_residual` |
 | SurfMol `step_force_md` energy conservation | **yes** | <1e-4 drift / 1000 steps | `test_raff.rs::test_force_md_energy_conservation` |
-| SurfMol `step_xpbd` constraint satisfaction | **yes** | <1e-8 | `test_raff.rs::test_xpbd_convergence` |
+| SurfMol `step_xpbd` constraint satisfaction | **yes** | <1e-8 | `test_raff.rs::test_xpbd_converges_ch4` |
+| SurfMol all position-based solvers → same geometry | **yes** | Kabsch RMSD < 1e-3 | `test_raff_convergence.rs::test_same_geometry_{ch4,water}` |
+| SurfMol position-based vs force-MD geometry parity | **yes** | Kabsch RMSD < 1e-3 | `test_raff_convergence.rs` (all 3 PosSolver variants vs ForceMD, CH4+water) |
 | SurfMol `get_force_spring_ray` vs FireCore | **yes** (by construction) | exact | Same formula: `-dp_perp * k` |
 | SurfMol vs FireCore `RARFF_SR.h::pairEF` | **no** | 1e-3 rel | **TODO** — needs Morse port first |
 | SurfMol vs SPAMMM `compact_exp_pair_EF` | **no** | 1e-3 | **TODO** — needs compact-exp port |
@@ -82,7 +86,8 @@ See [`/notes/tasks/2026-08-28_roadmap_port_based_rigid_ff.md`](/notes/tasks/2026
 
 - [ ] **Polar decomposition rotation solver** (Axis 1b-i): port Newton–Schulz `R ← ½R(3I−RᵀR)` from `RRsp3.cl:1089`. Currently only Horn eigen is implemented.
 - [ ] **Newton-in-ω rotation solver** (Axis 1b-iii): port from `RRsp3.cl:916`. Local 3×3 Hessian solve.
-- [ ] **Projective Dynamics wiring** (Axis 2c): `step_proximal` exists but is not wired to the editor or tested end-to-end.
+- [ ] **Projective Dynamics wiring** (Axis 2c): `step_proximal` (the IMEX stub) exists but is not wired to the editor. The real Projective Dynamics solver is now `PosSolver::Projective` in `solve_projective_jacobi` (tested + benchmarked); `step_proximal` should either be removed or refactored to call `step_position_based` with `PosSolver::Projective`.
+- [ ] **Position-based solvers not wired to editor**: `do_raff_step` inlines force-MD only. Need GUI selector for `PosSolver` + dispatch to `step_position_based`.
 - [ ] **Morse non-bonded** (Axis 3a): add `Morse(D_e, a, r0)` to `eval_nonbonded` as physics reference.
 - [ ] **Compact-exp non-bonded** (Axis 3a'): port `compact_exp_pair_EF` from SPAMMM — the production model.
 - [ ] **Split-collision** (Axis 3b): implement 3 sub-variants (piecewise quadratic, hard contact + erf/erfc, compact-exp split). Required for stable XPBD with non-bonded.
