@@ -250,6 +250,7 @@ Default non-covalent parameters for capping H and generic atoms. Port to `moltop
 | **UFF kernels** | `kernels/UFF.cl` (`evalBondsAndHNeigh_UFF`, `evalAngles_UFF`, `evalDihedrals_UFF`, `evalInversions_UFF`, `assembleForces_UFF`) | Harmonic bonds + hneigh vectors reused by angles/dihedrals. |
 | **SPFF kernels** | `kernels/SPFF.cl` (`getSPFFf4`, `updateAtomsSPFFf4`, `relax_nsteps_serial`) | Bonds, angles, π-orbital DOFs, FIRE relaxation. |
 | **Rigid body 6-DOF** | `kernels/rigid.cl` (`rigid_body_folded_kernel`, `rigid_body_pairff_probe_grid`) + `spammm/forcefields/RigidBodyDynamics.py` | Quaternion integration, gyroscopic term, per-body state, ping-pong multimol MD. |
+| **PairFF non-bonded model (legacy + unified)** | `kernels/rigid.cl:2198` (legacy `rigid_body_pairff_kernel`), `kernels/rigid.cl:2452` (unified `rigid_body_pairff_unified_kernel`), `kernels/Forces.cl:260` (`compact_exp_pair_EF`), `kernels/Forces.cl:279` (`pairff_unified_site_EF`) | **Our latest non-covalent interaction model.** See §"PairFF non-bonded model" below for full detail. |
 | **LFF projective Jacobi** | `kernels/LFF.cl` + `spammm/forcefields/LFFSolver.py` | Linearized projective Jacobi on K12/K13/K14 springs — fast relaxation surrogate. Closest existing thing to "position-based dynamics" in the repo. |
 | **Contact surface (separable B-spline×poly + radial PIC)** | `kernels/contact_surface.cl` (`evalSeparableBsplinePoly`, `relaxStrokesTiltedContactPME*`, `fillContactPMEMeshVL`) | Quasi-2D contact field for static AFM. |
 | **GridFF tricubic B-spline + Poisson** | `kernels/gridFF.cl` (`sample3D*`, `poissonW*`) | Tricubic interpolation with PBC; FFT Poisson solver with slab correction. |
@@ -260,9 +261,177 @@ Default non-covalent parameters for capping H and generic atoms. Port to `moltop
 - **`float4.w` channel reuse** for energy / secondary results / clash flags — avoid extra buffers.
 - Workgroup-sized fragments: 32 atoms/tile (nonbonded), `MAX_ATOMS_PER_BODY=128` (rigid), `LFF_WG_SIZE=64`, `CS_TILE=16`. **Matches the 16/32/64/128 atoms-per-fragment design in `notes/ToDo_user.md`.**
 
+### PairFF non-bonded model (our latest creation — full detail)
+
+**Entry point:** `demos/demo_pairff.py` → `RigidBodyPairFF` (`spammm/forcefields/RigidBodyDynamics.py:1588`).
+
+The demo implements **two switchable non-covalent force models** for rigid-body molecule-molecule interactions. Both operate on a sorted site array `[real_atoms, epairs, sigma_holes]` with per-site `REQ = (R, sqrt(E), Q/pseudo-charge, w_blunt)` and `type ∈ {0=atom, 1=epair, 2=sigma}`.
+
+#### Legacy kernel (`rigid_body_pairff_kernel`, rigid.cl:2198) — 4 separate loops
+
+| Interaction | Formula | Sites involved |
+|-------------|---------|----------------|
+| **Morse** (atom-atom) | `E = E₀·[exp(2α(r−R₀)) − 2·exp(α(r−R₀))]` | type=0 ↔ type=0 |
+| **Coulomb** (atom-atom) | `E = k_e·Q_i·Q_j / √(r² + R2SAFE)` (damped) | type=0 ↔ type=0 |
+| **Lorentzian Hbond** (atom-epair) | `E = min(0, Q_atom·Q_epair) · fcut(r/rc) · 1/(w² + r²)` | type=0 ↔ type=1 or type=1 ↔ type=0 |
+| **Sigma-hole** (atom-sigma) | `E = min(0, Q_atom·Q_sigma) · fcut(r/rc) · 1/(w² + r²)` | type=0 ↔ type=2 or type=2 ↔ type=0 |
+
+where `fcut = smoothstep(1 − r/rc) = 3x² − 2x³`, `R0 = Ri+Rj`, `E0 = sqrt(Ei)·sqrt(Ej)`, `Q = Qi·Qj`.
+
+**Design:** epairs/sigma-holes are pseudo-atoms with R=0, E=0. They participate ONLY in Hbond/sigma interactions, not Morse/Coulomb. Pseudo-charge stored in REQ.z. The kernel uses 4 separate loops with `if (atom_idx < n_dyn_atoms)` branching — causes warp divergence. Epair-epair and sigma-sigma interactions are skipped.
+
+#### Unified kernel (`rigid_body_pairff_unified_kernel`, rigid.cl:2452) — single branch-free loop
+
+**This is the production model and the one to port to SurfMol.** Uses `pairff_unified_site_EF` (Forces.cl:279) which calls `compact_exp_pair_EF` (Forces.cl:260):
+
+```
+V = E₀ · y · (α·y − (1+α))     where y = max(0, 1 − β(ρ−R₀)/8)^8
+ρ = r² / (√(r²+w²) + w)         [soft radius, one sqrt]
+```
+
+**Branch-free mixing** (all GPU lanes execute same instructions, parameters differ):
+```
+gij = gi · gj                   [core flag: 1=atom, 0=epair]
+R0  = gij · (Ri + Rj)           [epair-atom: R0=0]
+E0  = mix(attr, ei·ej, gij)     [attr = -min(0, Qi·Qj)]
+α   = gij                       [atom: α=1 (Morse), epair: α=0 (purely attractive)]
+w   = wi + wj                   [atom: w=0 (sharp), epair: w>0 (blunt)]
+```
+
+Coulomb is added only when `gij > 0.5` (real-real pairs): `E += k_e·Qi·Qj / √(r² + R2SAFE)`.
+
+**Key advantages over legacy:**
+- Single loop over all sites (no branching by type → no warp divergence)
+- Same instructions for atoms and epairs (just different parameters)
+- Compact exponential converges to Morse (not Gaussian like polynomial family)
+- Exact `V(R₀)=−E₀`, `V'(R₀)=0`, `V''(R₀)=2E₀β²` for all n
+- One sqrt (for soft radius); no `r=sqrt(r²)` for the compact channel
+- Cutoff `r_c = R₀ + n/β` (compact support)
+
+**Site types and their roles:**
+| Type | Name | R | E | Q | w | α | Role |
+|------|------|---|---|---|---|---|------|
+| 0 | atom | RvdW | √(EvdW) | charge | 0 | 1 | Morse + Coulomb |
+| 1 | epair (lone pair) | 0 | 0 | He (<0) | w>0 | 0 | Hbond acceptor (attracts H+) |
+| 2 | sigma-hole | 0 | 0 | Hs (>0) | w>0 | 0 | Hbond donor (attracts O−) |
+
+**Electron pairs** are placed by `AtomicSystem.add_electron_pairs()` at `epair_dist` (default 1.4 Å) from host O/N atoms, along the lone-pair direction. **Sigma holes** are placed on H atoms bonded to O/N at `sigma_dist` (default 1.0 Å) along the O-H bond direction. Both are fixed in the body frame at construction time.
+
+**Additional features in the kernel:**
+- Z-harmonic constraint (per-atom, produces both force and torque): `F_z = -k_z·(z - z_target)`
+- Anchor springs for mouse dragging: `F = -k_anchor·(p - anchor)`
+- FIRE relaxation (adaptive dt, quench on v·F < 0)
+- Gyroscopic torque: `α_body = I⁻¹·(τ_body - ω × L)` where `L = I·ω`
+- Quaternion update: `q ← normalize(q ⊗ dq_taylor(ω·dt))`
+
+**Kernel variants (all use the same compact-exp model):**
+| Kernel | Lines | Use case |
+|--------|-------|----------|
+| `rigid_body_pairff_unified_kernel` | 2452-2623 | 1 active body + 1 static partner |
+| `rigid_body_pairff_unified_env_kernel` | 2643+ | 1 active body + many env molecules (tiled) |
+| `rigid_body_pairff_unified_faf_kernel` | 2700+ | + FAF substrate (fused PairFF+FAF) |
+| `rigid_body_pairff_unified_env_faf_kernel` | 2734+ | + env + FAF |
+| `rigid_body_pairff_unified_allmol[_faf]_kernel` | 2888+ | Multi-body shared buffers (preferred for multi-mol) |
+
 ### Notes
 - No reactive/dissociative potentials or port-based bonding in SPAMM — those come from FireCore (`RARFF`, `RRsp3`).
 - NVIDIA GPU requires unrestricted shell so the ICD is visible; sandbox hides it and falls back to PoCL/CPU (never report PoCL timings as GPU).
+
+---
+
+## 2b. NumericalMathPlayground — `/home/prokop/git/NumericalMathPlayground/`
+
+**Role:** Theoretical derivations and compact-potential fitting playground. Contains the physics justification for the port-based RAFF approach and the fast compact non-bonded potentials used across SPAMMM and SurfMol. **Not a code source to port from — a theory source to cite.**
+
+### Top-level layout
+| Dir | Purpose |
+|-----|---------|
+| `topics/ReactiveFF/` | Rigid-atom rotating-frame FF theory, OpenCL demos |
+| `topics/NonBondingFFs/` | Compact pairwise potential design, fitting, demos |
+
+### Jewels to cite (high priority)
+| What | File | Notes |
+|------|------|-------|
+| **Port-based FF literature review + theory** | `topics/ReactiveFF/RigidAtomicRotatingFrameFF.chat.md` | Core theoretical document: port energy formulation, ARAP/Procrustes equivalence to angle FFs, adiabatic vs extended-Lagrangian rotation, novelty vs VALBOND/patchy-particles/AMOEBA. **The physics justification for RAFF.** |
+| **Compact pairwise potentials derivation** | `topics/NonBondingFFs/FastPairwisePotentials.chat.md` | Full derivation of compact polynomial Morse (r²-based), compact exponential Morse (recommended), pure-tail analytical solution, f²/f⁴ interpolation, soft-radius for epair blunting, branch-free mixing rules. |
+| **Compact potential fitting code** | `topics/NonBondingFFs/fit_radial.py` | Working Python: all compact potential variants, analytical coefficients, mixing rules, comparison plots. |
+| **NonBondingFFs overview** | `topics/NonBondingFFs/README.md` | Summary of compact-exp family, GPU branch-free design, PairFF demo, parameter reference. |
+| **ReactiveFF OpenCL demos** | `topics/ReactiveFF/reactiveff_ocl_app.py`, `reactiveff_ocl_app3d.py` | OpenCL demo apps for reactive rigid-atom FF. |
+
+### Key equations (centralized in `notes/designs/raff_theory_equations.md`)
+- **Compact polynomial Morse:** `V = C_R z² − C_A z`, `z = (1 − r²/r_c²)^q`, force without sqrt, C³ at cutoff.
+- **Compact exponential Morse (recommended):** `V = E₀ y [αy − (1+α)]`, `y = max(0, 1 − β(ρ−R₀)/n)^n`, converges to Morse as n→∞. Exact `V(R₀)=−E₀`, `V'(R₀)=0`, `V''(R₀)=2E₀β²` for all n.
+- **Soft radius:** `ρ = √(r²+w²) − w = r²/(√(r²+w²)+w)` — blunts epair origin, same GPU instructions as sharp atom core.
+- **Branch-free mixing:** `g_ij = g_i·g_j` (core flag), `R₀ = g_ij(R_i+R_j)`, `α = g_ij`, `w = w_i+w_j`. No pair-kind branching on GPU.
+- **Pure-tail polynomial:** `r_c² = R₀² + 4n·Δ·R₀`, `Δ = ln(2)/β`. Sets c=0, no repulsive bump, purely attractive tail.
+
+### Porting notes
+- The compact-exp kernel is already implemented in SPAMMM `Forces.cl:compact_exp_pair_EF` (l.260-273) — port that to Rust/OpenCL, citing both NumericalMathPlayground (derivation) and SPAMMM (implementation).
+- The theory document (`RigidAtomicRotatingFrameFF.chat.md`) should be cited in any publication or design doc justifying the RAFF approach.
+
+### Chronology — how the non-bonded interaction ideas developed
+
+Reconstructed from git logs of NumericalMathPlayground (NMP) and SPAMMM. This shows the evolution from theory → fitting → demo → production kernel.
+
+| Date | Repo | Commit / file | What happened |
+|------|------|---------------|---------------|
+| **2026-07-15** | NMP | `ff1915b` | First reactive forcefield for 2D/3D sp2/sp3 particles. `reactiveff_ocl_app.py` created. |
+| **2026-07-15** | NMP | `17d2626` | Discussion about bond order and Pauli repulsion. `RigidAtomicRotatingFrameFF.chat.md` started. |
+| **2026-07-16** | NMP | `RigidAtomicRotatingFrameFF.chat.md` finalized | **Core theory document**: port energy formulation, ARAP/Procrustes equivalence, adiabatic vs extended-Lagrangian rotation, novelty assessment. The physics justification for RAFF. |
+| **2026-07-22** | NMP | `9620b52` | `ff_map.py` created — 2D H-bond mapping around molecules. |
+| **2026-07-22** | NMP | `1dc80aa` | **Big day**: (1) `ff_map.py` Morse+Coulomb+epairs/sigma-holes 2D maps; (2) `demo_pairff.py` interactive Vispy rigid-body simulator; (3) `fit_radial.py` polynomial fit of unified short-range potential approximating both Morse and electron pairs. `FastPairwisePotentials.chat.md` started (compact polynomial family). |
+| **2026-07-22** | NMP | `FastPairwisePotentials.chat.md` (l.1-830) | Compact polynomial Morse derivation: `V = C_R z² − C_A z`, `z = (1−r²/r_c²)^q`, force without sqrt, mixing rules. |
+| **2026-07-22** | NMP | `FastPairwisePotentials.chat.md` (l.833-1365) | Pure-tail analytical solution: `r_c² = R₀² + 4n·Δ·R₀`, f²/f⁴ interpolation. |
+| **2026-07-22** | NMP | `FastPairwisePotentials.chat.md` (l.1366+) | **Key insight**: polynomial converges to Gaussian, not exponential. Compact exponential family: `y = max(0, 1−β(ρ−R₀)/n)^n` → converges to Morse. Unified `V = E₀y[αy−(1+α)]` for atoms+epairs. Soft radius `ρ = √(r²+w²)−w`. |
+| **2026-07-23** | NMP | `84e5e35` | Implemented unified kernel `rigid_body_pairff_unified_kernel` in SPAMMM `kernels/rigid.cl` for atom-atom and atom-epair, tested in `demo_pairff.py`. **The compact-exp kernel was born.** |
+| **2026-07-23** | SPAMMM | `0b45550` | SPAMMM `demo_pairff.py` shows rigid body dynamics with H-bond unified kernel. `Forces.cl:compact_exp_pair_EF` (l.260-273) implemented — the production compact-exp kernel (n=8, soft radius, branch-free). |
+| **2026-07-24** | SPAMMM | `c1d8a51` | Multi-body picking in demo_pairff.py; FAF substrate restructuring. |
+| **2026-07-24** | SPAMMM | `14f5568` | `rigid_body_pairff_unified_faf_kernel` — fused PairFF+FAF for on-surface assembly. |
+| **2026-07-28** | SPAMMM | `19059ca` | `PairFF_manual.md` and `PairFF.md` design reports written. Speed improvements, animation. |
+| **2026-07-30** | SPAMMM | `4ea1f6a` | Rigid body dynamics for on-surface assembly (production). |
+| **2026-08-01** | SPAMMM | `d81ec52` | Two FAF-substrate strategies: per-type combined potential, per-atom mixing rules (Pauli, London, Coulomb, Hb). |
+| **2026-08-01** | SPAMMM | `a1fec9e` | Refactored `RigidBodyDynamics.py`; multi-body allmol shared buffers; `rigid_body_pairff_unified_allmol[_faf]_kernel`. |
+| **2026-08-03** | SPAMMM | `1c12231` | Proper vmin/vmax in FAF+PairFF dragging; GUI scripts for benzoic acid dimer drag. |
+| **2026-08-10** | SPAMMM | (file mtime) | `demo_pairff.py`, `RigidBodyDynamics.py`, `rigid.cl`, `Forces.cl` last modified — current state. |
+
+**Evolution summary:**
+1. **Theory** (Jul 15-16, NMP): port-based FF justification, ARAP equivalence, rotation regimes.
+2. **Non-bonded potential design** (Jul 22, NMP): compact polynomial → pure-tail → **compact exponential** (the breakthrough — converges to Morse, branch-free for atoms+epairs).
+3. **First demo** (Jul 22-23, NMP→SPAMMM): `demo_pairff.py` with Vispy, `fit_radial.py` fitting, unified kernel in `rigid.cl`.
+4. **Production** (Jul 24 - Aug 10, SPAMMM): FAF substrate fusion, multi-body allmol, GUI integration, refactoring.
+
+**What superseded what:**
+- Compact polynomial Morse (family 1) → **superseded by** compact exponential Morse (family 2) for Morse tail reproduction.
+- Pure-tail polynomial → still useful for analytical cutoff, but compact-exp is the production choice.
+- Legacy 4-loop kernel (Morse+Coulomb / Lorentzian) → **superseded by** unified compact-exp kernel (single branch-free loop). Legacy kept for comparison.
+- Single static partner → **superseded by** multi-body allmol shared buffers.
+- `NMP/demo_pairff.py` (legacy default) → **superseded by** `SPAMMM/demos/demo_pairff.py` (unified default, multi-body, FAF).
+
+### External review — `notes/chats/REAFF.chat.md`
+
+**ChatGPT review of the RAFF theory and roadmap (2026-08-28).** Found 12 issues, all corrected in `raff_theory_equations.md`:
+
+| # | Issue | Severity | Fix |
+|---|-------|----------|-----|
+| 1 | Port energy inconsistent factors of 2 | Bug | Clean convention: `E = k_p/2 |e|²`, `F = k_p·e`, `k_p = K_bond/2` for reciprocal ports |
+| 2 | XPBD constraint `C = |x_j−tip| − l_0 = 0` | Bug | `C = |x_j−tip| = 0` (tip already contains bond length) |
+| 3 | Compliance notation `α = 1/(K·dt²)` | Non-standard | `α = 1/K` (physical), `α̃ = 1/(K·dt²)` (timestep-scaled) |
+| 4 | Full Procrustes (with centroid subtraction) | Conceptual | Wahba problem (rotation-only, no centering) — `x_i` is a dynamical variable |
+| 5 | Center-force projection "required" for analytical | Too strong | Unnecessary at exact adiabatic convergence (envelope theorem); changes the force field |
+| 6 | PD characterized as "linear only" | Too narrow | PD supports nonlinear local projections; fixed global step, not fixed constraints |
+| 7 | "Four cases" but enum has 3 | Counting | Separate model/solver/schedule axes instead of multiplying enums |
+| 8 | "Convex = suitable for XPBD" | Wrong criterion | Replace with "locally projectable"; `½k[R−r]₊²` is not convex in Cartesian |
+| 9 | "Split potential" = two different things | Conceptual | Separate exact algebraic decomposition (3b-iii) from approximate replacement (3b-i, 3b-ii) |
+| 10 | Compact-exp split recommended for PBD | Numerically poor | Explicit part retains 87.5% of total curvature (`V_attr'' = −1.75 E₀β²` vs `V'' = 2 E₀β²`); verified with SymPy |
+| 11 | Concave quadratic tail "unphysical" | Misleading | Morse IS concave/attrative for `r > R_0`; inflection at `R_inf = R_0 + ln(2)/β` is the natural split boundary |
+| 12 | erf/erfc mixed with PBD stiffness | Wrong axis | erf/erfc is spatial short/long range decomposition for grids, not PBD stiffness split; leave Coulomb in outer force for CPU prototype |
+
+**Key architectural contributions from the review:**
+- **Common proximal problem** (§11): `x^{n+1} = argmin_x [1/(2H²)(x−y)^T M(x−y) + U_h(x,R)]` — XPBD, PD, VBD are all solvers for this same problem.
+- **Curvature-based split criterion**: `θ* = argmin_θ max_r |U_ref'' − U_h''|` — directly targets max timestep, not energy fitting.
+- **`U''(r)` is the most important plot** for evaluating nonbonded splits.
+- **Iterations vs substeps experiment**: compare `1×H, 16 iters` vs `16×h, 1 iter` at equal hard-work budget.
+- **Central research question**: "How much of the stiff Hessian can we remove from the explicit outer dynamics using only cheap atom-local implicit solves?"
 
 ---
 

@@ -7,7 +7,7 @@ use surfff::{SurfaceFolded, SurfaceScratch};
 use molff::rigid_sp3::RigidSp3FF;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum BondedFFMode { Uff, RigidSp3 }
+pub enum BondedFFMode { Uff, RigidSp3, Raff }
 
 /// MolWorld orchestrates multiple forcefield engines for molecular dynamics.
 /// Does NOT own apos/fapos/vapos directly — those live in DynamicAtoms.
@@ -65,6 +65,7 @@ impl MolWorld {
         let (eb, ea, ed, ei) = match self.bonded_mode {
             BondedFFMode::Uff => self.uff.eval_forces(apos, fapos, neighs, neigh_bs),
             BondedFFMode::RigidSp3 => (self.rigid_sp3.eval_forces(apos, fapos, &self.uff, neighs, neigh_bs), 0.0, 0.0, 0.0),
+            BondedFFMode::Raff => (0.0, 0.0, 0.0, 0.0),  // RAFF driven externally by editor's do_relax_step
         };
         let mut enb = 0.0;
         let mut es = 0.0;
@@ -95,6 +96,7 @@ impl MolWorld {
                 let neigh_bs = self.dyn_atoms.atoms.neigh_bs.as_slice();
                 self.rigid_sp3.move_atom_md(i, apos, fapos, vapos, &self.uff, neigh_bs, dt, flim, cdamp)
             }
+            BondedFFMode::Raff => (0.0, 0.0, 0.0),  // RAFF integration done externally
         }
     }
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use glam::{Quat, Vec2, Vec3};
 use surfmol::mol_world::{BondedFFMode, MolWorld};
 use molff::nonbonded::NonBondedFF;
+use molff::raff::{RaffState, RaffTopology, RaffConfig, NbConfig, NbParams, OrientMode, eval_port_forces, eval_nonbonded, quat_from_omega_dt, quat_mul, quat_normalize, quat_conj};
 use molrender::impostor::{AtomInstance, ImpostorRenderer};
 use molrender::line_renderer::{LineRenderer, LineVertex};
 use molrender::surface_renderer::SurfaceRenderer;
@@ -57,7 +58,7 @@ struct App {
     world: MolWorld, elems: Vec<String>, params: Params, uff_types: Vec<String>, charges: Vec<f64>,
     cam: TrackballCam, selected: Option<usize>, pinned: Vec<bool>, pick_k: f64,
     show_bonds: bool, show_surface: bool, show_help: bool, show_groups: bool, show_ports: bool, show_labels: bool, show_debug_cursor: bool, label_mode: LabelMode,
-    run_relax: bool, dt: f64, flim: f64, damping: f64, zero_v_on_opposition: bool, per_frame: i32,
+    run_relax: bool, dt: f64, flim: f64, damping: f64, zero_v_on_opposition: bool, per_frame: i32, atom_scale: f32,
     dirty: Dirty,
     device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, config: wgpu::SurfaceConfiguration,
     renderer: ImpostorRenderer, instances: Vec<AtomInstance>, line_renderer: LineRenderer, surface_renderer: SurfaceRenderer,
@@ -77,6 +78,15 @@ struct App {
     show_hex_grid: bool,
     show_ghost_hexes: bool,
     edit_from_builder: bool,
+    // --- RAFF state (rigid-atom port-based FF with non-bonded + collision) ---
+    raff_state: Option<RaffState>,
+    raff_topo: Option<RaffTopology>,
+    raff_cfg: RaffConfig,
+    raff_nbcfg: NbConfig,
+    raff_nb_enabled: bool,
+    raff_e_port: f64,
+    raff_e_nb: f64,
+    plane_2d: bool,  // constrain atoms to z=0 plane (for easier 2D testing)
 }
 
 impl App {
@@ -118,8 +128,21 @@ impl App {
         let args: Vec<String> = std::env::args().collect();
         let mut copies_x: usize = 1; let mut copies_y: usize = 1; let mut spacing: f64 = 12.0;
         let mut group_size: usize = GROUP_SIZE_DEFAULT; let mut per_frame: i32 = PER_FRAME; let mut dt: f64 = 0.02;
-        { let mut it = args.iter().skip(1); while let Some(a) = it.next() { match a.as_str() { "--copies-x" => copies_x = it.next().unwrap_or(&"1".to_string()).parse().unwrap_or(1), "--copies-y" => copies_y = it.next().unwrap_or(&"1".to_string()).parse().unwrap_or(1), "--spacing" => spacing = it.next().unwrap_or(&"12.0".to_string()).parse().unwrap_or(12.0), "--group-size" => group_size = it.next().unwrap_or(&"32".to_string()).parse().unwrap_or(GROUP_SIZE_DEFAULT), "--perFrame" => per_frame = it.next().unwrap_or(&"100".to_string()).parse().unwrap_or(PER_FRAME), "--dt" => dt = it.next().unwrap_or(&"0.02".to_string()).parse().unwrap_or(0.02), _ => {} } } }
-        let xyz_path: PathBuf = args.iter().skip(1).find(|s| !s.starts_with("--")).map(|s| { let p = PathBuf::from(s); if p.is_absolute() { p } else { workspace_root.join(p) } }).unwrap_or_else(|| workspace_root.join("data/xyz/pentacene.xyz"));
+        let mut flag_raff = false; let mut flag_2d = false; let mut atom_scale: f32 = ATOM_SCALE;
+        let mut xyz_path_arg: Option<String> = None;
+        { let mut it = args.iter().skip(1); while let Some(a) = it.next() { match a.as_str() {
+            "--raff" => { flag_raff = true; },
+            "--2d" => { flag_2d = true; },
+            "--atom-scale" => { atom_scale = it.next().unwrap_or(&"0.25".to_string()).parse().unwrap_or(ATOM_SCALE); },
+            "--copies-x" => { copies_x = it.next().unwrap_or(&"1".to_string()).parse().unwrap_or(1); },
+            "--copies-y" => { copies_y = it.next().unwrap_or(&"1".to_string()).parse().unwrap_or(1); },
+            "--spacing" => { spacing = it.next().unwrap_or(&"12.0".to_string()).parse().unwrap_or(12.0); },
+            "--group-size" => { group_size = it.next().unwrap_or(&"32".to_string()).parse().unwrap_or(GROUP_SIZE_DEFAULT); },
+            "--perFrame" => { per_frame = it.next().unwrap_or(&"100".to_string()).parse().unwrap_or(PER_FRAME); },
+            "--dt" => { dt = it.next().unwrap_or(&"0.02".to_string()).parse().unwrap_or(0.02); },
+            _ => { if !a.starts_with("--") { xyz_path_arg = Some(a.clone()); } }
+        } } }
+        let xyz_path: PathBuf = xyz_path_arg.map(|s| { let p = PathBuf::from(s); if p.is_absolute() { p } else { workspace_root.join(p) } }).unwrap_or_else(|| workspace_root.join("data/xyz/benzene.xyz"));
         println!("Loading XYZ: {:?}", xyz_path);
         let sys = xyz::read_xyz(&xyz_path).expect("read_xyz failed"); println!("Loaded {} atoms", sys.elems.len());
 
@@ -157,9 +180,18 @@ impl App {
         } else { for i in 0..world.natoms() { let mut req = [1.5, 0.1, 0.0, 0.0]; if charges[i] != 0.0 { req[2] = charges[i]; } world.nonbonded.as_mut().unwrap().reqs.as_mut_slice()[i] = req; } world.nonbonded.as_mut().unwrap().make_plqs(2.0); let apos_slice = world.dyn_atoms.atoms.apos.as_slice(); for ib in 0..world.uff.nbonds as usize { let b = world.uff.bon_atoms.as_slice()[ib]; let ia = b[0] as usize; let ja = b[1] as usize; let d = numtypes::Vec3d::set_sub(apos_slice[ja], apos_slice[ia]); let l0 = d.norm(); world.uff.bon_params.as_mut_slice()[ib] = [100.0, l0]; } }
         }
         for i in 0..world.natoms() { world.dyn_atoms.atoms.apos.as_mut_slice()[i].z += 2.0; }
+        // --2d: flatten to z=0 plane for easier 2D navigation/testing
+        if flag_2d { for i in 0..world.natoms() { world.dyn_atoms.atoms.apos.as_mut_slice()[i].z = 0.0; } println!("[--2d] Flattened all atoms to z=0 plane"); }
         world.update_hneigh();
-        world.setup_nacl_surface(LATTICE_A, SURFACE_Z0 as f64, BETA_CHARGE, BETA_MORSE_RATIO, Q_AMP, PLQ_AMP);
-        println!("Surface setup complete (NaCl lattice a={} Å)", LATTICE_A);
+        // --raff: force RAFF mode, disable surface (not needed for FF testing)
+        if flag_raff {
+            world.bonded_mode = BondedFFMode::Raff;
+            world.surface = None;  // no surface in RAFF test mode
+            println!("[--raff] Forced bonded_mode = Raff, surface disabled");
+        } else {
+            world.setup_nacl_surface(LATTICE_A, SURFACE_Z0 as f64, BETA_CHARGE, BETA_MORSE_RATIO, Q_AMP, PLQ_AMP);
+            println!("Surface setup complete (NaCl lattice a={} Å)", LATTICE_A);
+        }
 
         let mut cam = TrackballCam::new(Vec3::new(0.0, 1.0, 0.0), 6.0);
 
@@ -186,7 +218,7 @@ impl App {
         for i in 0..natoms {
             let el = elems.get(i).map(|s| s.as_str()).unwrap_or("C");
             let col = params.element_color_f32(el);
-            let r = params.element_radius_vdw(el) * ATOM_SCALE;
+            let r = params.element_radius_vdw(el) * atom_scale;
             let p = &ps[i];
             instances.push(AtomInstance { pos: [p.x as f32, p.y as f32, p.z as f32], radius: r, color: col, _pad: 0.0 });
         }
@@ -196,7 +228,17 @@ impl App {
         let mut dirty = Dirty::default(); dirty.atoms = false; dirty.camera = true; dirty.bonds = false; dirty.surface = false; dirty.groups = false;
         println!("App initialized. Controls: H=help  SPACE=relax  S=surface  B=bonds  P=pin  ESC=deselect");
         let kekule_editor = KekuleEditor::new();
-        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: true, show_help: true, show_groups: false, show_ports: false, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: 0.0, zero_v_on_opposition: true, per_frame, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, clipboard: Clipboard::new(), etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0, kekule_editor, builder: b, show_kekule_editor: true, show_hex_grid: true, show_ghost_hexes: true, edit_from_builder: false };
+        // --raff: start in simulation mode (not kekule editor), show ports, enable non-bonded
+        let show_kekule_editor_init = !flag_raff;
+        let show_ports_init = flag_raff;
+        let show_surface_init = !flag_raff;
+        let raff_nb_enabled_init = flag_raff;
+        // RAFF mode: use higher damping (0.1 → cdamp=0.9) and fewer steps/frame for stable relaxation
+        let damping_init = if flag_raff { 0.1 } else { 0.0 };
+        let per_frame_init = if flag_raff { 20 } else { per_frame };
+        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: show_surface_init, show_help: true, show_groups: false, show_ports: show_ports_init, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: damping_init, zero_v_on_opposition: true, per_frame: per_frame_init, atom_scale, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, clipboard: Clipboard::new(), etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0, kekule_editor, builder: b, show_kekule_editor: show_kekule_editor_init, show_hex_grid: true, show_ghost_hexes: true, edit_from_builder: false, raff_state: None, raff_topo: None, raff_cfg: RaffConfig { dt: 0.02, cdamp: 0.9, rot_damp: 0.9, flim: 1000.0, xpbd_iters: 4, xpbd_over_relax: 1.0, orient_mode: OrientMode::Adiabatic, ..Default::default() }, raff_nbcfg: NbConfig { enabled: false, rcut: 10.0, r_damp: 0.1, f_max: 50.0, k_coll: 100.0, excl_12: true, excl_13: true }, raff_nb_enabled: raff_nb_enabled_init, raff_e_port: 0.0, raff_e_nb: 0.0, plane_2d: flag_2d };
+        // --raff: build RAFF topology immediately
+        if flag_raff { app.build_raff_from_world(); }
         app.rebuild_surface_cache();
         app
     }
@@ -239,6 +281,11 @@ impl App {
 
     fn do_relax_step(&mut self) {
         if !self.run_relax { return; }
+        // RAFF mode: use dedicated rigid-atom FF engine with non-bonded + collision
+        if self.world.bonded_mode == BondedFFMode::Raff {
+            self.do_raff_step();
+            return;
+        }
         for _ in 0..self.per_frame {
             let (eb, ea, ed, ei, enb, es) = self.world.eval_forces();
             self.eb = eb; self.ea = ea; self.ed = ed; self.ei = ei; self.enb = enb; self.es = es;
@@ -266,6 +313,149 @@ impl App {
         self.sync_pos_from_engine();
     }
 
+    /// Build RaffTopology + RaffState from the current MolWorld bond topology + positions.
+    /// Called when user switches to RAFF mode (or when topology changes while in RAFF mode).
+    fn build_raff_from_world(&mut self) {
+        let natoms = self.world.natoms();
+        let mut topo = RaffTopology::new(natoms);
+        // Bond params from UFF: [k, l0] → PortParam { k_p = k/2, l0 }
+        let nbonds = self.world.uff.nbonds as usize;
+        let bon_atoms = self.world.uff.bon_atoms.as_slice();
+        let bon_params = self.world.uff.bon_params.as_slice();
+        let mut bonds = Vec::with_capacity(nbonds);
+        for ib in 0..nbonds {
+            let ba = bon_atoms[ib];
+            let bp = bon_params[ib];
+            bonds.push([ba[0], ba[1]]);
+            topo.bond_params.push(molff::raff::PortParam { k_p: bp[0] * 0.5, l0: bp[1] });
+        }
+        topo.build_neighs_from_bonds(&bonds);
+        // Set non-bonded params from element types (LJ σ from vdw radius, ε small, charge from xyz)
+        for i in 0..natoms {
+            let el = self.elems.get(i).map(|s| s.as_str()).unwrap_or("C");
+            let rvdw = self.params.element_radius_vdw(el) as f64;
+            let q = self.charges.get(i).copied().unwrap_or(0.0);
+            // σ ≈ 2 * rvdw (LJ sigma ≈ 2× vdw radius), ε = 0.01 eV (weak default)
+            topo.nb_params[i] = NbParams { sigma: 2.0 * rvdw, epsilon: 0.01, charge: q, radius: rvdw * 0.8 };
+        }
+        // State from current world positions
+        let ps = self.world.dyn_atoms.atoms.apos.as_slice();
+        let mut state = RaffState::new(natoms);
+        state.set_positions(&ps[0..natoms].to_vec());
+        // Initialize quaternions to identity (ports point in default directions)
+        for i in 0..natoms { state.quat[i] = numtypes::Quat4d::new(0.0, 0.0, 0.0, 1.0); }
+        // Solve initial rotations (adiabatic)
+        molff::raff::solve_all_rotations(&mut state, &topo);
+        self.raff_state = Some(state);
+        self.raff_topo = Some(topo);
+        println!("[RAFF] Built topology: {} atoms, {} bonds, {} exclusions", natoms, nbonds, natoms);
+    }
+
+    /// One RAFF relaxation step: eval port + non-bonded forces, add spring drag, integrate, sync.
+    fn do_raff_step(&mut self) {
+        // Lazy init: build RAFF state on first step
+        if self.raff_state.is_none() || self.raff_topo.is_none() {
+            self.build_raff_from_world();
+        }
+        let natoms = self.world.natoms();
+        // Sync config from GUI sliders
+        let mut cfg = self.raff_cfg;
+        cfg.dt = self.dt;
+        cfg.flim = self.flim;
+        cfg.cdamp = 1.0 - self.damping;
+        cfg.rot_damp = 1.0 - self.damping;
+        let mut nbcfg = self.raff_nbcfg;
+        nbcfg.enabled = self.raff_nb_enabled;
+        for _ in 0..self.per_frame {
+            let (state, topo) = self.raff_state_take();  // borrow workaround
+            let mut fapos = vec![numtypes::VEC3D_ZERO; natoms];
+            let mut tau = vec![numtypes::VEC3D_ZERO; natoms];
+            // 1. Eval port forces
+            let e_port = eval_port_forces(&state, &topo, &mut fapos, &mut tau);
+            // 2. Eval non-bonded (accumulates into fapos)
+            let e_nb = eval_nonbonded(&state, &topo, &nbcfg, &mut fapos);
+            // 3. Spring drag force on selected atom (mouse pulling)
+            if !self.show_kekule_editor {
+                if let Some(idx) = self.selected {
+                    let atom_pos = glam::Vec3::new(state.pos[idx].x as f32, state.pos[idx].y as f32, state.pos[idx].z as f32);
+                    let (ray0, hray) = self.cam.screen_ray(self.prev_mouse, self.window_size.0, self.window_size.1);
+                    let f_spring = get_force_spring_ray(atom_pos, hray, ray0, self.pick_k as f32);
+                    fapos[idx].x += f_spring.x as f64;
+                    fapos[idx].y += f_spring.y as f64;
+                    fapos[idx].z += f_spring.z as f64;
+                }
+            }
+            // --2d: zero out z-component of forces and torques (constrain to xy plane)
+            if self.plane_2d {
+                for i in 0..natoms { fapos[i].z = 0.0; tau[i].x = 0.0; tau[i].y = 0.0; }  // only allow rotation around z
+            }
+            // 4. Integrate (symplectic Euler, same as step_force_md but with pinning)
+            let dt = cfg.dt;
+            let cdamp = cfg.cdamp;
+            let rot_damp = cfg.rot_damp;
+            let flim = cfg.flim;
+            let mut state = state;
+            // Stopping criterion: if total dot(v,f) < 0 (force opposing motion), zero all velocities.
+            // Same as FireCore MolWorld_sp3 zero_v_on_opposition — prevents oscillation, converges to equilibrium.
+            if self.zero_v_on_opposition {
+                let mut fv = 0.0;
+                for i in 0..natoms { fv += state.vel[i].dot(fapos[i]); }
+                if fv < 0.0 {
+                    for i in 0..natoms { state.vel[i] = numtypes::VEC3D_ZERO; state.omega[i] = numtypes::VEC3D_ZERO; }
+                }
+            }
+            for i in 0..natoms {
+                if self.pinned[i] { continue; }
+                let mut f = fapos[i];
+                let f2 = f.norm2();
+                if flim > 0.0 && f2 > flim * flim { f.mul(flim / f2.sqrt()); }
+                let mut v = state.vel[i];
+                v.mul(cdamp);
+                v.add_mul(f, dt / topo.mass[i]);
+                state.vel[i] = v;
+                state.pos[i].add_mul(v, dt);
+                // Rotation (only if atom has ports and inertia)
+                if topo.inv_inertia[i] > 0.0 && topo.nport[i] > 0 {
+                    let t = tau[i];
+                    let mut w = state.omega[i];
+                    w.mul(rot_damp);
+                    w.add_mul(t, topo.inv_inertia[i] * dt);
+                    state.omega[i] = w;
+                    let dq = quat_from_omega_dt(w, dt);
+                    state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
+                }
+            }
+            // Adiabatic: re-solve rotations after position updates
+            if cfg.orient_mode == OrientMode::Adiabatic {
+                molff::raff::solve_all_rotations(&mut state, &topo);
+            }
+            // --2d: clamp z position to 0 and zero z velocity
+            if self.plane_2d {
+                for i in 0..natoms { state.pos[i].z = 0.0; state.vel[i].z = 0.0; state.omega[i].x = 0.0; state.omega[i].y = 0.0; }
+            }
+            self.raff_state = Some(state);
+            self.raff_e_port = e_port;
+            self.raff_e_nb = e_nb;
+            self.etot = e_port + e_nb;
+        }
+        // Sync positions back to world for rendering
+        if let Some(ref state) = self.raff_state {
+            let apos = self.world.dyn_atoms.atoms.apos.as_mut_slice();
+            for i in 0..natoms {
+                apos[i] = state.pos[i];
+            }
+        }
+        self.dirty.atoms = true;
+        let _ = quat_conj;  // suppress unused import warning
+    }
+
+    /// Helper to take raff_state (workaround for borrow checker)
+    fn raff_state_take(&mut self) -> (RaffState, RaffTopology) {
+        let state = self.raff_state.take().expect("raff_state must exist");
+        let topo = self.raff_topo.as_ref().expect("raff_topo must exist").clone();
+        (state, topo)
+    }
+
     fn collect_lines(&self) -> Vec<LineVertex> {
         use molgui::gui::gizmos::{make_bond_segments, make_ring, make_axes, make_crosshair};
         let mut lines = Vec::new();
@@ -290,21 +480,40 @@ impl App {
 
             // --- Ports ---
             if self.show_ports {
-                let rr = &self.world.rigid_sp3;
-                let neigh_bs = self.world.dyn_atoms.atoms.neigh_bs.as_slice();
                 let port_col = [1.0f32, 0.5, 0.0, 1.0];
-                for i in 0..natoms {
-                    let pi = Vec3::new(ps[i].x as f32, ps[i].y as f32, ps[i].z as f32);
-                    let bs = neigh_bs[i].as_array();
-                    let np = rr.nport[i] as usize;
-                    for s in 0..np {
-                        let ib = bs[s];
-                        if ib < 0 { continue; }
-                        let l0 = self.world.uff.bon_params.as_slice()[ib as usize][1];
-                        let tip = rr.get_port_tip(ps, i, s, l0);
-                        let pt = Vec3::new(tip.x as f32, tip.y as f32, tip.z as f32);
-                        lines.push(LineVertex { pos: [pi.x, pi.y, pi.z], col: port_col });
-                        lines.push(LineVertex { pos: [pt.x, pt.y, pt.z], col: port_col });
+                if self.world.bonded_mode == BondedFFMode::Raff {
+                    // RAFF mode: draw ports from RaffState quaternions (synced with physics solver)
+                    if let (Some(ref state), Some(ref topo)) = (&self.raff_state, &self.raff_topo) {
+                        for i in 0..natoms {
+                            let pi = Vec3::new(state.pos[i].x as f32, state.pos[i].y as f32, state.pos[i].z as f32);
+                            let np = topo.nport[i] as usize;
+                            for s in 0..np {
+                                let ib = topo.neigh_bs[i].as_array()[s];
+                                if ib < 0 { continue; }
+                                let tip = topo.port_tip(state, i, s);
+                                let pt = Vec3::new(tip.x as f32, tip.y as f32, tip.z as f32);
+                                lines.push(LineVertex { pos: [pi.x, pi.y, pi.z], col: port_col });
+                                lines.push(LineVertex { pos: [pt.x, pt.y, pt.z], col: port_col });
+                            }
+                        }
+                    }
+                } else {
+                    // UFF/RigidSp3 mode: draw ports from fixed rigid_sp3 geometry
+                    let rr = &self.world.rigid_sp3;
+                    let neigh_bs = self.world.dyn_atoms.atoms.neigh_bs.as_slice();
+                    for i in 0..natoms {
+                        let pi = Vec3::new(ps[i].x as f32, ps[i].y as f32, ps[i].z as f32);
+                        let bs = neigh_bs[i].as_array();
+                        let np = rr.nport[i] as usize;
+                        for s in 0..np {
+                            let ib = bs[s];
+                            if ib < 0 { continue; }
+                            let l0 = self.world.uff.bon_params.as_slice()[ib as usize][1];
+                            let tip = rr.get_port_tip(ps, i, s, l0);
+                            let pt = Vec3::new(tip.x as f32, tip.y as f32, tip.z as f32);
+                            lines.push(LineVertex { pos: [pi.x, pi.y, pi.z], col: port_col });
+                            lines.push(LineVertex { pos: [pt.x, pt.y, pt.z], col: port_col });
+                        }
                     }
                 }
             }
@@ -312,7 +521,7 @@ impl App {
             // --- Picking highlight ring ---
             if let Some(idx) = self.selected {
                 let pos = Vec3::new(ps[idx].x as f32, ps[idx].y as f32, ps[idx].z as f32);
-                let r = if self.show_ports { 0.03 } else { self.params.element_radius_vdw(&self.elems[idx]) * ATOM_SCALE };
+                let r = if self.show_ports { 0.03 } else { self.params.element_radius_vdw(&self.elems[idx]) * self.atom_scale };
                 let ring_col: [f32; 4] = if self.pinned[idx] { [1.0, 1.0, 0.0, 1.0] } else { [0.0, 1.0, 0.4, 1.0] };
                 lines.extend(make_ring(pos, r * 1.6, 16, ring_col));
             }
@@ -487,7 +696,16 @@ impl App {
                         "c" | "C" => { self.cam = TrackballCam::new(Vec3::new(0.0, 1.0, 0.0), 6.0); self.dirty.camera = true; needs_redraw = true; }
                         "l" | "L" => { self.label_mode = match self.label_mode { LabelMode::None => LabelMode::AtomNumber, LabelMode::AtomNumber => LabelMode::AtomType, LabelMode::AtomType => LabelMode::Charge, LabelMode::Charge => LabelMode::ElementName, LabelMode::ElementName => LabelMode::None }; println!("label_mode = {:?}", self.label_mode); needs_redraw = true; }
                         "e" | "E" => { self.show_kekule_editor = !self.show_kekule_editor; println!("show_kekule_editor = {}", self.show_kekule_editor); needs_redraw = true; }
-                        "f" | "F" => { self.world.bonded_mode = match self.world.bonded_mode { BondedFFMode::Uff => BondedFFMode::RigidSp3, BondedFFMode::RigidSp3 => BondedFFMode::Uff }; println!("bonded_mode = {:?}", self.world.bonded_mode); needs_redraw = true; }
+                        "f" | "F" => {
+                            self.world.bonded_mode = match self.world.bonded_mode {
+                                BondedFFMode::Uff => BondedFFMode::RigidSp3,
+                                BondedFFMode::RigidSp3 => BondedFFMode::Raff,
+                                BondedFFMode::Raff => BondedFFMode::Uff,
+                            };
+                            if self.world.bonded_mode == BondedFFMode::Raff { self.build_raff_from_world(); }
+                            println!("bonded_mode = {:?}", self.world.bonded_mode);
+                            needs_redraw = true;
+                        }
                         "1" => { self.kekule_editor.set_edit_mode(EditMode::Select); println!("edit_mode = Select"); needs_redraw = true; }
                         "2" => { self.kekule_editor.set_edit_mode(EditMode::HexPaint); println!("edit_mode = HexPaint"); needs_redraw = true; }
                         "3" => { self.kekule_editor.set_edit_mode(EditMode::HexToggle); println!("edit_mode = HexToggle"); needs_redraw = true; }
@@ -538,7 +756,7 @@ impl App {
         for i in 0..natoms {
             let el = self.elems.get(i).map(|s| s.as_str()).unwrap_or("C");
             let col = self.params.element_color_f32(el);
-            let r = self.params.element_radius_vdw(el) * ATOM_SCALE;
+            let r = self.params.element_radius_vdw(el) * self.atom_scale;
             let p = &ps[i];
             self.instances.push(AtomInstance { pos: [p.x as f32, p.y as f32, p.z as f32], radius: r, color: col, _pad: 0.0 });
         }
@@ -553,7 +771,13 @@ impl App {
                 self.rebuild_instances();
             } else {
                 let ps = self.world.dyn_atoms.atoms.apos.as_slice();
-                for i in 0..natoms { let p = &ps[i]; self.instances[i].pos = [p.x as f32, p.y as f32, p.z as f32]; }
+                for i in 0..natoms {
+                    let p = &ps[i];
+                    self.instances[i].pos = [p.x as f32, p.y as f32, p.z as f32];
+                    // Update radius from current atom_scale (slider may have changed it)
+                    let el = self.elems.get(i).map(|s| s.as_str()).unwrap_or("C");
+                    self.instances[i].radius = self.params.element_radius_vdw(el) * self.atom_scale;
+                }
                 self.renderer.set_atoms(&self.instances);
             }
             self.dirty.atoms = false;
@@ -788,6 +1012,8 @@ impl App {
                 ui.checkbox(&mut self.zero_v_on_opposition, "Zero V when F·V < 0 (3N)");
                 ui.separator();
                 ui.heading("Display");
+                let slider = egui::Slider::new(&mut self.atom_scale, 0.05..=0.5).text("Atom size");
+                if ui.add(slider).changed() { self.dirty.atoms = true; }
                 ui.horizontal(|ui| {
                     ui.label("Labels:");
                     egui::ComboBox::from_id_source("label_mode_combo")
@@ -814,10 +1040,16 @@ impl App {
                         .selected_text(match self.world.bonded_mode {
                             BondedFFMode::Uff => "UFF",
                             BondedFFMode::RigidSp3 => "Rigid sp3",
+                            BondedFFMode::Raff => "RAFF",
                         })
                         .show_ui(ui, |ui| {
+                            let prev = self.world.bonded_mode;
                             ui.selectable_value(&mut self.world.bonded_mode, BondedFFMode::Uff, "UFF");
                             ui.selectable_value(&mut self.world.bonded_mode, BondedFFMode::RigidSp3, "Rigid sp3");
+                            ui.selectable_value(&mut self.world.bonded_mode, BondedFFMode::Raff, "RAFF");
+                            if prev != BondedFFMode::Raff && self.world.bonded_mode == BondedFFMode::Raff {
+                                self.build_raff_from_world();
+                            }
                         });
                 });
                 ui.separator();
@@ -826,6 +1058,41 @@ impl App {
                 let sf_str = if self.world.surface.is_some() { "NaCl" } else { "None" };
                 ui.label(egui::RichText::new(format!("Surface (M): {}", sf_str)).size(14.0).color(egui::Color32::YELLOW));
             });
+
+        // RAFF settings panel (only shown in RAFF mode)
+        if self.world.bonded_mode == BondedFFMode::Raff {
+            egui::Window::new("RAFF Settings")
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 380.0))
+                .resizable(false)
+                .title_bar(true)
+                .frame(egui::Frame::window(&ctx.style()))
+                .show(ctx, |ui| {
+                    ui.heading("RAFF Physics");
+                    ui.checkbox(&mut self.raff_nb_enabled, "Non-bonded (LJ+Coul+Coll)");
+                    ui.checkbox(&mut self.plane_2d, "2D plane (z=0 constraint)");
+                    ui.horizontal(|ui| {
+                        ui.label("Orient:");
+                        egui::ComboBox::from_id_source("raff_orient_combo")
+                            .width(100.0)
+                            .selected_text(match self.raff_cfg.orient_mode { OrientMode::Adiabatic => "Adiabatic", OrientMode::Dynamic => "Dynamic" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.raff_cfg.orient_mode, OrientMode::Adiabatic, "Adiabatic");
+                                ui.selectable_value(&mut self.raff_cfg.orient_mode, OrientMode::Dynamic, "Dynamic");
+                            });
+                    });
+                    ui.separator();
+                    ui.heading("Non-bonded Params");
+                    ui.add(egui::Slider::new(&mut self.raff_nbcfg.rcut, 3.0..=20.0).text("rcut (Å)"));
+                    ui.add(egui::Slider::new(&mut self.raff_nbcfg.k_coll, 0.0..=500.0).text("k_coll"));
+                    ui.add(egui::Slider::new(&mut self.raff_nbcfg.f_max, 0.0..=200.0).text("f_max"));
+                    ui.checkbox(&mut self.raff_nbcfg.excl_12, "Exclude 1-2");
+                    ui.checkbox(&mut self.raff_nbcfg.excl_13, "Exclude 1-3");
+                    ui.separator();
+                    ui.label(egui::RichText::new(format!("E_port = {:.4} eV", self.raff_e_port)).size(14.0).color(egui::Color32::from_rgb(100, 200, 255)));
+                    ui.label(egui::RichText::new(format!("E_nb   = {:.4} eV", self.raff_e_nb)).size(14.0).color(egui::Color32::from_rgb(100, 200, 255)));
+                    ui.label(egui::RichText::new(format!("E_tot  = {:.4} eV", self.etot)).size(14.0).color(egui::Color32::YELLOW));
+                });
+        }
 
         // Kekule Editor panel (left side, below title)
         if self.show_kekule_editor {
@@ -1003,6 +1270,7 @@ impl App {
                     ui.label(egui::RichText::new("Controls:").size(16.0).color(egui::Color32::WHITE));
                     let help = [
                         "LMB click atom     -> pick/unpick (Select mode)",
+                        "LMB drag atom      -> pull atom (spring force, sim mode)",
                         "LMB click          -> hex paint/toggle/atom (Edit mode)",
                         "RMB click          -> unpick (Select) / remove hex (Edit)",
                         "Shift+LMB drag     -> pan camera",
@@ -1019,12 +1287,16 @@ impl App {
                         "C                  -> reset camera",
                         "G                  -> toggle group AABBs",
                         "T                  -> toggle ports",
-                        "F                  -> toggle bonded FF",
+                        "F                  -> cycle bonded FF: Uff -> RigidSp3 -> RAFF",
                         "L                  -> cycle label mode",
                         "K                  -> toggle labels",
                         "D                  -> toggle debug cursor",
                         "N                  -> toggle non-bonded",
                         "M                  -> toggle surface FF",
+                        "",
+                        "CLI: --raff --2d  (start in RAFF mode, 2D plane)",
+                        "     --atom-scale S (atom render size, default 0.25)",
+                        "     [file.xyz]    (default: data/xyz/benzene.xyz)",
                     ];
                     for line in help {
                         ui.label(egui::RichText::new(line).size(12.0).color(egui::Color32::GRAY));

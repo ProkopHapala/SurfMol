@@ -23,7 +23,7 @@ When implementing or debugging a topic (e.g. "UFF bond evaluation", "AABB collis
 - `uff.md` — UFF force field (bonds, angles, dihedrals, inversions)
 - `nonbonded.md` — LJ / Coulomb / H-bond non-bonded interactions
 - `rigid_body.md` — 6-DOF quaternion rigid body dynamics
-- `raff.md` — RigidAtomFF (RAFF): ARAP ports, fixed vs reactive
+- **`raff.md`** — RigidAtomFF (RAFF): port-based rigid-atom FF, rotation solvers, XPBD/force-MD/projective, split-collision, GPU layouts. **Populated 2026-09-28.**
 - `collision.md` — AABB broad phase, uniform grid, spatial hashing
 - `projective_dynamics.md` — Projective / position-based dynamics for relaxation
 - `gridff.md` — B-spline grid interpolation for substrate potentials

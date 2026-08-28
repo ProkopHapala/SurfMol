@@ -51,10 +51,10 @@ impl TrackballCam {
         let ty = -(u.x * eye[0] + u.y * eye[1] + u.z * eye[2]);
         let tz_view = -(f.x * eye[0] + f.y * eye[1] + f.z * eye[2]);
         let vp = [
-            [sx * r.x, sx * r.y, sx * r.z, sx * tx],
-            [sy * u.x, sy * u.y, sy * u.z, sy * ty],
-            [sz * f.x, sz * f.y, sz * f.z, sz * tz_view + tz],
-            [0.0, 0.0, 0.0, 1.0],
+            [sx * r.x, sy * u.x, sz * f.x, 0.0],
+            [sx * r.y, sy * u.y, sz * f.y, 0.0],
+            [sx * r.z, sy * u.z, sz * f.z, 0.0],
+            [sx * tx,  sy * ty,  sz * tz_view + tz, 1.0],
         ];
         CameraData { view_proj: vp, eye, _pad1: 0.0, right: [r.x, r.y, r.z], _pad2: 0.0, up: [u.x, u.y, u.z], _pad3: 0.0, forward: [f.x, f.y, f.z], ortho: 1.0, ray_shift: [10000.0, 0.0, 0.0, 0.0] }
     }

@@ -161,16 +161,18 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | `src/aabb.rs` | 96 | `fit_aabb(pos, ids)`, `fit_group_aabbs(pos, RaggedIndex, out)`, `fit_range_aabbs(pos, ranges, out)`. Uses `numtypes::Aabb3d` and `numtypes::RaggedIndex`. |
 | `src/buckets.rs` | 95 | `Buckets` — spatial hashing via count→prefix→scatter (FireCore `Buckets.h` pattern). `build(cell_of_obj)`; `cell_objects(c)`. Single `counts` buffer doubles as cursor; no extra allocation during rebuild. |
 
-### `molff` (`crates/libs/molff/`, 1205 LOC)
-*Intra-molecular forcefields. See `notes/designs/` for forcefield data ownership.*
+### `molff` (`crates/libs/molff/`, 2289 LOC)
+*Intra-molecular forcefields. See `notes/designs/` for forcefield data ownership. See `/doc/topical_audit/raff.md` for RAFF cross-implementation map.*
 
 | File | LOC | Contents |
 |------|-----|----------|
-| `src/lib.rs` | 6 | Crate root: `pub mod uff; nonbonded; rigid_sp3;` |
+| `src/lib.rs` | 6 | Crate root: `pub mod uff; nonbonded; rigid_sp3; raff;` |
 | `src/uff.rs` | 665 | `Uff` — bonded forcefield. `Buckets` (spatial partition for force assembly). SoA `AlignedVec` arrays. `eval_atom_bonds()`, `eval_angle_prokop()`, `eval_dihedral_prokop()` (Fourier series via `Vec2d::mul_cmplx`). |
 | `src/nonbonded.rs` | 300 | `NonBondedFF` — LJ + Coulomb + H-bond. `reqs`, `plqs`, `make_second_neighs()` (1-2 + 1-3 exclusion), `make_pbc_shifts()`. `eval()` / `eval_pbc()` — O(N²) with exclusion skip. |
-| `src/rigid_sp3.rs` | 237 | `RigidSp3FF` — port-based rigid body FF (RAFF precursor). Per-atom quaternion, angular velocity, torque, port geometry. |
+| `src/rigid_sp3.rs` | 237 | `RigidSp3FF` — **legacy** port-based rigid body FF (single variant: Dynamic+ForceMD). Superseded by `raff.rs`. |
+| `src/raff.rs` | 1085 | **RAFF** — multi-variant port-based rigid-atom FF. `RaffTopology`/`RaffState`/`RaffConfig`/`NbConfig`. Port forces, Wahba/Horn rotation solver, `step_force_md`, `step_xpbd`, `step_proximal`, `solve_collisions`, `eval_nonbonded`, FD checks. See `/doc/topical_audit/raff.md`. |
 | `tests/test_rigid_sp3.rs` | 110 | Tetrahedral sp3 center (CH4-like) + water test. |
+| `tests/test_raff.rs` | 607 | 22 tests: port forces, rotation convergence, energy/momentum conservation, XPBD constraints, collisions, adiabatic torque residual. All passing. |
 
 ### `surfff` (`crates/libs/surfff/`, 512 LOC)
 *Surface interaction forcefield.*
@@ -215,7 +217,7 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | `src/gui/gizmos.rs` | — | `make_bond_segments()` — multi-segment bond line generation. |
 | `src/gui/kekule_editor.rs` | 338 | `KekuleEditor` — hex-grid molecular editor. `EditMode`, `collect_hex_grid_points()`, `collect_builder_bonds/atoms()`, `export_xyz()`, `element_color()`. |
 | `src/gui/thumbnailer.rs` | 234 | `MolThumbnailer` — wraps `ImpostorRenderer` + `LineRenderer` for egui thumbnail textures. PCA alignment via `numcore::math::linalg::symmetric_eigen_3x3`. |
-| `src/gui/trackball.rs` | 63 | `TrackballCam` — orbit camera (target, rotation Quat, zoom, lerp). |
+| `src/gui/trackball.rs` | 61 | `TrackballCam` — orbit camera (target, rotation Quat, zoom, lerp). **Column-major orthographic projection** (fixed fisheye bug 2026-09-28). |
 | `src/gui/clipboard.rs` | — | `Clipboard` — arboard wrapper. `inject_cut_copy_if_needed`, `inject_paste_if_needed`, `handle_output_commands`. Replaces egui-winit's clipboard feature. |
 | `tests/test_thumb.rs` | — | MolThumbnailer integration test (saves PNG via `image` crate). |
 
@@ -233,12 +235,12 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 |------|-----|----------|
 | `src/main.rs` | 90 | Rhai-scripted MD/relaxation. Registers `load_topology`, `eval_forces`, `step_md`, `relax`, `get_natoms`. `SimulationEngine` wraps `MolWorld` in `Arc<Mutex>`. |
 
-### `editor` (`crates/apps/editor/`, 1161 LOC)
-*Interactive molecular editor and on-surface MD simulator. wgpu + egui + winit.*
+### `editor` (`crates/apps/editor/`, 1433 LOC)
+*Interactive molecular editor and on-surface MD simulator. wgpu + egui + winit. Supports UFF / RigidSp3 / RAFF forcefield modes.*
 
 | File | LOC | Contents |
 |------|-----|----------|
-| `src/main.rs` | 1161 | 3D molecular editor. TrackballCam, atom picking (ray-sphere), bond drawing, hex-grid Kekule editing, MD relaxation (RigidSp3 + NonBonded + NaCl surface), surface potential visualization, clipboard support. |
+| `src/main.rs` | 1433 | 3D molecular editor. TrackballCam, atom picking (ray-sphere), bond/port drawing, hex-grid Kekule editing, MD relaxation (Uff/RigidSp3/Raff + NonBonded + NaCl surface), RAFF integration (`do_raff_step`, spring drag, 2D constraint, stopping criterion, port sync), surface potential visualization, atom-scale CLI/GUI, clipboard support. CLI: `--raff`, `--2d`, `--atom-scale`, `--perFrame`, `--dt`. |
 
 ### `molbrowser` (`crates/apps/molbrowser/`, 250 LOC)
 *Gallery browser for XYZ molecule files. eframe (egui).*
@@ -322,7 +324,8 @@ cargo clippy --workspace                 # lints
 | `Builder` | moltopo | Slot-based graph with generational handles (AtomH, BondH), hex-grid editing |
 | `Params` | moltopo | Loaded FF parameter tables |
 | `Uff` | molff | Bonded FF: SoA arrays, Buckets force assembly, hneigh |
-| `RigidSp3FF` | molff | Port-based rigid body: quat, omega, tau. **RAFF precursor.** |
+| `RigidSp3FF` | molff | **Legacy** port-based rigid body: quat, omega, tau. Single variant (Dynamic+ForceMD). |
+| `RAFF` | molff | **Multi-variant** port-based rigid-atom FF: `RaffTopology`/`RaffState`, port forces, Wahba/Horn rotation, `step_force_md`/`step_xpbd`/`step_proximal`, `eval_nonbonded`, `solve_collisions`. 22 tests. See `/doc/topical_audit/raff.md`. |
 | `NonBondedFF` | molff | LJ+Coulomb+Hbond: reqs, plqs, excl, PBC shifts |
 | `SurfaceFolded` | surfff | Separable Fourier basis surface potential |
 | `MolWorld` | surfmol | Coordinator: DynamicAtoms + Uff + RigidSp3FF + optional NonBondedFF/SurfaceFolded |
