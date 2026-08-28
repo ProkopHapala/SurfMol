@@ -3,7 +3,7 @@ type: userguide
 title: User Guide
 description: End-user documentation for finished, polished modules — how to run the program, features, GUI controls, CLI options, examples, and didactic theory.
 tags: [user-guide, end-user, theory]
-timestamp: 2026-08-25
+timestamp: 2026-09-29
 ---
 
 # User Guide
@@ -25,6 +25,10 @@ End-user documentation for **finished, polished** modules of SurfMol. This folde
 - Developer-facing architecture/code navigation → `doc/`.
 - Internal design decisions → `DESIGN_GOALS.md`.
 
+## Guides
+
+- **[`editor.md`](editor.md)** — Interactive molecular editor & on-surface MD simulator. CLI options (`--nmols`, `--layout`, `--show-aabb`, `--raff`, `--2d`), keyboard shortcuts, GUI panels, usage examples with benzoic acid / pyrrol / benzene, broad-phase AABB collision visualization, and didactic theory (forcefields, AABB collision).
+
 ## Status
 
-Empty — populate as modules become polished and user-facing.
+One guide populated (`editor`). Add more as modules become polished and user-facing.

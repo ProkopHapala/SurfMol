@@ -24,7 +24,7 @@ When implementing or debugging a topic (e.g. "UFF bond evaluation", "AABB collis
 - `nonbonded.md` — LJ / Coulomb / H-bond non-bonded interactions
 - `rigid_body.md` — 6-DOF quaternion rigid body dynamics
 - **`raff.md`** — RigidAtomFF (RAFF): port-based rigid-atom FF, rotation solvers, XPBD/force-MD/projective, split-collision, GPU layouts. **Populated 2026-09-28.**
-- `collision.md` — AABB broad phase, uniform grid, spatial hashing
+- ~~`collision.md`~~ — merged into `spatial_acceleration.md` (broad-phase collision is part of spatial acceleration)
 - `projective_dynamics.md` — Projective / position-based dynamics for relaxation
 - `gridff.md` — B-spline grid interpolation for substrate potentials
 - `ewald2d.md` — 2D Ewald summation for periodic surfaces
@@ -33,8 +33,9 @@ When implementing or debugging a topic (e.g. "UFF bond evaluation", "AABB collis
 ## Populated topics
 
 - **`graph_algorithms.md`** — Positioned graph data contract (`pgraph`) + algorithms (`pgraph_ops`): adjacency (CSR/ELL), components, bridges, reorder. Parity with FireCore `MolecularGraph.h`, `Groups.h`, `CMesh.h`.
-- **`spatial_acceleration.md`** — `spacc` crate: AABB fitting, spatial hashing (Buckets). Parity with FireCore `Buckets.h`, `NBFF::initBBsFromGroups()`.
+- **`spatial_acceleration.md`** — `spacc` crate: AABB fitting, spatial hashing (Buckets), **broad-phase collision** (`broad_phase_pairs`, `BroadPhase` struct, `eval_broad`/`eval_nonbonded_broad`). Parity with FireCore `Buckets.h`, `NBFF::initBBsFromGroups()`, `NBFF::evalSortRange_BBs()`. **Updated 2026-09-29** with broad-phase collision implementation.
+- **`raff.md`** — RAFF cross-implementation map: port-based rigid-atom FF, 4 design axes (rotation solver, dynamics, non-bonded, GPU). Parity with FireCore `RRsp3.cl`, SPAMMM. **Populated 2026-09-28.**
 
 ## Status
 
-Two topics populated (`graph_algorithms`, `spatial_acceleration`). Remaining topics are placeholders — populate per topic as implementations are ported. Cross-reference `Import_other_Repos.md` for source locations in reference repos.
+Three topics populated (`graph_algorithms`, `spatial_acceleration`, `raff`). Remaining topics are placeholders — populate per topic as implementations are ported. Cross-reference `Import_other_Repos.md` for source locations in reference repos.

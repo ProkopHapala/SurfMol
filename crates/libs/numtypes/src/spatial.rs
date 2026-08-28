@@ -61,6 +61,27 @@ pub type SymMat3f = Vec6f;
 /// True if the AABB has valid (non-empty) bounds: lo <= hi in all axes.
 #[inline(always)] pub fn aabb_is_valid(bb: Aabb3d) -> bool { bb.a.x <= bb.b.x && bb.a.y <= bb.b.y && bb.a.z <= bb.b.z }
 
+/// Test if two AABBs overlap when expanded by `margin` on each side.
+/// Mirrors FireCore `RRsp3.cl:123-128` `bboxes_overlap(minA, maxA, minB, maxB, margin)`.
+#[inline(always)] pub fn aabb_overlap_margin(a: Aabb3d, b: Aabb3d, margin: f64) -> bool {
+    a.b.x + margin >= b.a.x && a.a.x <= b.b.x + margin &&
+    a.b.y + margin >= b.a.y && a.a.y <= b.b.y + margin &&
+    a.b.z + margin >= b.a.z && a.a.z <= b.b.z + margin
+}
+
+/// Squared distance from point `p` to AABB `bb` (0 if inside). Mirrors `RRsp3.cl` ghost-atom test.
+#[inline(always)] pub fn aabb_point_dist2(bb: Aabb3d, p: Vec3d) -> f64 {
+    let dx = if p.x < bb.a.x { bb.a.x - p.x } else if p.x > bb.b.x { p.x - bb.b.x } else { 0.0 };
+    let dy = if p.y < bb.a.y { bb.a.y - p.y } else if p.y > bb.b.y { p.y - bb.b.y } else { 0.0 };
+    let dz = if p.z < bb.a.z { bb.a.z - p.z } else if p.z > bb.b.z { p.z - bb.b.z } else { 0.0 };
+    dx*dx + dy*dy + dz*dz
+}
+
+/// Test if sphere (center `p`, radius `r`) overlaps AABB `bb`. Mirrors `Grid_dftb.py:240-244`.
+#[inline(always)] pub fn aabb_sphere_overlap(bb: Aabb3d, p: Vec3d, r: f64) -> bool {
+    aabb_point_dist2(bb, p) < r * r
+}
+
 // =======================================================================================
 // Symmetric 3×3 intrinsic functions
 // =======================================================================================
@@ -121,5 +142,32 @@ mod tests {
         assert!(aabb_overlap(a, b));
         let c = Aabb3d::new(Vec3d::new(3.0, 0.0, 0.0), Vec3d::new(4.0, 1.0, 1.0));
         assert!(!aabb_overlap(a, c));
+    }
+
+    #[test]
+    fn aabb_overlap_margin_test() {
+        let a = Aabb3d::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(2.0, 2.0, 2.0));
+        let c = Aabb3d::new(Vec3d::new(3.0, 0.0, 0.0), Vec3d::new(4.0, 1.0, 1.0));
+        // No margin: no overlap (gap = 1.0 in x)
+        assert!(!aabb_overlap_margin(a, c, 0.0));
+        // Margin 0.5: still no overlap (gap = 1.0 > 0.5)
+        assert!(!aabb_overlap_margin(a, c, 0.5));
+        // Margin 1.0: touching → overlap
+        assert!(aabb_overlap_margin(a, c, 1.0));
+        // Margin 1.5: clear overlap
+        assert!(aabb_overlap_margin(a, c, 1.5));
+    }
+
+    #[test]
+    fn aabb_sphere_overlap_test() {
+        let bb = Aabb3d::new(Vec3d::new(0.0, 0.0, 0.0), Vec3d::new(2.0, 2.0, 2.0));
+        // Point inside → distance 0
+        assert!(aabb_sphere_overlap(bb, Vec3d::new(1.0, 1.0, 1.0), 0.1));
+        // Point at distance 0.5 from box, radius 1.0 → overlap
+        assert!(aabb_sphere_overlap(bb, Vec3d::new(2.5, 1.0, 1.0), 1.0));
+        // Point at distance 0.5 from box, radius 0.1 → no overlap
+        assert!(!aabb_sphere_overlap(bb, Vec3d::new(2.5, 1.0, 1.0), 0.1));
+        // Point far away
+        assert!(!aabb_sphere_overlap(bb, Vec3d::new(10.0, 10.0, 10.0), 1.0));
     }
 }

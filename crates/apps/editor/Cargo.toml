@@ -14,6 +14,7 @@ molff = { workspace = true }
 surfff = { workspace = true }
 moltopo = { workspace = true }
 numtypes = { workspace = true }
+spacc = { workspace = true }
 molgui = { workspace = true }
 molrender = { workspace = true }
 wgpu = { workspace = true }

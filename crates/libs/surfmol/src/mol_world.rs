@@ -84,6 +84,32 @@ impl MolWorld {
         (eb, ea, ed, ei, enb, es)
     }
 
+    /// Evaluate all forces with broad-phase AABB culling for non-bonded.
+    /// Same as `eval_forces` but uses `nb.eval_broad` instead of `nb.eval`.
+    /// Must produce identical forces/energy (just fewer iterations).
+    pub fn eval_forces_broad(&mut self, bp: &molff::nonbonded::BroadPhase) -> (f64, f64, f64, f64, f64, f64) {
+        let natoms = self.natoms();
+        let apos = self.dyn_atoms.atoms.apos.as_slice();
+        let fapos = self.dyn_atoms.fapos.as_mut_slice();
+        let neighs = self.dyn_atoms.atoms.neighs.as_slice();
+        let neigh_bs = self.dyn_atoms.atoms.neigh_bs.as_slice();
+        let (eb, ea, ed, ei) = match self.bonded_mode {
+            BondedFFMode::Uff => self.uff.eval_forces(apos, fapos, neighs, neigh_bs),
+            BondedFFMode::RigidSp3 => (self.rigid_sp3.eval_forces(apos, fapos, &self.uff, neighs, neigh_bs), 0.0, 0.0, 0.0),
+            BondedFFMode::Raff => (0.0, 0.0, 0.0, 0.0),
+        };
+        let mut enb = 0.0;
+        let mut es = 0.0;
+        if let Some(ref mut nb) = self.nonbonded {
+            enb = nb.eval_broad(&mut fapos[0..natoms], &apos[0..natoms], bp);
+        }
+        if let (Some(ref surf), Some(ref nb)) = (&self.surface, &self.nonbonded) {
+            let plqs = nb.plqs.as_slice();
+            es = surf.eval_all_clamped(&apos[0..natoms], &plqs[0..natoms], &mut fapos[0..natoms], 100.0);
+        }
+        (eb, ea, ed, ei, enb, es)
+    }
+
     /// Single atom MD step. Returns (v·f, v·v, f·f) for convergence/instability checks.
     #[inline(always)]
     pub fn move_atom_md(&mut self, i: usize, dt: f64, flim: f64, cdamp: f64) -> (f64, f64, f64) {

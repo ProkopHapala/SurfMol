@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use glam::{Quat, Vec2, Vec3};
 use surfmol::mol_world::{BondedFFMode, MolWorld};
-use molff::nonbonded::NonBondedFF;
-use molff::raff::{RaffState, RaffTopology, RaffConfig, NbConfig, NbParams, OrientMode, eval_port_forces, eval_nonbonded, quat_from_omega_dt, quat_mul, quat_normalize, quat_conj};
+use molff::nonbonded::{NonBondedFF, BroadPhase};
+use molff::raff::{RaffState, RaffTopology, RaffConfig, NbConfig, NbParams, OrientMode, eval_port_forces, eval_nonbonded, eval_nonbonded_broad, quat_from_omega_dt, quat_mul, quat_normalize, quat_conj};
 use molrender::impostor::{AtomInstance, ImpostorRenderer};
 use molrender::line_renderer::{LineRenderer, LineVertex};
 use molrender::surface_renderer::SurfaceRenderer;
 use numtypes::Vec3d;
+use spacc::aabb::aabb_edges;
 use moltopo::xyz;
 use moltopo::assign_uff;
 use moltopo::builder;
@@ -87,6 +88,10 @@ struct App {
     raff_e_port: f64,
     raff_e_nb: f64,
     plane_2d: bool,  // constrain atoms to z=0 plane (for easier 2D testing)
+    // --- Broad-phase AABB collision ---
+    broad_phase: Option<BroadPhase>,  // None = O(N²) all-pairs; Some = AABB-culled
+    show_aabb: bool,  // render cluster bounding boxes
+    n_clusters: usize,  // number of molecules (clusters)
 }
 
 impl App {
@@ -126,16 +131,17 @@ impl App {
         // --- World setup (ported from old main.rs) ---
         let workspace_root = std::path::PathBuf::from(std::env!("CARGO_MANIFEST_DIR")).join("../../..");
         let args: Vec<String> = std::env::args().collect();
-        let mut copies_x: usize = 1; let mut copies_y: usize = 1; let mut spacing: f64 = 12.0;
+        let mut nmols: usize = 2; let mut layout = "lattice".to_string(); let mut spacing: f64 = 12.0;
         let mut group_size: usize = GROUP_SIZE_DEFAULT; let mut per_frame: i32 = PER_FRAME; let mut dt: f64 = 0.02;
-        let mut flag_raff = false; let mut flag_2d = false; let mut atom_scale: f32 = ATOM_SCALE;
+        let mut flag_raff = false; let mut flag_2d = false; let mut flag_show_aabb = false; let mut atom_scale: f32 = ATOM_SCALE;
         let mut xyz_path_arg: Option<String> = None;
         { let mut it = args.iter().skip(1); while let Some(a) = it.next() { match a.as_str() {
             "--raff" => { flag_raff = true; },
             "--2d" => { flag_2d = true; },
+            "--show-aabb" => { flag_show_aabb = true; },
             "--atom-scale" => { atom_scale = it.next().unwrap_or(&"0.25".to_string()).parse().unwrap_or(ATOM_SCALE); },
-            "--copies-x" => { copies_x = it.next().unwrap_or(&"1".to_string()).parse().unwrap_or(1); },
-            "--copies-y" => { copies_y = it.next().unwrap_or(&"1".to_string()).parse().unwrap_or(1); },
+            "--nmols" => { nmols = it.next().unwrap_or(&"2".to_string()).parse().unwrap_or(2); },
+            "--layout" => { layout = it.next().unwrap_or(&"lattice".to_string()).clone(); },
             "--spacing" => { spacing = it.next().unwrap_or(&"12.0".to_string()).parse().unwrap_or(12.0); },
             "--group-size" => { group_size = it.next().unwrap_or(&"32".to_string()).parse().unwrap_or(GROUP_SIZE_DEFAULT); },
             "--perFrame" => { per_frame = it.next().unwrap_or(&"100".to_string()).parse().unwrap_or(PER_FRAME); },
@@ -146,9 +152,90 @@ impl App {
         println!("Loading XYZ: {:?}", xyz_path);
         let sys = xyz::read_xyz(&xyz_path).expect("read_xyz failed"); println!("Loaded {} atoms", sys.elems.len());
 
+        // --- Multi-molecule layout: spawn `nmols` copies with non-overlapping AABBs ---
+        // Compute the molecule's own AABB to determine spacing.
+        let mut mol_min = Vec3d::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let mut mol_max = Vec3d::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in &sys.apos { mol_min.x = mol_min.x.min(p.x); mol_min.y = mol_min.y.min(p.y); mol_min.z = mol_min.z.min(p.z); mol_max.x = mol_max.x.max(p.x); mol_max.y = mol_max.y.max(p.y); mol_max.z = mol_max.z.max(p.z); }
+        let mol_size = Vec3d::new(mol_max.x - mol_min.x, mol_max.y - mol_min.y, mol_max.z - mol_min.z);
+        let mol_center = Vec3d::new((mol_min.x + mol_max.x) * 0.5, (mol_min.y + mol_max.y) * 0.5, (mol_min.z + mol_max.z) * 0.5);
+        // collision margin: max VdW radius (approx 1.7 for C) + 0.5 Å buffer
+        let rmax = 1.7; let coll_margin = rmax + 0.5;
+        // For lattice: spacing = max(mol_size.xy) + coll_margin, placed on a grid
+        // For random: place molecules with non-overlapping AABBs (tight touching by default)
         let mut apos_v3d = Vec::<Vec3d>::new(); let mut elems = Vec::<String>::new(); let mut charges = Vec::<f64>::new();
-        for iy in 0..copies_y { for ix in 0..copies_x { let shift = Vec3d::new((ix as f64) * spacing, (iy as f64) * spacing, 0.0); let i0 = apos_v3d.len(); apos_v3d.extend(sys.apos.iter().map(|p| Vec3d::set_add(*p, shift))); elems.extend(sys.elems.iter().cloned()); charges.extend(sys.charges.iter().copied()); assert!(apos_v3d.len() - i0 == sys.apos.len()); } }
-        println!("Spawned copies: {}x{} -> natoms={}", copies_x, copies_y, apos_v3d.len());
+        let mut cluster_ranges: Vec<[u32; 2]> = Vec::with_capacity(nmols);
+        let mol_natoms = sys.apos.len();
+        // Compute shifts for each molecule
+        let shifts: Vec<Vec3d> = match layout.as_str() {
+            "random" => {
+                // Random placement with non-overlapping AABBs (tight touching with collision margin)
+                use std::collections::HashSet;
+                let mut rng_state: u64 = 12345; // simple LCG for reproducibility
+                let mut placed_aabbs: Vec<(Vec3d, Vec3d)> = Vec::new();
+                let mut shifts_out = Vec::with_capacity(nmols);
+                let max_attempts = 1000;
+                for _ in 0..nmols {
+                    let mut found = false;
+                    for _attempt in 0..max_attempts {
+                        // LCG random in range [-span, span]
+                        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let rx = ((rng_state >> 33) as f64) / (1u64 << 31) as f64 * 2.0 - 1.0;
+                        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let ry = ((rng_state >> 33) as f64) / (1u64 << 31) as f64 * 2.0 - 1.0;
+                        let span = (nmols as f64).sqrt() * (mol_size.x.max(mol_size.y) + coll_margin * 2.0) * 0.7;
+                        let shift = Vec3d::new(rx * span, ry * span, 0.0);
+                        // Compute this molecule's AABB after shift (centered at origin + shift)
+                        let lo = Vec3d::new(shift.x - mol_size.x * 0.5, shift.y - mol_size.y * 0.5, -mol_size.z * 0.5);
+                        let hi = Vec3d::new(shift.x + mol_size.x * 0.5, shift.y + mol_size.y * 0.5, mol_size.z * 0.5);
+                        // Check non-overlap with all placed AABBs (with collision margin)
+                        let mut ok = true;
+                        for &(plo, phi) in &placed_aabbs {
+                            // AABB overlap test with margin
+                            if hi.x + coll_margin >= plo.x && lo.x <= phi.x + coll_margin &&
+                               hi.y + coll_margin >= plo.y && lo.y <= phi.y + coll_margin {
+                                ok = false; break;
+                            }
+                        }
+                        if ok {
+                            placed_aabbs.push((lo, hi));
+                            shifts_out.push(shift);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found { panic!("random layout: could not place molecule {} within {} attempts (try fewer molecules or larger spacing)", shifts_out.len(), max_attempts); }
+                }
+                let _ = HashSet::<()>::new();
+                shifts_out
+            }
+            _ => {
+                // "lattice" (default): grid layout with spacing = max(mol_size.xy) + coll_margin
+                let step = mol_size.x.max(mol_size.y) + coll_margin * 2.0 + spacing * 0.0; // spacing unused for lattice; use tight by default
+                let ncols = (nmols as f64).sqrt().ceil() as usize;
+                let mut shifts_out = Vec::with_capacity(nmols);
+                for i in 0..nmols {
+                    let ix = i % ncols; let iy = i / ncols;
+                    let shift = Vec3d::new((ix as f64) * step, (iy as f64) * step, 0.0);
+                    shifts_out.push(shift);
+                }
+                shifts_out
+            }
+        };
+        // Center the molecule at origin, then apply shift
+        for (mi, shift) in shifts.iter().enumerate() {
+            let i0 = apos_v3d.len();
+            for (p, (el, q)) in sys.apos.iter().zip(sys.elems.iter().zip(sys.charges.iter())) {
+                let centered = Vec3d::new(p.x - mol_center.x, p.y - mol_center.y, p.z - mol_center.z);
+                apos_v3d.push(Vec3d::set_add(centered, *shift));
+                elems.push(el.clone());
+                charges.push(*q);
+            }
+            cluster_ranges.push([i0 as u32, apos_v3d.len() as u32]);
+            let _ = mi;
+        }
+        let n_clusters = nmols;
+        println!("Spawned {} molecules (layout={}) -> natoms={}", nmols, layout, apos_v3d.len());
 
         let dat_dir_candidates = [workspace_root.join("tmp/FireCore_cpp/common_resources"), workspace_root.join("data")];
         let dat_dir = dat_dir_candidates.iter().find(|d| d.join("ElementTypes.dat").exists() && d.join("AtomTypes.dat").exists() && d.join("BondTypes.dat").exists() && d.join("AngleTypes.dat").exists()).cloned().unwrap_or_else(|| dat_dir_candidates[0].clone());
@@ -193,6 +280,16 @@ impl App {
             println!("Surface setup complete (NaCl lattice a={} Å)", LATTICE_A);
         }
 
+        // --- Broad-phase AABB setup: one cluster per molecule ---
+        // Only enable broad phase when there are multiple molecules (single molecule = O(N²) is fine)
+        let broad_phase: Option<BroadPhase> = if n_clusters > 1 {
+            let rcut = 8.0; // must match nonbonded cutoff
+            let mut bp = BroadPhase::new(cluster_ranges.clone(), rcut);
+            bp.rebuild(world.dyn_atoms.atoms.apos.as_slice());
+            println!("[BroadPhase] {} clusters, rcut={} Å, {} overlapping pairs", n_clusters, rcut, bp.pairs().len());
+            Some(bp)
+        } else { None };
+
         let mut cam = TrackballCam::new(Vec3::new(0.0, 1.0, 0.0), 6.0);
 
         if natoms > 0 {
@@ -236,7 +333,7 @@ impl App {
         // RAFF mode: use higher damping (0.1 → cdamp=0.9) and fewer steps/frame for stable relaxation
         let damping_init = if flag_raff { 0.1 } else { 0.0 };
         let per_frame_init = if flag_raff { 20 } else { per_frame };
-        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: show_surface_init, show_help: true, show_groups: false, show_ports: show_ports_init, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: damping_init, zero_v_on_opposition: true, per_frame: per_frame_init, atom_scale, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, clipboard: Clipboard::new(), etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0, kekule_editor, builder: b, show_kekule_editor: show_kekule_editor_init, show_hex_grid: true, show_ghost_hexes: true, edit_from_builder: false, raff_state: None, raff_topo: None, raff_cfg: RaffConfig { dt: 0.02, cdamp: 0.9, rot_damp: 0.9, flim: 1000.0, xpbd_iters: 4, xpbd_over_relax: 1.0, orient_mode: OrientMode::Adiabatic, ..Default::default() }, raff_nbcfg: NbConfig { enabled: false, rcut: 10.0, r_damp: 0.1, f_max: 50.0, k_coll: 100.0, excl_12: true, excl_13: true }, raff_nb_enabled: raff_nb_enabled_init, raff_e_port: 0.0, raff_e_nb: 0.0, plane_2d: flag_2d };
+        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: show_surface_init, show_help: true, show_groups: false, show_ports: show_ports_init, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: damping_init, zero_v_on_opposition: true, per_frame: per_frame_init, atom_scale, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, clipboard: Clipboard::new(), etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0, kekule_editor, builder: b, show_kekule_editor: show_kekule_editor_init, show_hex_grid: true, show_ghost_hexes: true, edit_from_builder: false, raff_state: None, raff_topo: None, raff_cfg: RaffConfig { dt: 0.02, cdamp: 0.9, rot_damp: 0.9, flim: 1000.0, xpbd_iters: 4, xpbd_over_relax: 1.0, orient_mode: OrientMode::Adiabatic, ..Default::default() }, raff_nbcfg: NbConfig { enabled: false, rcut: 10.0, r_damp: 0.1, f_max: 50.0, k_coll: 100.0, excl_12: true, excl_13: true }, raff_nb_enabled: raff_nb_enabled_init, raff_e_port: 0.0, raff_e_nb: 0.0, plane_2d: flag_2d, broad_phase, show_aabb: flag_show_aabb, n_clusters };
         // --raff: build RAFF topology immediately
         if flag_raff { app.build_raff_from_world(); }
         app.rebuild_surface_cache();
@@ -286,8 +383,17 @@ impl App {
             self.do_raff_step();
             return;
         }
+        // Rebuild broad-phase AABBs from current positions (if enabled)
+        if let Some(ref mut bp) = self.broad_phase {
+            bp.rebuild(self.world.dyn_atoms.atoms.apos.as_slice());
+        }
         for _ in 0..self.per_frame {
-            let (eb, ea, ed, ei, enb, es) = self.world.eval_forces();
+            // Use broad-phase eval when available (identical results, fewer iterations)
+            let (eb, ea, ed, ei, enb, es) = if let Some(ref bp) = self.broad_phase {
+                self.world.eval_forces_broad(bp)
+            } else {
+                self.world.eval_forces()
+            };
             self.eb = eb; self.ea = ea; self.ed = ed; self.ei = ei; self.enb = enb; self.es = es;
             self.etot = eb + ea + ed + ei + enb + es;
             // Atom dragging via spring force: only in sim mode (not edit mode)
@@ -330,6 +436,13 @@ impl App {
             topo.bond_params.push(molff::raff::PortParam { k_p: bp[0] * 0.5, l0: bp[1] });
         }
         topo.build_neighs_from_bonds(&bonds);
+        // State from current world positions
+        let ps = self.world.dyn_atoms.atoms.apos.as_slice();
+        // Set port geometry from initial neighbor directions (per-atom ARAP).
+        // This makes identity rotation perfectly align all ports, and the Wahba solver preserves
+        // the original local geometry. Idealized sp2/sp3 ports (set_port_geometry_from_types) would
+        // be geometrically inconsistent with the bond-list-order port assignment from build_neighs_from_bonds.
+        topo.set_port_geometry_from_reference(&ps[0..natoms].to_vec());
         // Set non-bonded params from element types (LJ σ from vdw radius, ε small, charge from xyz)
         for i in 0..natoms {
             let el = self.elems.get(i).map(|s| s.as_str()).unwrap_or("C");
@@ -338,8 +451,6 @@ impl App {
             // σ ≈ 2 * rvdw (LJ sigma ≈ 2× vdw radius), ε = 0.01 eV (weak default)
             topo.nb_params[i] = NbParams { sigma: 2.0 * rvdw, epsilon: 0.01, charge: q, radius: rvdw * 0.8 };
         }
-        // State from current world positions
-        let ps = self.world.dyn_atoms.atoms.apos.as_slice();
         let mut state = RaffState::new(natoms);
         state.set_positions(&ps[0..natoms].to_vec());
         // Initialize quaternions to identity (ports point in default directions)
@@ -366,14 +477,23 @@ impl App {
         cfg.rot_damp = 1.0 - self.damping;
         let mut nbcfg = self.raff_nbcfg;
         nbcfg.enabled = self.raff_nb_enabled;
+        // Rebuild broad-phase AABBs from current RAFF state positions (if enabled)
+        if let Some(ref mut bp) = self.broad_phase {
+            let pos_vec: Vec<Vec3d> = if let Some(ref state) = self.raff_state { state.pos[0..natoms].to_vec() } else { self.world.dyn_atoms.atoms.apos.as_slice()[0..natoms].to_vec() };
+            bp.rebuild(&pos_vec);
+        }
         for _ in 0..self.per_frame {
             let (state, topo) = self.raff_state_take();  // borrow workaround
             let mut fapos = vec![numtypes::VEC3D_ZERO; natoms];
             let mut tau = vec![numtypes::VEC3D_ZERO; natoms];
             // 1. Eval port forces
             let e_port = eval_port_forces(&state, &topo, &mut fapos, &mut tau);
-            // 2. Eval non-bonded (accumulates into fapos)
-            let e_nb = eval_nonbonded(&state, &topo, &nbcfg, &mut fapos);
+            // 2. Eval non-bonded (accumulates into fapos) — use broad phase if available
+            let e_nb = if let Some(ref bp) = self.broad_phase {
+                eval_nonbonded_broad(&state, &topo, &nbcfg, bp, &mut fapos)
+            } else {
+                eval_nonbonded(&state, &topo, &nbcfg, &mut fapos)
+            };
             // 3. Spring drag force on selected atom (mouse pulling)
             if !self.show_kekule_editor {
                 if let Some(idx) = self.selected {
@@ -515,6 +635,38 @@ impl App {
                             lines.push(LineVertex { pos: [pt.x, pt.y, pt.z], col: port_col });
                         }
                     }
+                }
+            }
+
+            // --- AABB bounding boxes (broad-phase visualization) ---
+            if self.show_aabb {
+                if let Some(ref bp) = self.broad_phase {
+                    // Tight AABBs (green)
+                    let tight_col: [f32; 4] = [0.0, 0.8, 0.2, 0.6];
+                    for bb in &bp.aabbs {
+                        let edges = aabb_edges(*bb);
+                        for k in 0..12 {
+                            let p0 = edges[k*2]; let p1 = edges[k*2+1];
+                            lines.push(LineVertex { pos: p0, col: tight_col });
+                            lines.push(LineVertex { pos: p1, col: tight_col });
+                        }
+                    }
+                    // Expanded AABBs (red, expanded by rcut) — shows the overlap test region
+                    let exp_col: [f32; 4] = [0.8, 0.2, 0.0, 0.4];
+                    let m = bp.rcut as f32;
+                    for bb in &bp.aabbs {
+                        let expanded = numtypes::Aabb3d::new(
+                            numtypes::Vec3d::new(bb.a.x - bp.rcut, bb.a.y - bp.rcut, bb.a.z - bp.rcut),
+                            numtypes::Vec3d::new(bb.b.x + bp.rcut, bb.b.y + bp.rcut, bb.b.z + bp.rcut),
+                        );
+                        let edges = aabb_edges(expanded);
+                        for k in 0..12 {
+                            let p0 = edges[k*2]; let p1 = edges[k*2+1];
+                            lines.push(LineVertex { pos: p0, col: exp_col });
+                            lines.push(LineVertex { pos: p1, col: exp_col });
+                        }
+                    }
+                    let _ = m;
                 }
             }
 
@@ -692,6 +844,7 @@ impl App {
                         "t" | "T" => { self.show_ports = !self.show_ports; needs_redraw = true; }
                         "k" | "K" => { self.show_labels = !self.show_labels; needs_redraw = true; }
                         "d" | "D" => { self.show_debug_cursor = !self.show_debug_cursor; needs_redraw = true; }
+                        "a" | "A" => { self.show_aabb = !self.show_aabb; println!("show_aabb = {}", self.show_aabb); needs_redraw = true; }
                         "p" | "P" => { if let Some(idx) = self.selected { self.pinned[idx] = !self.pinned[idx]; } needs_redraw = true; }
                         "c" | "C" => { self.cam = TrackballCam::new(Vec3::new(0.0, 1.0, 0.0), 6.0); self.dirty.camera = true; needs_redraw = true; }
                         "l" | "L" => { self.label_mode = match self.label_mode { LabelMode::None => LabelMode::AtomNumber, LabelMode::AtomNumber => LabelMode::AtomType, LabelMode::AtomType => LabelMode::Charge, LabelMode::Charge => LabelMode::ElementName, LabelMode::ElementName => LabelMode::None }; println!("label_mode = {:?}", self.label_mode); needs_redraw = true; }
@@ -1057,6 +1210,10 @@ impl App {
                 ui.label(egui::RichText::new(format!("Non-bonded (N): {}", nb_str)).size(14.0).color(egui::Color32::YELLOW));
                 let sf_str = if self.world.surface.is_some() { "NaCl" } else { "None" };
                 ui.label(egui::RichText::new(format!("Surface (M): {}", sf_str)).size(14.0).color(egui::Color32::YELLOW));
+                ui.checkbox(&mut self.show_aabb, "Show AABB (A)");
+                if let Some(ref bp) = self.broad_phase {
+                    ui.label(egui::RichText::new(format!("Clusters: {}, BP pairs: {}", self.n_clusters, bp.pairs().len())).size(12.0).color(egui::Color32::GRAY));
+                }
             });
 
         // RAFF settings panel (only shown in RAFF mode)
@@ -1291,10 +1448,14 @@ impl App {
                         "L                  -> cycle label mode",
                         "K                  -> toggle labels",
                         "D                  -> toggle debug cursor",
+                        "A                  -> toggle AABB bounding boxes",
                         "N                  -> toggle non-bonded",
                         "M                  -> toggle surface FF",
                         "",
                         "CLI: --raff --2d  (start in RAFF mode, 2D plane)",
+                        "     --nmols N    (number of molecules, default 2)",
+                        "     --layout L   (lattice|random, default lattice)",
+                        "     --show-aabb  (show bounding boxes)",
                         "     --atom-scale S (atom render size, default 0.25)",
                         "     [file.xyz]    (default: data/xyz/benzene.xyz)",
                     ];

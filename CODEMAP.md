@@ -3,7 +3,7 @@ type: developer-docs
 title: CODEMAP
 description: Repo structure, file inventory, crate dependency graph, pinned dependencies, and build/test commands.
 tags: [codemap, navigation, structure, dependencies]
-timestamp: 2026-08-25
+timestamp: 2026-09-29
 ---
 
 # CODEMAP
@@ -30,7 +30,7 @@ SurfMol/
 ├── crates/                   # Rust workspace (10 libs + 4 apps)
 │   ├── libs/                 # Library crates (no binary targets)
 │   └── apps/                 # Binary crates (CLI/GUI tools)
-└── userguide/                # End-user docs for finished modules
+└── userguide/                # End-user docs for finished modules (editor.md populated)
 ```
 
 ## 2. Rust workspace
@@ -68,8 +68,10 @@ crates/apps/   (4 binary crates)
 Apps depend on libs:
 - `buildff` → moltopo, numcore
 - `molengine` → surfmol, molff, moltopo, numcore
-- `editor` → surfmol, molff, surfff, moltopo, numcore, molgui, molrender
+- `editor` → surfmol, molff, surfff, moltopo, numcore, molgui, molrender, **spacc** (for `aabb_edges` visualization)
 - `molbrowser` → moltopo, numcore, molgui, molrender
+
+**Note:** `molff` now depends on `spacc` (for `BroadPhase` struct using `broad_phase_pairs` + `fit_range_aabbs`).
 
 ### Workspace dependencies (`Cargo.toml`)
 
@@ -112,7 +114,7 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | `src/mat.rs` | ~150 | `Mat3d`/`Mat4d` and `Mat4f`; `rows()`/`array()` views, `dot`, `mmul3`/`mmul4`/`mmul4f`, `outer`, `det`, `inverse`. `Mat4f` adds `look_at`, `ortho`, `to_arr4x4()` for graphics. |
 | `src/alloc.rs` | ~95 | `AlignedVec<T, A>` — 64-byte aligned allocator, `Deref`/`DerefMut` to `[T]`, `with_len_fill`, `resize_fill`, `push`. |
 | `src/graph.rs` | ~150 | `Index`, `INVALID`, `PGraph`, `PGraphView`, `Elements<N>`, `RaggedIndex` (replaces `Ragged`+`IndexGroups`), `Permutation`, `Partition`, `RangeGroups`, `CsrAdj`, `FixedRows<K>`, `FixedAdj<K>` (using aligned `AlignedVec`). |
-| `src/spatial.rs` | ~70 | `Aabb3d`/`Aabb3f` and `SymMat3d`/`SymMat3f` as `Vec6` aliases; standalone `aabb_*` and `sym3_*` intrinsic functions. |
+| `src/spatial.rs` | ~90 | `Aabb3d`/`Aabb3f` and `SymMat3d`/`SymMat3f` as `Vec6` aliases; standalone `aabb_*` and `sym3_*` intrinsic functions. `aabb_overlap_margin`, `aabb_point_dist2`, `aabb_sphere_overlap` added for broad-phase collision. |
 
 ### `numcore` (`crates/libs/numcore/`, ~110 LOC)
 *Numerical algorithms. Does **not** re-export `numtypes` data; owns `fastmath` and `linalg` only.*
@@ -152,27 +154,28 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | `src/reorder.rs` | 154 | `partition_to_index_groups`, `group_aware_permutation` (→ `Permutation` + `RangeGroups`), `apply_permutation`, `permute_edges`. |
 | `src/geometry.rs` | 87 | `edge_vec`, `edge_length`, `edge_lengths`, `bounding_box`, `bounding_box_center`, `bounding_box_span`. |
 
-### `spacc` (`crates/libs/spacc/`, ~220 LOC)
-*Spatial acceleration — rebuildable caches, no molecular semantics. Operates on `numtypes` layouts.*
+### `spacc` (`crates/libs/spacc/`, ~280 LOC)
+*Spatial acceleration — rebuildable caches, no molecular semantics. Operates on `numtypes` layouts. See [`/doc/topical_audit/spatial_acceleration.md`](/doc/topical_audit/spatial_acceleration.md).*
 
 | File | LOC | Contents |
 |------|-----|----------|
 | `src/lib.rs` | 6 | Module declarations: aabb, buckets. |
-| `src/aabb.rs` | 96 | `fit_aabb(pos, ids)`, `fit_group_aabbs(pos, RaggedIndex, out)`, `fit_range_aabbs(pos, ranges, out)`. Uses `numtypes::Aabb3d` and `numtypes::RaggedIndex`. |
+| `src/aabb.rs` | 155 | `fit_aabb(pos, ids)`, `fit_group_aabbs(pos, RaggedIndex, out)`, `fit_range_aabbs(pos, ranges, out)`. **`broad_phase_pairs(cluster_aabbs, margin)`** — O(N²) over clusters, returns overlapping `(i,j)` pairs. **`aabb_edges(bb)`** — 12 edge segments for line rendering. Uses `numtypes::Aabb3d` and `numtypes::RaggedIndex`. |
 | `src/buckets.rs` | 95 | `Buckets` — spatial hashing via count→prefix→scatter (FireCore `Buckets.h` pattern). `build(cell_of_obj)`; `cell_objects(c)`. Single `counts` buffer doubles as cursor; no extra allocation during rebuild. |
 
-### `molff` (`crates/libs/molff/`, 2289 LOC)
-*Intra-molecular forcefields. See `notes/designs/` for forcefield data ownership. See `/doc/topical_audit/raff.md` for RAFF cross-implementation map.*
+### `molff` (`crates/libs/molff/`, 2500 LOC)
+*Intra-molecular forcefields. See `notes/designs/` for forcefield data ownership. See `/doc/topical_audit/raff.md` for RAFF cross-implementation map and `/doc/topical_audit/spatial_acceleration.md` for broad-phase collision.*
 
 | File | LOC | Contents |
 |------|-----|----------|
 | `src/lib.rs` | 6 | Crate root: `pub mod uff; nonbonded; rigid_sp3; raff;` |
 | `src/uff.rs` | 665 | `Uff` — bonded forcefield. `Buckets` (spatial partition for force assembly). SoA `AlignedVec` arrays. `eval_atom_bonds()`, `eval_angle_prokop()`, `eval_dihedral_prokop()` (Fourier series via `Vec2d::mul_cmplx`). |
-| `src/nonbonded.rs` | 300 | `NonBondedFF` — LJ + Coulomb + H-bond. `reqs`, `plqs`, `make_second_neighs()` (1-2 + 1-3 exclusion), `make_pbc_shifts()`. `eval()` / `eval_pbc()` — O(N²) with exclusion skip. |
+| `src/nonbonded.rs` | 400 | `NonBondedFF` — LJ + Coulomb + H-bond. `reqs`, `plqs`, `make_second_neighs()` (1-2 + 1-3 exclusion), `make_pbc_shifts()`. `eval()` / `eval_pbc()` — O(N²) with exclusion skip. **`BroadPhase`** struct (cluster ranges + AABB cache + rcut). **`eval_broad()`** — AABB-culled eval, identical results to `eval()`. |
 | `src/rigid_sp3.rs` | 237 | `RigidSp3FF` — **legacy** port-based rigid body FF (single variant: Dynamic+ForceMD). Superseded by `raff.rs`. |
-| `src/raff.rs` | 1085 | **RAFF** — multi-variant port-based rigid-atom FF. `RaffTopology`/`RaffState`/`RaffConfig`/`NbConfig`. Port forces, Wahba/Horn rotation solver, `step_force_md`, `step_xpbd`, `step_proximal`, `solve_collisions`, `eval_nonbonded`, FD checks. See `/doc/topical_audit/raff.md`. |
+| `src/raff.rs` | 1200 | **RAFF** — multi-variant port-based rigid-atom FF. `RaffTopology`/`RaffState`/`RaffConfig`/`NbConfig`. Port forces, Wahba/Horn rotation solver, `step_force_md`, `step_xpbd`, `step_proximal`, `solve_collisions`, `eval_nonbonded`, **`eval_nonbonded_broad`**, FD checks. See `/doc/topical_audit/raff.md`. |
 | `tests/test_rigid_sp3.rs` | 110 | Tetrahedral sp3 center (CH4-like) + water test. |
 | `tests/test_raff.rs` | 607 | 22 tests: port forces, rotation convergence, energy/momentum conservation, XPBD constraints, collisions, adiabatic torque residual. All passing. |
+| `tests/test_broad_phase.rs` | 177 | **3 parity tests**: broad-phase vs O(N²) for `NonBondedFF::eval_broad` and `raff::eval_nonbonded_broad`. Near/far molecule configurations. All passing. |
 
 ### `surfff` (`crates/libs/surfff/`, 512 LOC)
 *Surface interaction forcefield.*
@@ -188,7 +191,7 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | File | LOC | Contents |
 |------|-----|----------|
 | `src/lib.rs` | 6 | Crate root: `pub mod mol_world; import;` |
-| `src/mol_world.rs` | 140 | `MolWorld` — orchestrator. `BondedFFMode::{Uff, RigidSp3}`. Owns `DynamicAtoms`, `Uff`, `RigidSp3FF`, optional `NonBondedFF`, optional `SurfaceFolded`. `eval_forces()`, `run_md()`, `move_atom_md()`. |
+| `src/mol_world.rs` | 165 | `MolWorld` — orchestrator. `BondedFFMode::{Uff, RigidSp3, Raff}`. Owns `DynamicAtoms`, `Uff`, `RigidSp3FF`, optional `NonBondedFF`, optional `SurfaceFolded`. `eval_forces()`, **`eval_forces_broad(bp)`** (AABB-culled), `run_md()`, `move_atom_md()`. |
 | `src/import.rs` | 13 | `load_topology_from_json()` → `(Uff, Vec<String>)`. |
 
 ### `molrender` (`crates/libs/molrender/`, 939 LOC)
@@ -235,12 +238,12 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 |------|-----|----------|
 | `src/main.rs` | 90 | Rhai-scripted MD/relaxation. Registers `load_topology`, `eval_forces`, `step_md`, `relax`, `get_natoms`. `SimulationEngine` wraps `MolWorld` in `Arc<Mutex>`. |
 
-### `editor` (`crates/apps/editor/`, 1433 LOC)
-*Interactive molecular editor and on-surface MD simulator. wgpu + egui + winit. Supports UFF / RigidSp3 / RAFF forcefield modes.*
+### `editor` (`crates/apps/editor/`, 1600 LOC)
+*Interactive molecular editor and on-surface MD simulator. wgpu + egui + winit. Supports UFF / RigidSp3 / RAFF forcefield modes. See [`/userguide/editor.md`](/userguide/editor.md) for end-user guide.*
 
 | File | LOC | Contents |
 |------|-----|----------|
-| `src/main.rs` | 1433 | 3D molecular editor. TrackballCam, atom picking (ray-sphere), bond/port drawing, hex-grid Kekule editing, MD relaxation (Uff/RigidSp3/Raff + NonBonded + NaCl surface), RAFF integration (`do_raff_step`, spring drag, 2D constraint, stopping criterion, port sync), surface potential visualization, atom-scale CLI/GUI, clipboard support. CLI: `--raff`, `--2d`, `--atom-scale`, `--perFrame`, `--dt`. |
+| `src/main.rs` | 1600 | 3D molecular editor. TrackballCam, atom picking (ray-sphere), bond/port drawing, hex-grid Kekule editing, MD relaxation (Uff/RigidSp3/Raff + NonBonded + NaCl surface), RAFF integration (`do_raff_step`, spring drag, 2D constraint, stopping criterion, port sync), surface potential visualization, atom-scale CLI/GUI, clipboard support. **Multi-molecule loading** (`--nmols N`, `--layout lattice\|random`), **AABB broad-phase collision** (`BroadPhase` struct, `eval_forces_broad`/`eval_nonbonded_broad`), **AABB visualization** (`--show-aabb`, green tight + red expanded boxes). CLI: `--raff`, `--2d`, `--atom-scale`, `--nmols`, `--layout`, `--show-aabb`, `--perFrame`, `--dt`. |
 
 ### `molbrowser` (`crates/apps/molbrowser/`, 250 LOC)
 *Gallery browser for XYZ molecule files. eframe (egui).*
@@ -326,7 +329,8 @@ cargo clippy --workspace                 # lints
 | `Uff` | molff | Bonded FF: SoA arrays, Buckets force assembly, hneigh |
 | `RigidSp3FF` | molff | **Legacy** port-based rigid body: quat, omega, tau. Single variant (Dynamic+ForceMD). |
 | `RAFF` | molff | **Multi-variant** port-based rigid-atom FF: `RaffTopology`/`RaffState`, port forces, Wahba/Horn rotation, `step_force_md`/`step_xpbd`/`step_proximal`, `eval_nonbonded`, `solve_collisions`. 22 tests. See `/doc/topical_audit/raff.md`. |
-| `NonBondedFF` | molff | LJ+Coulomb+Hbond: reqs, plqs, excl, PBC shifts |
+| `NonBondedFF` | molff | LJ+Coulomb+Hbond: reqs, plqs, excl, PBC shifts. `eval_broad()` for AABB-culled eval. |
+| `BroadPhase` | molff | Per-cluster AABB broad-phase collision: cluster ranges + rebuildable AABB cache + rcut. Used by `eval_broad` / `eval_nonbonded_broad`. |
 | `SurfaceFolded` | surfff | Separable Fourier basis surface potential |
 | `MolWorld` | surfmol | Coordinator: DynamicAtoms + Uff + RigidSp3FF + optional NonBondedFF/SurfaceFolded |
 | `Buckets` | spacc | Spatial hashing (count→prefix→scatter); replaces `molff::uff::Buckets` long-term |
@@ -353,6 +357,10 @@ Each ported module cites its reference (see `AGENTS.md` §Rule 6 — Parity Work
 | `pgraph_ops::partition_to_index_groups` | FireCore C++ | `Groups::setGroupMapping()` |
 | `spacc::Buckets` | FireCore/SSE C++ | `Buckets.h` |
 | `spacc::fit_group_aabbs` | FireCore C++ | `NBFF::initBBsFromGroups()` |
+| `spacc::broad_phase_pairs` | FireCore C++ | `NBFF::evalSortRange_BBs()` |
+| `numtypes::aabb_overlap_margin` | FireCore OpenCL | `RRsp3.cl:123-128` (`bboxes_overlap` with margin) |
+| `numtypes::aabb_sphere_overlap` | FireCore Python | `Grid_dftb.py:240-244` (point-to-AABB distance) |
+| `molff::BroadPhase` + `eval_broad` | FireCore C++ | `NBFF.h` bucket-pair broad phase + narrow phase |
 
 See `Import_other_Repos.md` for the full cross-repo import map.
 
@@ -361,10 +369,10 @@ See `Import_other_Repos.md` for the full cross-repo import map.
 - **OpenCL integration:** `ocl` 0.19 is declared in workspace deps but no crate uses it yet. CPU Rust is authoritative.
 - **RAFF (RigidAtomFF):** `RigidSp3FF` is the precursor; full RAFF not yet implemented. See `DESIGN_GOALS.md` §2.
 - **Projective / Position-Based Dynamics:** not yet implemented. See `DESIGN_GOALS.md` §3.
-- **AABB collision acceleration in NonBondedFF:** `spacc` provides the structures but `NonBondedFF` is still O(N²). See `DESIGN_GOALS.md` §2.3.
+- **AABB collision acceleration in NonBondedFF:** **Implemented** (2026-09-29). `BroadPhase` struct + `eval_broad` / `eval_nonbonded_broad` + `MolWorld::eval_forces_broad`. Parity tests pass. See [`/doc/topical_audit/spatial_acceleration.md`](/doc/topical_audit/spatial_acceleration.md) and [`/notes/designs/cluster_aabb_collision.md`](/notes/designs/cluster_aabb_collision.md). PBC + broad phase not yet supported.
 - **Global optimization (GOpt):** not yet implemented.
 - **NPZ format:** `buildff` output and `molengine` input planned to support NPZ (currently JSON only).
 - **`pgraph_ops` P2 modules:** `loops.rs` (cycle/ring detection), `selection.rs` (SDF selection), `picking.rs` (ray picking), `edit.rs` (editing helpers) not yet implemented.
 - **`spacc` P1 modules:** `uniform_grid.rs`, `morton.rs` not yet implemented.
 - **`moltopo` migration to `pgraph`:** `moltopo` still uses its own `Topology`/`Builder` structs; planned to build on `pgraph`/`pgraph_ops` per `notes/designs/topology_builder.md`.
-- **`CODEMAP.md` status:** this file is current as of 2026-08-25.
+- **`CODEMAP.md` status:** this file is current as of 2026-09-29.

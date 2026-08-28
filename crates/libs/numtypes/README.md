@@ -43,6 +43,9 @@ The project-wide low-level memory vocabulary. Defines data layouts and the tiny 
 - **`spatial.rs`** — `Aabb3d`/`Aabb3f` and `SymMat3d`/`SymMat3f` as `Vec6` aliases.
   - Standalone `aabb_*` and `sym3_*` functions.
   - `aabb_empty`, `aabb_include`, `aabb_contains`, `aabb_merge`, `aabb_overlap`, `aabb_center`, `aabb_size`, `aabb_max_extent`, `aabb_is_valid`.
+  - **`aabb_overlap_margin(a, b, margin)`** — AABB overlap test with per-axis margin expansion (mirrors FireCore `RRsp3.cl:123-128`).
+  - **`aabb_point_dist2(bb, p)`** — squared distance from point to AABB (0 if inside).
+  - **`aabb_sphere_overlap(bb, p, r)`** — sphere-AABB overlap test (mirrors `Grid_dftb.py:240-244`).
   - `sym3_det`, `sym3_dot`, `sym3_outer`, `sym3_quadratic`.
 
 ## Unsafe policy

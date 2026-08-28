@@ -1,9 +1,47 @@
 use numtypes::Quat4i;
-use numtypes::{Vec3d, VEC3D_ZERO as VEC3_ZERO};
+use numtypes::{Vec3d, VEC3D_ZERO as VEC3_ZERO, Aabb3d, aabb_empty, aabb_is_valid};
 use numtypes::AlignedVec;
+use spacc::aabb::fit_range_aabbs;
+use spacc::aabb::broad_phase_pairs;
 
 const EXCL_MAX: usize = 16;
 const COULOMB_CONST: f64 = 14.3996448915; // eV*A / e^2
+
+/// Broad-phase acceleration for non-bonded pair evaluation.
+/// Holds per-cluster contiguous atom ranges and a rebuildable AABB cache.
+/// One cluster = one molecule (or any sub-grouping the caller chooses).
+/// AABBs are position-only at fit time; `rcut` margin is applied at query time.
+/// Mirrors FireCore `NBFF.h` bucket-pair broad phase.
+pub struct BroadPhase {
+    /// `[i0, i1)` atom index ranges per cluster (contiguous packed fragments).
+    pub cluster_ranges: Vec<[u32; 2]>,
+    /// Cached AABBs, one per cluster. Invalidated by geometry changes — caller must `rebuild`.
+    pub aabbs: Vec<Aabb3d>,
+    /// Interaction cutoff used for AABB expansion during pair search.
+    pub rcut: f64,
+}
+
+impl BroadPhase {
+    /// Create from cluster ranges. AABBs are empty until `rebuild` is called.
+    pub fn new(cluster_ranges: Vec<[u32; 2]>, rcut: f64) -> Self {
+        let n = cluster_ranges.len();
+        Self { cluster_ranges, aabbs: vec![aabb_empty(); n], rcut }
+    }
+
+    /// Rebuild AABB cache from current positions. Must be called after geometry changes.
+    pub fn rebuild(&mut self, apos: &[Vec3d]) {
+        assert!(self.aabbs.len() == self.cluster_ranges.len(), "BroadPhase::rebuild: aabbs.len() {} != cluster_ranges.len() {}", self.aabbs.len(), self.cluster_ranges.len());
+        fit_range_aabbs(apos, &self.cluster_ranges, &mut self.aabbs);
+        for (i, bb) in self.aabbs.iter().enumerate() {
+            assert!(aabb_is_valid(*bb), "BroadPhase::rebuild: cluster {} produced invalid AABB (empty cluster?)", i);
+        }
+    }
+
+    /// Return overlapping cluster pairs `(i, j)` with `i < j`, expanded by `rcut`.
+    pub fn pairs(&self) -> Vec<(u32, u32)> {
+        broad_phase_pairs(&self.aabbs, self.rcut)
+    }
+}
 
 pub struct NonBondedFF {
     pub natoms: usize,
@@ -200,6 +238,87 @@ impl NonBondedFF {
             let (e, mut fi) = (0.0, VEC3_ZERO);
             etot += self.eval_nb_atom(ia, apos, &mut fi);
             fapos[ia].add(fi);
+        }
+        etot
+    }
+
+    /// Evaluate non-bonded with broad-phase AABB culling (no PBC).
+    /// Only atom pairs whose cluster AABBs overlap (expanded by `bp.rcut`) are evaluated.
+    /// Within each overlapping cluster pair, all atom pairs are checked (with exclusion + cutoff).
+    /// Must produce **identical** forces/energy as `eval` — this is just a culling optimization.
+    /// Note: `eval` evaluates each pair from both directions (i→j and j→i), double-counting energy.
+    /// This implementation counts each pair once and doubles the energy to match `eval`'s convention.
+    pub fn eval_broad(&mut self, fapos: &mut [Vec3d], apos: &[Vec3d], bp: &BroadPhase) -> f64 {
+        assert_eq!(fapos.len(), self.natoms, "eval_broad: fapos length mismatch");
+        assert_eq!(apos.len(), self.natoms, "eval_broad: apos length mismatch");
+        assert!(!self.b_pbc || self.npbc == 0, "eval_broad: PBC not supported with broad phase yet");
+        let r2damp = self.rdamp * self.rdamp;
+        let f2max = self.fmax_nonbonded * self.fmax_nonbonded;
+        let rcut2 = self.rcut2;
+        let excl = self.excl.as_slice();
+        let reqs = self.reqs.as_slice();
+        let mut etot = 0.0;
+        // 1. Intra-cluster pairs (atoms within the same molecule)
+        for cr in &bp.cluster_ranges {
+            let i0 = cr[0] as usize; let i1 = cr[1] as usize;
+            for ia in i0..i1 {
+                let pi = apos[ia];
+                let reqi = reqs[ia];
+                let i0_ex = ia * EXCL_MAX;
+                let mut iex = i0_ex;
+                let iex_end = i0_ex + EXCL_MAX - 1;
+                let mut jex = excl[iex];
+                let mut fi = VEC3_ZERO;
+                for ja in (ia+1)..i1 {
+                    if jex != -1 {
+                        if iex < iex_end && jex < ja as i32 { iex += 1; }
+                        jex = excl[iex];
+                    }
+                    if jex == ja as i32 { continue; }
+                    let dp = Vec3d::set_sub(apos[ja], pi);
+                    if dp.norm2() > rcut2 { continue; }
+                    let reqij = Self::combine_req(reqs[ja], reqi);
+                    let (eij, mut fij) = Self::get_ljqh(dp, reqij, r2damp);
+                    if self.b_clamp_nonbonded { Self::clamp_force_vec(&mut fij, f2max); }
+                    etot += 2.0 * eij;  // ×2 to match eval's double-counted convention
+                    fi.add(fij);
+                    fapos[ja].sub(fij);  // Newton's 3rd law
+                }
+                fapos[ia].add(fi);
+            }
+        }
+        // 2. Inter-cluster pairs (atoms in different molecules, only if AABBs overlap)
+        let pairs = bp.pairs();
+        for &(ci, cj) in &pairs {
+            let ri = bp.cluster_ranges[ci as usize];
+            let rj = bp.cluster_ranges[cj as usize];
+            let i0 = ri[0] as usize; let i1 = ri[1] as usize;
+            let j0 = rj[0] as usize; let j1 = rj[1] as usize;
+            for ia in i0..i1 {
+                let pi = apos[ia];
+                let reqi = reqs[ia];
+                let i0_ex = ia * EXCL_MAX;
+                let mut iex = i0_ex;
+                let iex_end = i0_ex + EXCL_MAX - 1;
+                let mut jex = excl[iex];
+                let mut fi = VEC3_ZERO;
+                for ja in j0..j1 {
+                    if jex != -1 {
+                        if iex < iex_end && jex < ja as i32 { iex += 1; }
+                        jex = excl[iex];
+                    }
+                    if jex == ja as i32 { continue; }
+                    let dp = Vec3d::set_sub(apos[ja], pi);
+                    if dp.norm2() > rcut2 { continue; }
+                    let reqij = Self::combine_req(reqs[ja], reqi);
+                    let (eij, mut fij) = Self::get_ljqh(dp, reqij, r2damp);
+                    if self.b_clamp_nonbonded { Self::clamp_force_vec(&mut fij, f2max); }
+                    etot += 2.0 * eij;  // ×2 to match eval's double-counted convention
+                    fi.add(fij);
+                    fapos[ja].sub(fij);  // Newton's 3rd law
+                }
+                fapos[ia].add(fi);
+            }
         }
         etot
     }

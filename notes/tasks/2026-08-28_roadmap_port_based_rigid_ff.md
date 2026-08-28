@@ -70,11 +70,14 @@ See [`/doc/topical_audit/raff.md`](/doc/topical_audit/raff.md) for the full cros
 - [ ] Split-collision: piecewise quadratic (`getSR_x2_smooth`)
 - [ ] Split-collision: hard contact + erf/erfc (`SoftSplineHardAtomCore.chat.md`)
 - [ ] Split-collision: compact-exp split (reuses compact-exp kernel)
+- [x] **AABB broad-phase for non-bonded** (per-cluster AABB cull → narrow phase). Design: [`cluster_aabb_collision.md`](../designs/cluster_aabb_collision.md). Implemented: `aabb_overlap_margin` + `broad_phase_pairs` in `spacc`/`numtypes`, `BroadPhase` struct + `eval_broad`/`eval_nonbonded_broad` in `molff`, `eval_forces_broad` in `MolWorld`, editor `--nmols`/`--layout`/`--show-aabb` CLI + GUI visualization. Parity tests pass (`tests/test_broad_phase.rs`).
+- [ ] **Per-type port reindexing** — `set_port_geometry_from_types` uses idealized sp2/sp3 directions, but `build_neighs_from_bonds` assigns ports in bond-list order, causing geometrically inconsistent port-to-neighbor pairing. Fix: add `reindex_ports_by_direction` that permutes neighbor slots to match idealized port directions. Per-atom ARAP (`set_port_geometry_from_reference`) is the current workaround/default. See `raff_theory_equations.md` §1.4.
 - [ ] Capping atoms as rigid appendix (H = host_pos + host_quat · port · l_H)
 - [ ] Electron-pair / sigma-hole site system
 - [ ] Projective dynamics wiring to editor + end-to-end test
 - [ ] Side-by-side forcefield comparison mode in editor
 - [ ] Energy/momentum HUD in editor (E_pot, E_kin, |P|, |L| real-time)
+- [x] **AABB broad-phase collision** (per-cluster AABB cull → narrow phase) — `spacc::broad_phase_pairs`, `molff::BroadPhase`, `eval_broad`/`eval_nonbonded_broad`, editor `--nmols`/`--layout`/`--show-aabb`. Parity tests pass.
 - [ ] GPU: port CPU force-eval to OpenCL (`molff-ocl` crate)
 - [ ] GPU: layout variants 4a–4e + benchmark
 - [ ] GPU: CPU↔GPU parity test

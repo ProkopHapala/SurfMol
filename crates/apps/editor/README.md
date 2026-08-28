@@ -29,13 +29,17 @@ Interactive molecular editor and physics simulator for molecules on surfaces. Co
 - **Port rendering sync**: in RAFF mode, ports are drawn from `topo.port_tip(state, i, s)` which applies `state.quat[i]` — the actual rotated port arm from the physics solver. In RigidSp3 mode, ports use fixed geometry from `world.rigid_sp3.get_port_tip()`.
 - **Surface potential texture** (`rebuild_surface_cache`): samples NaCl surface on 257×257 grid aligned to lattice parallelogram, evaluates `surf.eval_atom` with unit charge probe, maps to blue-white-red colormap, uploads as wgpu texture.
 - **Builder-to-Sim pipeline** ("Bake to Sim"): `cleanup_dead` → `bake` → `MolWorld::from_topology` → rebuild neighbor lists → reassign UFF types → rebuild nonbonded FF with REQ → reload .dat params → rebuild surface.
+- **Broad-phase AABB collision** (`--nmols N`): when multiple molecules are loaded, a `BroadPhase` struct (`molff::nonbonded::BroadPhase`) holds per-cluster AABBs and a cutoff. Each relaxation step rebuilds AABBs from current positions, then `eval_broad` / `eval_nonbonded_broad` only evaluates atom pairs whose cluster AABBs overlap (expanded by `rcut`). This produces identical forces/energy as the O(N²) all-pairs path (verified by parity tests in `tests/test_broad_phase.rs`). AABBs are visualized with `--show-aabb` (green = tight, red = expanded by rcut). Design: `notes/designs/cluster_aabb_collision.md`.
 
 ## CLI arguments
 
 - `--raff` — start in RAFF mode (simulation, not Kekule editor; show ports; enable non-bonded; disable surface; damping=0.1, per_frame=20)
 - `--2d` — flatten atoms to z=0 plane, constrain forces/velocities/positions to 2D
 - `--atom-scale S` — atom render size multiplier (default 0.25, range 0.05–0.5; also adjustable via GUI slider)
-- `--copies-x N`, `--copies-y N`, `--spacing S` — replicate input molecule in x/y
+- `--nmols N` — number of molecule copies to spawn (default 2). Each molecule is its own cluster for broad-phase AABB collision.
+- `--layout L` — molecule placement strategy: `lattice` (default, grid with tight touching AABBs + collision margin) or `random` (non-overlapping random placement)
+- `--show-aabb` — render cluster bounding boxes (green = tight AABB, red = expanded by rcut for overlap test)
+- `--spacing S` — extra spacing between molecules (default 12.0, used by lattice layout)
 - `--group-size N` — group size for replicated copies
 - `--perFrame N` — MD iterations per render frame (default 100, or 20 with `--raff`)
 - `--dt T` — MD timestep (default 0.02)
@@ -43,7 +47,7 @@ Interactive molecular editor and physics simulator for molecules on surfaces. Co
 
 ## Keyboard shortcuts
 
-`H` help · `SPACE` run/stop relaxation · `B` bonds · `S` surface · `G` groups · `T` ports · `K` labels · `D` debug cursor · `P` pin · `C` reset camera · `L` cycle label mode · `E` toggle editor · `F` cycle bonded FF (Uff→RigidSp3→Raff) · `1-4` edit modes · `N` nonbonded · `M` surface · `[` `]` adjust pick_k · `-` `=` adjust per_frame · `ESC` deselect
+`H` help · `SPACE` run/stop relaxation · `B` bonds · `S` surface · `G` groups · `T` ports · `K` labels · `D` debug cursor · `A` toggle AABB bounding boxes · `P` pin · `C` reset camera · `L` cycle label mode · `E` toggle editor · `F` cycle bonded FF (Uff→RigidSp3→Raff) · `1-4` edit modes · `N` nonbonded · `M` surface · `[` `]` adjust pick_k · `-` `=` adjust per_frame · `ESC` deselect
 
 ## GUI panels
 
@@ -72,7 +76,10 @@ Interactive molecular editor and physics simulator for molecules on surfaces. Co
 
 ## See also
 
+- **[`/userguide/editor.md`](/userguide/editor.md)** — end-user guide with CLI examples, GUI controls, and molecule walkthroughs
 - [`/doc/topical_audit/raff.md`](/doc/topical_audit/raff.md) — RAFF cross-implementation map
+- [`/doc/topical_audit/spatial_acceleration.md`](/doc/topical_audit/spatial_acceleration.md) — AABB/broad-phase collision cross-implementation map
+- [`/notes/designs/cluster_aabb_collision.md`](/notes/designs/cluster_aabb_collision.md) — broad-phase AABB collision design document
 - [`/notes/tasks/2026-08-28_roadmap_port_based_rigid_ff.md`](/notes/tasks/2026-08-28_roadmap_port_based_rigid_ff.md) — RAFF phased plan with checkboxes
 - `molbrowser` — gallery browser using the same rendering stack
 - `molgui` — reusable GUI components (trackball camera, kekule editor)

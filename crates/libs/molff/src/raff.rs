@@ -14,6 +14,7 @@
 //! This separation maps cleanly to the eventual OpenCL version.
 
 use numtypes::{Mat3d, Quat4d, Quat4i, Vec3d, VEC3D_ZERO};
+use crate::nonbonded::BroadPhase;
 
 // ==================================================================
 //  Data structures (§11 architecture: State + Topology + Config)
@@ -229,6 +230,64 @@ impl RaffTopology {
     /// Set point atom (no ports, e.g. terminal H).
     pub fn set_point(&mut self, i: usize) {
         self.nport[i] = 0;
+    }
+
+    /// Set port geometry for all atoms from UFF type strings.
+    /// Uses hybridization from UFF type suffix: _R/_2 → sp2 (120°), _1 → sp1 (180°), H_ → point, else sp3.
+    /// This overrides the bond-count-based geometry from `build_neighs_from_bonds`.
+    /// Ported from `RigidSp3FF::set_port_geometry_from_types`.
+    ///
+    /// **Warning:** this uses idealized port directions (120°, 109.5°, etc.) which may not match
+    /// the actual neighbor directions in the initial configuration. The Wahba solver will find
+    /// the best rotation, but if the port-to-neighbor assignment is geometrically inconsistent
+    /// (port 0 assigned to a neighbor that's in the wrong direction), the residual error is large.
+    /// For molecules with non-ideal geometry, use `set_port_geometry_from_reference` instead.
+    pub fn set_port_geometry_from_types(&mut self, uff_types: &[String]) {
+        assert_eq!(uff_types.len(), self.natoms, "set_port_geometry_from_types: uff_types.len()={} != natoms={}", uff_types.len(), self.natoms);
+        for i in 0..self.natoms {
+            let t = uff_types[i].as_str();
+            if matches!(t, "C_R"|"C_2"|"N_R"|"O_2"|"O_R") {
+                self.set_sp2(i);
+            } else if matches!(t, "C_1"|"N_1") {
+                self.set_sp1(i);
+            } else if t == "H_" {
+                self.set_point(i);
+            } else {
+                self.set_sp3(i);
+            }
+        }
+        self.compute_inertia();
+    }
+
+    /// Set port geometry from the initial/reference configuration (per-atom ARAP).
+    /// Each port direction is set to the normalized direction from the atom to its neighbor
+    /// in the reference positions. This makes the identity rotation perfectly align all ports,
+    /// and the Wahba solver preserves the original local geometry (ARAP — As-Rigid-As-Possible).
+    ///
+    /// This is the correct approach for molecules with non-ideal geometry (e.g. distorted rings,
+    /// non-planar structures) where idealized sp2/sp3 port directions would be geometrically
+    /// inconsistent with the port-to-neighbor assignment from `build_neighs_from_bonds`.
+    ///
+    /// See `notes/designs/raff_theory_equations.md` §1.4 for the per-type vs per-atom comparison.
+    pub fn set_port_geometry_from_reference(&mut self, ref_pos: &[Vec3d]) {
+        assert_eq!(ref_pos.len(), self.natoms, "set_port_geometry_from_reference: ref_pos.len()={} != natoms={}", ref_pos.len(), self.natoms);
+        for i in 0..self.natoms {
+            let np = self.nport[i] as usize;
+            let xi = ref_pos[i];
+            let ns = self.neighs[i].as_array();
+            for s in 0..np {
+                let j = ns[s];
+                if j < 0 { continue; }
+                let d = ref_pos[j as usize] - xi;
+                let dnorm = d.norm();
+                if dnorm < 1e-12 {
+                    self.port_local[i * 4 + s] = Vec3d::new(1.0, 0.0, 0.0);
+                } else {
+                    self.port_local[i * 4 + s] = d * (1.0 / dnorm);
+                }
+            }
+        }
+        self.compute_inertia();
     }
 
     /// Build neighbor/bond-param index arrays from bond list.
@@ -654,6 +713,92 @@ pub fn eval_nonbonded(
             }
             e_total += e_ij;
             let _ = mi;  // mass not needed for force eval, only for integration
+        }
+    }
+    e_total
+}
+
+/// Evaluate non-bonded with broad-phase AABB culling. Same physics as `eval_nonbonded`,
+/// but only atom pairs whose cluster AABBs overlap (expanded by `bp.rcut`) are evaluated.
+/// Must produce **identical** forces/energy as `eval_nonbonded`.
+pub fn eval_nonbonded_broad(
+    state: &RaffState, topo: &RaffTopology, nbcfg: &NbConfig,
+    bp: &BroadPhase, fapos: &mut [Vec3d],
+) -> f64 {
+    if !nbcfg.enabled { return 0.0; }
+    let rcut2 = nbcfg.rcut * nbcfg.rcut;
+    let r_damp2 = nbcfg.r_damp * nbcfg.r_damp;
+    let f2max = nbcfg.f_max * nbcfg.f_max;
+    let mut e_total = 0.0;
+    // Helper: evaluate a single pair (i, j) — factored out to avoid duplication
+    let eval_pair = |i: usize, j: usize, pi: Vec3d, nbi: &NbParams, nbj: &NbParams, fapos: &mut [Vec3d]| -> f64 {
+        if topo.is_excluded(i, j as i32) { return 0.0; }
+        let dp = state.pos[j] - pi;
+        let r2 = dp.norm2();
+        if r2 > rcut2 || r2 < 1e-16 { return 0.0; }
+        let r = r2.sqrt();
+        let inv_r = 1.0 / r;
+        let n_hat = dp * inv_r;
+        let mut e_ij = 0.0;
+        let mut f_scalar = 0.0;
+        if nbi.epsilon > 0.0 && nbj.epsilon > 0.0 {
+            let sigma = 0.5 * (nbi.sigma + nbj.sigma);
+            let eps = (nbi.epsilon * nbj.epsilon).sqrt();
+            let sr6 = (sigma * inv_r).powi(6);
+            let sr12 = sr6 * sr6;
+            e_ij += 4.0 * eps * (sr12 - sr6);
+            f_scalar += 24.0 * eps * inv_r * (2.0 * sr12 - sr6);
+        }
+        if nbi.charge != 0.0 && nbj.charge != 0.0 {
+            let r_damped = (r2 + r_damp2).sqrt();
+            e_ij += COULOMB_CONST * nbi.charge * nbj.charge / r_damped;
+            f_scalar += COULOMB_CONST * nbi.charge * nbj.charge / (r_damped * r_damped);
+        }
+        if nbi.radius > 0.0 && nbj.radius > 0.0 {
+            let rsum = nbi.radius + nbj.radius;
+            if r < rsum {
+                let overlap = rsum - r;
+                e_ij += 0.5 * nbcfg.k_coll * overlap * overlap;
+                f_scalar += nbcfg.k_coll * overlap;
+            }
+        }
+        if f_scalar.abs() > 1e-30 {
+            let mut fi = n_hat * (-f_scalar);
+            if nbcfg.f_max > 0.0 {
+                let f2 = fi.norm2();
+                if f2 > f2max { fi.mul(f2max.sqrt() / f2.sqrt()); }
+            }
+            fapos[i].add(fi);
+            fapos[j].sub(fi);
+        }
+        e_ij
+    };
+    // 1. Intra-cluster pairs
+    for cr in &bp.cluster_ranges {
+        let i0 = cr[0] as usize; let i1 = cr[1] as usize;
+        for i in i0..i1 {
+            let pi = state.pos[i];
+            let nbi = topo.nb_params[i];
+            for j in (i+1)..i1 {
+                let nbj = topo.nb_params[j];
+                e_total += eval_pair(i, j, pi, &nbi, &nbj, fapos);
+            }
+        }
+    }
+    // 2. Inter-cluster pairs (only if AABBs overlap)
+    let pairs = bp.pairs();
+    for &(ci, cj) in &pairs {
+        let ri = bp.cluster_ranges[ci as usize];
+        let rj = bp.cluster_ranges[cj as usize];
+        let i0 = ri[0] as usize; let i1 = ri[1] as usize;
+        let j0 = rj[0] as usize; let j1 = rj[1] as usize;
+        for i in i0..i1 {
+            let pi = state.pos[i];
+            let nbi = topo.nb_params[i];
+            for j in j0..j1 {
+                let nbj = topo.nb_params[j];
+                e_total += eval_pair(i, j, pi, &nbi, &nbj, fapos);
+            }
         }
     }
     e_total

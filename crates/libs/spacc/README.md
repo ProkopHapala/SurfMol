@@ -1,18 +1,18 @@
 ---
 type: rust-crate
 title: spacc
-description: Spatial acceleration — AABB fitting and spatial bucketing on numtypes data. No molecular semantics.
-tags: [rust, crate, spatial, acceleration, broad-phase, numtypes]
-timestamp: 2026-08-25
+description: Spatial acceleration — AABB fitting, spatial bucketing, and broad-phase collision pair finding on numtypes data. No molecular semantics.
+tags: [rust, crate, spatial, acceleration, broad-phase, collision, numtypes]
+timestamp: 2026-09-29
 ---
 
 # spacc
 
-Rebuildable spatial acceleration structures with no molecular semantics. Operates on `numtypes` data contracts (`Aabb3d`, `RaggedIndex`) for AABB fitting and spatial hashing.
+Rebuildable spatial acceleration structures with no molecular semantics. Operates on `numtypes` data contracts (`Aabb3d`, `RaggedIndex`) for AABB fitting, spatial hashing, and broad-phase collision pair finding.
 
 ## What's implemented (P0 foundation)
 
-- **`aabb.rs`** — `fit_aabb(pos, ids)` fits an `Aabb3d` to selected positions. `fit_group_aabbs(pos, groups, out)` fits AABBs for multiple `RaggedIndex` groups. `fit_range_aabbs(pos, ranges, out)` fits AABBs for contiguous `[i0, i1)` ranges — the cache-optimal path for packed fragments. All use `numtypes::aabb_*` intrinsic functions.
+- **`aabb.rs`** — `fit_aabb(pos, ids)` fits an `Aabb3d` to selected positions. `fit_group_aabbs(pos, groups, out)` fits AABBs for multiple `RaggedIndex` groups. `fit_range_aabbs(pos, ranges, out)` fits AABBs for contiguous `[i0, i1)` ranges — the cache-optimal path for packed fragments. **`broad_phase_pairs(cluster_aabbs, margin)`** — O(N²) over clusters, returns sorted overlapping `(i,j)` pairs using margin-expanded AABB overlap (mirrors FireCore `NBFF::evalSortRange_BBs`). **`aabb_edges(bb)`** — 12 edge segments as `[f32;3]` pairs for line rendering of bounding boxes. All use `numtypes::aabb_*` intrinsic functions.
 - **`buckets.rs`** — `Buckets`: spatial hashing via count→prefix→scatter (FireCore/SSE `Buckets.h` pattern). One-shot `build(cell_of_obj)`; `cell_objects(c)` returns packed item list per cell. Items with `cell = -1` are skipped. A single `counts` buffer doubles as the per-cell cursor, so no extra allocation happens during rebuild.
 
 ## Not yet implemented (P1/P2)
@@ -26,6 +26,8 @@ Rebuildable spatial acceleration structures with no molecular semantics. Operate
 fit_aabb(pos, ids) -> Aabb3d
 fit_group_aabbs(pos, &RaggedIndex, out)
 fit_range_aabbs(pos, &[[Index;2]], out)
+broad_phase_pairs(cluster_aabbs, margin) -> Vec<(u32, u32)>
+aabb_edges(bb) -> [[f32; 3]; 24]
 Buckets::build(cell_of_item)
 build_uniform_grid(pos, cell_size) -> UniformGrid
 ```
@@ -41,19 +43,21 @@ build_uniform_grid(pos, cell_size) -> UniformGrid
 ## Architectural role
 
 Spatial acceleration is a separate concern from both the graph data contract (`numtypes::graph`) and graph algorithms (`pgraph`). It enables:
-- Broad-phase neighbor finding for non-bonded forcefields (replacing O(N²) in `NonBondedFF`)
+- **Broad-phase neighbor finding** for non-bonded forcefields (replacing O(N²) in `NonBondedFF`) — used by `molff::nonbonded::BroadPhase` and `molff::raff::eval_nonbonded_broad`
 - Ray-picking acceleration for large structures
 - Bounding volume hierarchies for rendering culling
 - Group AABB fitting for fragment-level collision (FireCore `NBFF::initBBsFromGroups` dataflow)
 
 ## Tests
 
-7 tests: `Aabb3d` contains, `fit_aabb`, `fit_group_aabbs`, `fit_range_aabbs`, buckets basic/empty-cell/skip-unassigned.
+8 tests: `Aabb3d` contains, `fit_aabb`, `fit_group_aabbs`, `fit_range_aabbs`, **`broad_phase_pairs`** (3 clusters with margin overlap), buckets basic/empty-cell/skip-unassigned.
 
 ## See also
 
-- `notes/designs/topology_builder.md` — full design (§7 for `spacc` scope)
+- [`/notes/designs/cluster_aabb_collision.md`](/notes/designs/cluster_aabb_collision.md) — design document for per-cluster AABB broad-phase collision
+- [`/doc/topical_audit/spatial_acceleration.md`](/doc/topical_audit/spatial_acceleration.md) — cross-implementation map (SurfMol vs FireCore vs SPAMMM)
+- [`/userguide/editor.md`](/userguide/editor.md) — end-user guide showing `--show-aabb` visualization
 - `numtypes::spatial` — `Aabb3d`, `Aabb3f`, and the `aabb_*` / `sym3_*` intrinsics
 - `pgraph` — algorithms that consume spatial structures
 - FireCore/SSE `Buckets.h` — C++ reference for spatial hashing
-- FireCore `NBFF::initBBsFromGroups` — reference for group AABB dataflow
+- FireCore `NBFF::initBBsFromGroups` / `NBFF::evalSortRange_BBs` — reference for group AABB dataflow and broad-phase pair finding

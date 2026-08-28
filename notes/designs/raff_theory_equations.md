@@ -91,6 +91,42 @@ The quaternion `q_i` is **not** a literal nuclear rotation — it represents a l
 | **Extended-Lagrangian** | Small fictitious inertia, cold/damped thermostat | MD with thermal correctness (like Drude polarization) |
 | **Structural relaxation** | Fictitious inertia = numerical preconditioning | Fast minimization (no thermodynamic meaning) |
 
+### 1.3 Mass convention — relaxation vs dynamics
+
+**SurfMol convention:** the mass `m_i` in `RaffTopology::mass[]` is a **numerical parameter**, not necessarily the physical atomic mass.
+
+| Mode | Mass | Why |
+|------|------|-----|
+| **Relaxation** (default in editor) | `m_i = 1.0` for all atoms | Uniform mass gives uniform convergence rate per atom — fastest minimization. Heavy atoms (C=12, O=16) don't lag behind H=1, so the structure settles in fewer steps. No thermodynamic meaning. |
+| **Dynamics** (MD with thermal correctness) | `m_i =` physical atomic mass | Needed for correct momentum conservation, thermal equilibrium, phonon spectra. Set via `set_masses_from_elements()` (planned). |
+
+The same logic applies to the rotational inertia `I_i`: for relaxation, `I_i = 0.4 · l²` (no mass factor) gives uniform rotational convergence; for dynamics, `I_i = 0.4 · m_i · l²` is physical.
+
+> **Current SurfMol state:** `mass[]` defaults to 1.0 (relaxation mode). The editor's `build_raff_from_world` does not override it. To switch to dynamics mode, add a `set_masses_from_elements` call and multiply inertia by mass. This is a future task — not needed for relaxation-only use.
+
+### 1.4 Port geometry — per-type vs per-atom (two ARAP variants)
+
+There are **two formulations** of the port geometry `a_{iα}`:
+
+| Variant | Port directions | Source | Status |
+|---------|----------------|--------|--------|
+| **Per-atom ARAP** (current default) | `a_{iα}` = normalized direction to neighbor α in the **initial/reference configuration** | `RaffTopology::set_port_geometry_from_reference` | **Implemented** — editor default |
+| **Per-type** (idealized) | `a_{iα}` from UFF type suffix: sp2→120° trigonal, sp3→tetrahedral, sp1→linear, H_→point | `RaffTopology::set_port_geometry_from_types` | **Implemented** — alternative, not used by editor |
+
+**Per-atom ARAP (current default):** each atom's ports are the actual neighbor directions in the initial configuration, stored per-atom. The Wahba solver then finds the rotation that best preserves the **original** local geometry. This is the classic ARAP (As-Rigid-As-Possible) approach from Sorkine & Alexa 2007 — the reference frame is the initial shape, not an idealized hybridization. At initialization, identity rotation perfectly aligns all ports (E_port = 0).
+
+**Per-type (idealized):** all atoms of the same hybridization get the same idealized port geometry (e.g. all sp2 carbons get 120° trigonal). The Wahba solver finds the rotation that best aligns these idealized ports to the actual neighbor directions. This is the UFF-style approach — the "ideal" geometry is encoded in the port directions.
+
+**Why per-atom is the default:** `build_neighs_from_bonds` assigns ports to neighbors in **bond-list order**, not geometric order. With idealized sp2 ports at 0°/120°/240°, the port-to-neighbor assignment may be geometrically inconsistent (port 0 at 0° assigned to a neighbor at 120°). No rotation can align all 3 ports simultaneously in this case — the Wahba residual is large, producing huge spurious forces. Per-atom ARAP avoids this entirely: ports ARE the initial directions, so identity rotation works regardless of assignment order.
+
+**Trade-offs:**
+- Per-atom: preserves the original shape exactly (ARAP), works for any geometry, E_port=0 at init. But can't correct a bad initial geometry toward ideal angles.
+- Per-type: forces idealized angles (120°, 109.5°). Could correct a distorted structure, but only works if port-to-neighbor assignment is geometrically consistent (needs port permutation or geometric sorting of neighbors). **Currently broken for most molecules due to bond-list-order assignment.**
+
+**To use per-type:** call `topo.set_port_geometry_from_types(&uff_types)` instead of `set_port_geometry_from_reference(&pos)`. To make per-type work correctly, also need to permute neighbor slots so port 0 goes to the neighbor closest to the port 0 direction (not yet implemented).
+
+**Future task — per-type port reindexing:** `build_neighs_from_bonds` assigns ports in bond-list order. To make `set_port_geometry_from_types` work, add a `reindex_ports_by_direction` method that, after setting idealized port directions, permutes the `neighs`/`neigh_bs` slots so each idealized port direction is paired with the neighbor closest to that direction. This would enable per-type mode (correcting distorted geometry toward ideal 120°/109.5° angles) as an alternative to per-atom ARAP. Not urgent — per-atom ARAP works well for relaxation.
+
 ---
 
 ## 2. Rotation solvers (Axis 1)
