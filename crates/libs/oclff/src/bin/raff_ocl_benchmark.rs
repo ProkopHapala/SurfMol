@@ -47,14 +47,14 @@ fn load_xylitol() -> (Vec<[f32;3]>, Vec<(usize,usize)>, Vec<String>, usize) {
 fn parse_args() -> (usize, usize, usize, usize) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut nsys = 500usize;
-    let mut group_size = 64usize;
+    let mut group_size = 32usize;
     let mut bench_steps = 100usize;
     let mut conv_steps = 5000usize;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--nsys" => { i += 1; if i < args.len() { nsys = args[i].parse().unwrap_or(500); } }
-            "--group-size" => { i += 1; if i < args.len() { group_size = args[i].parse().unwrap_or(64); } }
+            "--group-size" => { i += 1; if i < args.len() { group_size = args[i].parse().unwrap_or(32); } }
             "--steps" => { i += 1; if i < args.len() { bench_steps = args[i].parse().unwrap_or(100); } }
             "--conv-steps" => { i += 1; if i < args.len() { conv_steps = args[i].parse().unwrap_or(5000); } }
             _ => {}
@@ -143,11 +143,12 @@ fn main() -> ocl::Result<()> {
         sim.step_cluster_multi(port_kernel, &cfg)?;
     }
     sim.finish()?;  // wait for all kernels to complete
-    let wall_ms = t0.elapsed().as_millis();
-    let wall_s = wall_ms as f64 / 1000.0;
+    let elapsed = t0.elapsed();
+    let wall_s = elapsed.as_secs_f64();
+    let wall_ms = wall_s * 1000.0;
     let steps_per_s = bench_steps as f64 / wall_s;
     let atoms_per_s = steps_per_s * (nsys * natoms_real) as f64;
-    eprintln!("benchmark result: {bench_steps} steps in {wall_ms}ms = {steps_per_s:.1} steps/s, {atoms_per_s:.3e} atoms/s (real atoms = {nsys}×{natoms_real}={})", nsys * natoms_real);
+    eprintln!("benchmark result: {bench_steps} steps in {wall_ms:.3}ms = {steps_per_s:.1} steps/s, {atoms_per_s:.3e} atoms/s (real atoms = {nsys}×{natoms_real}={})", nsys * natoms_real);
 
     // 7. Convergence: run conv_steps steps, track max|correction| via download
     // For throughput we don't download every step (that would dominate time).
@@ -222,7 +223,7 @@ fn main() -> ocl::Result<()> {
     eprintln!("  atoms/replica:{natoms_real} (padded to {natoms_per_sys})");
     eprintln!("  total atoms:  {} (real), {} (padded)", nsys * natoms_real, nsys * natoms_per_sys);
     eprintln!("  bench_steps:  {bench_steps}");
-    eprintln!("  wall_time:    {wall_ms}ms");
+    eprintln!("  wall_time:    {wall_ms:.3}ms");
     eprintln!("  throughput:   {steps_per_s:.1} steps/s");
     eprintln!("  throughput:   {atoms_per_s:.3e} atoms/s");
     eprintln!("  per-step:     {:.3} ms/step", wall_ms as f64 / bench_steps as f64);

@@ -65,12 +65,14 @@ Debug artifacts saved to `debug/raff_ocl_smoke/` and `debug/raff_ocl_xylitol/` (
 | `tests/test_uff_cl.rs` | UFF OpenCL bond eval parity vs `molff::uff::Uff` CPU (H₂) |
 | `tests/test_spff_cl.rs` | SPFFsp3 OpenCL compile smoke test |
 | `tests/test_assemble_fragments.rs` | ClAssembler parse + inject: 21 functions from gridff_build.cl, 7 macros from gridff_eval.cl, etc. |
+| `tests/test_assemble_nb_generic.rs` | ClAssembler 3-axis NB template: assemble `getNonBond_generic.cl` with NONE/GRIDFF_BSPLINE/FAF surface variants × LJQH × NEIGHS4. 5 tests, all passing. |
 
 ## Open issues
 
 - [ ] **1-4 exclusions missing**: `make_exclusions_1st_2nd` only excludes 1st and 2nd neighbors. Xylitol has 1-4 atom pairs within collision radius (2.0 Å) that are not excluded, causing collision forces to fight port springs. Workaround: set `radius=0` to disable collisions. Fix: add 1-4 exclusion list.
 - [ ] **`k_coll` not used by collision kernel**: `compute_collision_cluster_rigid` uses geometric overlap (rsum = ri + rj), not `k_coll`. Setting `k_coll=0` has no effect. To disable collisions, set `radius=0`.
-- [ ] **`faf_eval.cl` is a placeholder**: empty file — GridFF/FAF eval macros not yet extracted from `surface_spammm.cl`. `FafEvalOcl::new()` will fail.
+- [ ] **`faf_eval.cl` is a placeholder**: ~~empty file~~ now populated with 5 `//>>>macro` blocks + `SURF_INJECT_FAF` macro. `FafEvalOcl::new()` may still fail if the assembled program has unresolved symbols — needs GPU compile test.
+- [ ] **3-axis NB template not GPU-compiled**: `getNonBond_generic.cl` assembles correctly (5 tests pass) but has not been compiled on NVIDIA GPU. Needs `ocl::ProQue` compile test + numerical parity vs FireCore `getNonBond_GridFF_Bspline`.
 - [ ] **SPFF harness is a stub**: `SpffOcl` compiles the kernel program but does not dispatch any kernels. Needs force evaluation + parity vs reference.
 - [ ] **UFF harness is partial**: `UffOcl::eval_bonds` works (parity tested) but angles/dihedrals/inversions not dispatched.
 - [ ] **No inter-molecular non-bonded on GPU**: the collision kernel handles sphere-sphere overlap but there is no LJ/Coulomb non-bonded kernel. CPU `eval_nonbonded` is the only option.

@@ -182,7 +182,7 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | `tests/test_raff.rs` | 607 | 22 tests: port forces, rotation convergence, energy/momentum conservation, XPBD constraints, collisions, adiabatic torque residual. All passing. |
 | `tests/test_raff_convergence.rs` | 216 | 4 tests: force-MD + all 3 position-based solvers converge to same geometry (Kabsch RMSD < 1e-3). Kabsch invariants. chain4 dihedral null space. All passing. |
 | `tests/test_broad_phase.rs` | 177 | **3 parity tests**: broad-phase vs O(N²) for `NonBondedFF::eval_broad` and `raff::eval_nonbonded_broad`. Near/far molecule configurations. All passing. |
-| `tests/test_multigrid.rs` | ~200 | **4 tests**: T1 matvec parity (vs dense), T2 diagonal-block parity, T3 direct-solve parity (MG vs Gaussian elimination), T4 convergence vs Jacobi (8×8 grid, 4.7× speedup). All passing. See `/doc/topical_audit/multigrid.md`. |
+| `tests/test_multigrid.rs` | ~200 | **4 tests**: T1 matvec parity (vs dense), T2 diagonal-block parity, T3 direct-solve parity (MG vs Gaussian elimination), T4 convergence vs Jacobi (8×8 grid, 3.9× fewer smoothing steps: 144 vs 561). All passing. See `/doc/topical_audit/multigrid.md`. |
 | `tests/test_multigrid_molecules.rs` | ~165 | **3 cantilever benchmarks**: pentacene (rigid stick), n-hexadecane (flexible rope), DiTriptyceno-helicene (branching I-beam). Compares direct vs Jacobi vs MG (manual + automatic pivots). All passing. Linear V-cycle retained as diagnostic; modal approach is the primary strategy — see `/notes/reports/2026-08-29_multigrid_consolidated_report.md`. |
 
 ### `surfff` (`crates/libs/surfff/`, 512 LOC)
@@ -210,6 +210,7 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | `tests/test_uff_cl.rs` | ~56 | UFF OpenCL parity test vs `molff::uff::Uff` CPU reference. |
 | `tests/test_spff_cl.rs` | ~12 | SPFFsp3 OpenCL compile smoke test. |
 | `tests/test_assemble_fragments.rs` | ~90 | **5 tests**: parse `gridff_build.cl` (21 functions), parse `gridff_eval.cl` (7 macros), parse `faf_build.cl` (10 functions), parse `faf_eval.cl` (5 macros), assemble + inject `SAMPLE_3D` macro into test kernel. All passing. |
+| `tests/test_assemble_nb_generic.rs` | ~100 | **5 tests**: assemble `getNonBond_generic.cl` with 3 surface variants (NONE/GRIDFF_BSPLINE/FAF) × LJQH × NEIGHS4. Verifies macro alias injection, fragment inclusion, and that surface functions appear only in the kernel body when selected. All passing. |
 
 ### `surfmol` (`crates/libs/surfmol/`, 155 LOC)
 *Integration engine: `MolWorld` orchestrator.*
@@ -284,6 +285,8 @@ Ported from FireCore / SPAMMM. See `opencl/README.md` and `doc/topical_audit/gri
 
 **Macro-fragment principle:** GridFF and FAF are not standalone programs. They are `//>>>function` / `//>>>macro` fragment libraries. Build fragments assemble into construction programs; eval fragments are injected via `//<<<macro NAME` into the `getNonBonded` loop of UFF/SPFF/RAFF/RigidMolFF so all forcefields share one NBFF primitive. This avoids combinatoric explosion: instead of N forcefields × M surface variants = N×M kernel files, we have N + M fragments composed at compile time by `oclff::ClAssembler`.
 
+**3-axis NB kernel template** (`getNonBond_generic.cl`): The generic non-bonded kernel is assembled from a single template with three orthogonal macro axes — (1) pairwise potential (`NB_PAIR_FORCE`), (2) exclusion strategy (`NB_EXCL_*`), (3) surface injection (`SURF_INJECT`). The `ClAssembler` injects `#define` aliases mapping generic names to specific variants. Currently: 1 pairwise (LJQH) × 1 exclusion (NEIGHS4) × 3 surface (NONE/GRIDFF_BSPLINE/FAF) = 3 variants from 8 fragments. See `doc/topical_audit/gridff_faf.md` §3-axis NB template.
+
 | File | Size | Purpose | Origin |
 |------|------|---------|--------|
 | `UFF.cl` | 108 KB | UFF force evaluation (bonds, angles, dihedrals, inversions) | FireCore |
@@ -294,13 +297,16 @@ Ported from FireCore / SPAMMM. See `opencl/README.md` and `doc/topical_audit/gri
 | `relax_multi.cl` | 284 KB | Unified multi-system force eval + bucket neighbor search | FireCore |
 | `relax_multi_mini.cl` | 186 KB | Minimal variant of relax_multi | FireCore |
 | `Rigid.cl` | 17 KB | Rigid body dynamics kernels | FireCore/SPAMMM |
-| `gridff_spammm.cl` | 2106 lines | SPAMMM GridFF — canonical whole-file reference (B-spline, Poisson, make_GridFF, sampleGridFF). **Requires** `common.cl`+`Forces.cl` first. | SPAMMM |
-| `surface_spammm.cl` | 1867 lines | SPAMMM surface — canonical whole-file reference (FAF, Ewald2D, isosurfaces). **Requires** `common.cl`+`Forces.cl` first. | SPAMMM |
+| `gridff_spammm.cl` | 2106 lines | SPAMMM GridFF — canonical whole-file reference (B-spline, Poisson, make_GridFF, sampleGridFF). **Requires** `common.cl`+`Forces.cl` first. **Deprecated** — content extracted into `gridff_build.cl`/`gridff_eval.cl`; kept as reference only, not loaded by any Rust code. | SPAMMM |
+| `surface_spammm.cl` | 1867 lines | SPAMMM surface — canonical whole-file reference (FAF, Ewald2D, isosurfaces). **Requires** `common.cl`+`Forces.cl` first. **Deprecated** — content extracted into `faf_build.cl`/`faf_eval.cl`; kept as reference only, not loaded by any Rust code. | SPAMMM |
 | `gridff_build.cl` | 1063 lines | **Fragment library** — 21 `//>>>function` blocks: utility + build kernels (make_MorseFF, poissonW, project_*, make_GridFF). Extracted from `gridff_spammm.cl`. | SurfMol |
-| `gridff_eval.cl` | 626 lines | **Macro library** — 7 `//>>>macro` blocks (SAMPLE_3D, SAMPLE_3D_GRID, SAMPLE_GRIDFF_BSPLINE_POINTS, etc.) + helper inline functions. Injected into `getNonBonded` via `//<<<macro`. Extracted from `gridff_spammm.cl`. | SurfMol |
+| `gridff_eval.cl` | 680 lines | **Macro library** — 7 `//>>>macro` blocks (SAMPLE_3D, SAMPLE_3D_GRID, SAMPLE_GRIDFF_BSPLINE_POINTS, etc.) + helper inline functions + `SURF_INJECT_GRIDFF_BSPLINE`/`SURF_INJECT_NONE` surface injection macros for `getNonBond_generic.cl`. Extracted from `gridff_spammm.cl`. | SurfMol |
 | `faf_build.cl` | 715 lines | **Fragment library** — 10 `//>>>function` blocks (getSurfMorse, eval_potential_*, compute_ewald_coefficients, getSurfaceIso*). Extracted from `surface_spammm.cl`. | SurfMol |
-| `faf_eval.cl` | 762 lines | **Macro library** — 5 `//>>>macro` blocks (GET_SURF_FOLDED, GET_SURF_FOLDED_WORKGROUP, GET_SURF_FOLDED_HARMONICS, GET_SURF_FOLDED_TENSOR_EXP, GET_SURF_FOLDED_TENSOR_POLY) + helper inline functions. Injected into `getNonBonded` via `//<<<macro`. Extracted from `surface_spammm.cl`. | SurfMol |
-| `grids.cl` | — | Grid utilities (lattice helpers, index math) | SPAMMM |
+| `faf_eval.cl` | 828 lines | **Macro library** — 5 `//>>>macro` blocks (GET_SURF_FOLDED, GET_SURF_FOLDED_WORKGROUP, GET_SURF_FOLDED_HARMONICS, GET_SURF_FOLDED_TENSOR_EXP, GET_SURF_FOLDED_TENSOR_POLY) + helper inline functions + `SURF_INJECT_FAF` surface injection macro for `getNonBond_generic.cl`. Extracted from `surface_spammm.cl`. | SurfMol |
+| `nb_common.cl` | 78 lines | **NB loop macro fragments** — Axis 1 (`NB_PAIR_LJQH`) + Axis 2 (`NB_EXCL_*_NEIGHS4`) macros for `getNonBond_generic.cl`. | SurfMol |
+| `getNonBond_generic.cl` | 133 lines | **3-axis NB kernel template** — generic `getNonBond_generic` assembled from `NB_PAIR_FORCE` × `NB_EXCL_*` × `SURF_INJECT` macro slots. Reference: FireCore `UFF.cl:getNonBond` / `getNonBond_GridFF_Bspline`. | SurfMol |
+| `getNonBond_reference.cl` | 409 lines | **Verbatim reference** — FireCore `getNonBond` (UFF.cl:1023-1204) + `getNonBond_GridFF_Bspline` (UFF.cl:1523-1717) copied verbatim for diffing against assembled output. Not compiled. | FireCore |
+| `grids.cl` | — | Grid utilities (lattice helpers, index math). **Deprecated** — not loaded by any Rust code. | SPAMMM |
 | `PME.cl` / `PME8.cl` | — | Particle-mesh Ewald solvers | SPAMMM |
 | `contact_surface.cl` | — | Quasi-2D contact surface | SPAMMM |
 | `Assembly.cl` | 7 KB | Rigid-body assembly / packing / clash | SPAMMM |
@@ -418,7 +424,7 @@ See `Import_other_Repos.md` for the full cross-repo import map.
 - **Global optimization (GOpt):** not yet implemented.
 - **NPZ format:** `buildff` output and `molengine` input planned to support NPZ (currently JSON only).
 - **`pgraph_ops` P2 modules:** `loops.rs` (cycle/ring detection), `selection.rs` (SDF selection), `picking.rs` (ray picking), `edit.rs` (editing helpers) not yet implemented.
-- **Multigrid / modal relaxation:** Rust CPU V-cycle implemented in `molff::multigrid` + tested (parity + convergence). Linear V-cycle underperforms end-to-end (dominated by fine-level work). **Modal coarse-graining achieves 53× speedup** on pentacene via fitted Newton + timestep scaling. Two approaches designed: (A) fitted modal [verified], (B) force-projection Galerkin V-shape [not yet implemented]. OpenCL kernels copied but not wired. See `/doc/topical_audit/multigrid.md` and `/notes/reports/2026-08-29_multigrid_consolidated_report.md`.
+- **Multigrid / modal relaxation:** Rust CPU V-cycle implemented in `molff::multigrid` + tested. Contract-separated fitted-modal benchmark: **57×** on pure in-manifold pentacene distortion (additive and decoder coincide), **53.8×** for staged canonical coarse-to-fine decoding of mixed input, and **1.66×** for additive preservation of the mixed atomistic state. Preferred fast path: reusable fitted internal coarse model + sparse full synchronization + canonical decode/refinement. Force-projection Galerkin V-shape is the planned nonlinear fallback. See `/doc/topical_audit/multigrid.md` and `/notes/reports/2026-08-29_multigrid_consolidated_report.md`.
 - **`spacc` P1 modules:** `uniform_grid.rs`, `morton.rs` not yet implemented.
 - **`moltopo` migration to `pgraph`:** `moltopo` still uses its own `Topology`/`Builder` structs; planned to build on `pgraph`/`pgraph_ops` per `notes/designs/topology_builder.md`.
 - **`CODEMAP.md` status:** this file is current as of 2026-08-29.

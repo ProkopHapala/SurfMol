@@ -37,7 +37,7 @@ When implementing or debugging a topic (e.g. "UFF bond evaluation", "AABB collis
 - **`spatial_acceleration.md`** — `spacc` crate: AABB fitting, spatial hashing (Buckets), **broad-phase collision** (`broad_phase_pairs`, `BroadPhase` struct, `eval_broad`/`eval_nonbonded_broad`). Parity with FireCore `Buckets.h`, `NBFF::initBBsFromGroups()`, `NBFF::evalSortRange_BBs()`. **Updated 2026-09-29** with broad-phase collision implementation.
 - **`raff.md`** — RAFF cross-implementation map: port-based rigid-atom FF, 4 design axes (rotation solver, dynamics, non-bonded, GPU). Parity with FireCore `RRsp3.cl`, SPAMMM. **Populated 2026-09-28.**
 - **`multigrid.md`** — Multigrid V-cycle solver for truss-elasticity (bond-stretch Hessian). Parity with NumericalMathPlayground `LinarElasticity/`. Rust CPU implemented + tested; OpenCL kernels copied but not wired; molecule benchmarks underperforming (debugging in progress). **Populated 2026-08-29.**
-- **`gridff_faf.md`** — GridFF and FAF OpenCL macro fragment architecture: build/eval split, `//>>>function`/`//>>>macro` conventions, macro-injection contract for sharing NBFF primitives across UFF/SPFF/RAFF/RigidMolFF. Documents the macro-variant principle (N+M fragments instead of N×M kernel files). **Populated 2026-08-29.**
+- **`gridff_faf.md`** — GridFF and FAF OpenCL macro fragment architecture: build/eval split, `//>>>function`/`//>>>macro` conventions, macro-injection contract for sharing NBFF primitives across UFF/SPFF/RAFF/RigidMolFF. Documents the macro-variant principle (N+M fragments instead of N×M kernel files) and the **3-axis NB kernel template** (`getNonBond_generic.cl`: pairwise × exclusion × surface injection). **Populated 2026-08-29.**
 
 ## Status
 

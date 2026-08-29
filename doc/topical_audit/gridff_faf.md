@@ -37,6 +37,45 @@ The macro assembler solves this by **separating the forcefield loop from the int
 
 This gives N + M fragments instead of N×M kernel files. Adding a new forcefield or a new surface variant is additive, not multiplicative. The same principle applies to build kernels: `gridff_build.cl` and `faf_build.cl` are composed with `common.cl` + `Forces.cl` to produce construction programs without duplicating the shared infrastructure.
 
+## 3-axis NB kernel template (`getNonBond_generic.cl`)
+
+The macro-variant principle is concretely realized in `getNonBond_generic.cl` — a single template kernel with three orthogonal macro axes. The `ClAssembler` injects `#define` aliases (via the `NB_VARIANT_DEFINES` macro substitution) that map generic names to specific variants before compilation.
+
+### The three axes
+
+| Axis | Generic macro | Variants | Fragment file |
+|------|--------------|----------|---------------|
+| 1. Pairwise potential | `NB_PAIR_FORCE(dp, REQK, R2damp)` | `NB_PAIR_LJQH` (UFF+SPFF shared) | `nb_common.cl` |
+| 2. Exclusion strategy | `NB_EXCL_ARGS`, `NB_EXCL_SETUP`, `NB_EXCL_TEST`, `NB_EXCL_PBC_TEST` | `NB_EXCL_*_NEIGHS4` (4-neighbor int4) | `nb_common.cl` |
+| 3. Surface injection | `SURF_ARGS`, `SURF_INJECT(posi, REQKi, fe)` | `SURF_NONE`, `SURF_GRIDFF_BSPLINE`, `SURF_FAF` | `gridff_eval.cl`, `faf_eval.cl` |
+
+### How it works
+
+1. The template (`getNonBond_generic.cl`) uses generic macro names (`NB_PAIR_FORCE`, `NB_EXCL_*`, `SURF_INJECT`, `SURF_ARGS`).
+2. The Rust harness builds a `#define` alias block (the `NB_VARIANT_DEFINES` macro body) mapping each generic name to the chosen variant, e.g. `#define NB_PAIR_FORCE(dp,REQK,R2damp) NB_PAIR_LJQH(dp,REQK,R2damp)`.
+3. `ClAssembler::assemble()` injects the alias block via `//<<<macro NB_VARIANT_DEFINES`.
+4. The C preprocessor resolves the aliases at OpenCL compile time.
+
+### Current variants
+
+1 pairwise × 1 exclusion × 3 surface = **3 kernel variants** from **8 fragments** (1 template + 1 pairwise + 1 exclusion + 2 surface-args + 2 surface-inject + 1 none). FireCore has 6+ hand-written `getNonBond*` kernels for the same space; adding FAF injection in the FireCore style would require 2 more hand-written kernels. With the template, it's one more `SURF_INJECT_FAF` macro.
+
+### Surface injection contract
+
+Each `SURF_INJECT_*` macro expands to a self-contained block that:
+- Declares any needed `__local` memory (e.g. `xqs[4]`, `yqs[4]` for GridFF PBC indices)
+- Cooperatively loads shared data with `barrier(CLK_LOCAL_MEM_FENCE)`
+- Samples the surface potential at `posi` using atom parameters `REQKi`
+- Accumulates force+energy into `fe` (float4: xyz=force, w=energy)
+
+Available variables in scope at injection point: `iG`, `iS`, `iL`, `nL`, `natoms`, `i0a`, `iaa`, `posi` (float3), `REQKi` (float4), `fe` (float4), `GFFParams` (float4).
+
+Each `SURF_ARGS_*` macro declares the extra kernel arguments needed by the corresponding `SURF_INJECT_*` (appended after `GFFParams`). `SURF_ARGS_NONE` is empty.
+
+### Reference vs assembled
+
+`getNonBond_reference.cl` contains verbatim copies of FireCore `getNonBond` (UFF.cl:1023-1204) and `getNonBond_GridFF_Bspline` (UFF.cl:1523-1717). These are not compiled — they exist for diffing against the assembled output to verify the template reproduces the reference behavior.
+
 ## Proposed `gridff_spammm.cl` split
 
 | `__kernel` | Block type | Destination fragment | Purpose |
@@ -71,13 +110,21 @@ This gives N + M fragments instead of N×M kernel files. Adding a new forcefield
 
 ## Open issues
 
+- ~~Target host kernel names and argument convention for `getNonBonded` in `UFF.cl` / `SPFF.cl` / `RAFF.cl` / `RigidMolFF.cl`.~~ **Resolved**: `getNonBond_generic.cl` template with 3-axis macro slots. UFF and SPFF share the same NB kernel (both call `getLJQH`); the forcefield difference is only in the bonded kernels.
+- ~~Whether `gridff_spammm.cl` and `surface_spammm.cl` are kept as canonical whole files or deleted after the fragments are extracted.~~ **Resolved**: content extracted into `gridff_build.cl`/`gridff_eval.cl`/`faf_build.cl`/`faf_eval.cl`. The whole files are deprecated and no longer loaded by any Rust code. Safe to delete.
 - Exact helper-function dependency graph for each `__kernel` (some helpers are shared between build and eval; need a `grids.cl` utility fragment or duplicated minimal copies).
-- Target host kernel names and argument convention for `getNonBonded` in `UFF.cl` / `SPFF.cl` / `RAFF.cl` / `RigidMolFF.cl`.
-- Whether `gridff_spammm.cl` and `surface_spammm.cl` are kept as canonical whole files or deleted after the fragments are extracted.
+- **GPU compilation parity**: assembled `getNonBond_generic` variants compile on NVIDIA GPU (not yet tested — only source assembly is tested in `test_assemble_nb_generic.rs`).
+- **Numerical parity**: assembled `getNonBond_uff_gridff` vs FireCore `getNonBond_GridFF_Bspline` — not yet tested.
+- **Exclusion list variant** (`NB_EXCL_*_EXCL_LIST`): stub only; needs implementation when packed sorted exclusion lists are needed (ex2 style).
 
 ## See also
 
 - `opencl/README.md` — kernel listing and assembly rules
-- `opencl/gridff_build.cl`, `opencl/gridff_eval.cl`, `opencl/faf_build.cl`, `opencl/faf_eval.cl` — the fragment templates (after refactor)
+- `opencl/getNonBond_generic.cl` — the 3-axis NB kernel template
+- `opencl/getNonBond_reference.cl` — verbatim FireCore reference kernels
+- `opencl/nb_common.cl` — Axis 1 + Axis 2 macro fragments
+- `opencl/gridff_build.cl`, `opencl/gridff_eval.cl`, `opencl/faf_build.cl`, `opencl/faf_eval.cl` — the fragment templates
 - `crates/libs/oclff/src/assemble.rs` — Rust `ClAssembler` / `ClLibrary` / `Substitutions`
+- `crates/libs/oclff/tests/test_assemble_nb_generic.rs` — assembly tests for 3-axis NB variants
+- `notes/designs/2026-08-29_nbff_surface_injection_design.md` — design spec for the 3-axis approach
 - `notes/designs/2026-08-29_gridff_faf_porting_notes.md` — original porting notes

@@ -728,6 +728,12 @@ pub struct RRsp3Multi {
     cl_drot_node: Buffer<f32>,   // [nsys * nnode * 4]
     cl_dpos_neigh: Buffer<f32>,  // [nsys * nnode * 4 * 4]
     cl_tips: Buffer<f32>,        // [nsys * nnode * 4 * 4] (for massless variants)
+
+    // Persistent kernels, built after node buffers are allocated.
+    k_collision: Option<Kernel>,
+    k_ports_current: Option<Kernel>,
+    k_corrections: Option<Kernel>,
+    collisions_enabled: bool,
 }
 
 impl RRsp3Multi {
@@ -811,8 +817,9 @@ impl RRsp3Multi {
         let cl_dpos_neigh = mk_fbuf(1, flags::MEM_READ_WRITE)?;
         let cl_tips = mk_fbuf(1, flags::MEM_READ_WRITE)?;
 
-        // Zero momentum buffers
+        // Zero persistent state that may be read before its producer is enabled.
         let zeros = vec![0.0f32; ns_n4];
+        cl_dpos_coll.write(&zeros[..]).enq()?;
         cl_dpos_mom.write(&zeros[..]).enq()?;
         cl_dquat_mom.write(&zeros[..]).enq()?;
         let zeros_i = vec![0i32; n];
@@ -825,11 +832,24 @@ impl RRsp3Multi {
             cl_port_local, cl_kflat, cl_bk_slots,
             cl_pos, cl_quat, cl_dpos_coll, cl_dpos_mom, cl_dquat_mom,
             cl_dpos_node, cl_drot_node, cl_dpos_neigh, cl_tips,
+            k_collision: None, k_ports_current: None, k_corrections: None,
+            collisions_enabled: false,
         })
     }
 
     pub fn device_name(&self) -> &str { &self.device_name }
     pub fn nsys(&self) -> usize { self.nsys }
+
+    fn build_kernels(&mut self) -> ocl::Result<()> {
+        let n = self.natoms_per_sys as i32;
+        let nn = self.nnode_per_group;
+        let gs = self.group_size;
+        let ns = self.nsys;
+        self.k_collision = Some(Kernel::builder().program(&self.program).name("compute_collision_multi").queue(self.queue.clone()).global_work_size((gs, ns)).local_work_size((gs, 1)).arg(&self.cl_pos).arg(&self.cl_radius).arg(&self.cl_excl1).arg(&self.cl_excl2).arg(&self.cl_dpos_coll).arg(n).arg(0.0f32).build()?);
+        self.k_ports_current = Some(Kernel::builder().program(&self.program).name("compute_ports_current_multi").queue(self.queue.clone()).global_work_size((gs, ns)).local_work_size((gs, 1)).arg(&self.cl_pos).arg(&self.cl_quat).arg(&self.cl_radius).arg(&self.cl_neighs).arg(&self.cl_port_local).arg(&self.cl_kflat).arg(&self.cl_dpos_node).arg(&self.cl_drot_node).arg(&self.cl_dpos_neigh).arg(n).arg(nn).arg(0.0f32).arg(0.0f32).build()?);
+        self.k_corrections = Some(Kernel::builder().program(&self.program).name("apply_corrections_multi").queue(self.queue.clone()).global_work_size((gs, ns)).local_work_size((gs, 1)).arg(n).arg(nn).arg(&self.cl_pos).arg(&self.cl_quat).arg(&self.cl_fixmask).arg(&self.cl_bk_slots).arg(&self.cl_dpos_node).arg(&self.cl_drot_node).arg(&self.cl_dpos_neigh).arg(&self.cl_dpos_coll).arg(&self.cl_dpos_mom).arg(&self.cl_dquat_mom).arg(0.0f32).arg(0.0f32).arg(0i32).arg(&self.cl_port_local).arg(&self.cl_tips).build()?);
+        Ok(())
+    }
 
     // ------------------------------------------------------------------
     // Upload shared topology (same for all replicas)
@@ -837,7 +857,14 @@ impl RRsp3Multi {
 
     pub fn upload_radius(&mut self, radius: &[f32]) -> ocl::Result<()> {
         assert!(radius.len() == self.natoms_per_sys, "upload_radius: len={} != natoms_per_sys={}", radius.len(), self.natoms_per_sys);
-        self.cl_radius.write(&radius[..]).enq()
+        for (i, &r) in radius.iter().enumerate() { assert!(r.is_finite() && r >= 0.0, "upload_radius: radius[{i}] must be finite and non-negative, got {r}"); }
+        self.collisions_enabled = radius.iter().any(|&r| r > 0.0);
+        self.cl_radius.write(radius).enq()?;
+        if !self.collisions_enabled {
+            let zeros = vec![0.0f32; self.nsys * self.natoms_per_sys * 4];
+            self.cl_dpos_coll.write(&zeros[..]).enq()?;
+        }
+        Ok(())
     }
 
     pub fn upload_neighs_and_exclusions(&mut self, neighs: &[i32], excl1: &[i32], excl2: &[i32]) -> ocl::Result<()> {
@@ -890,7 +917,7 @@ impl RRsp3Multi {
         }
         self.cl_port_local.write(&pl[..]).enq()?;
         self.cl_kflat.write(&kk[..]).enq()?;
-        Ok(())
+        self.build_kernels()
     }
 
     /// Upload bk_slots (shared). [natoms * 4] int4 — local slot indices into dpos_neigh.
@@ -994,65 +1021,29 @@ impl RRsp3Multi {
     // ------------------------------------------------------------------
 
     /// One cluster (relaxation) step for ALL replicas.
-    /// Runs: zero_corrections -> collision -> ports -> corrections.
+    /// Runs: [collision when any radius > 0] -> ports -> corrections. Current-mode producer kernels
+    /// overwrite every consumed correction slot; radius-zero collision output is initialized once.
     /// No bboxes/topology (independent replicas, no ghosts).
     /// Currently supports PortKernel::Current only.
     pub fn step_cluster_multi(&mut self, port_kernel: PortKernel, cfg: &StepConfig) -> ocl::Result<()> {
-        let n = self.natoms_per_sys as i32;
-        let nnode = self.nnode_per_group;
-        let gs = self.group_size;
-        let ns = self.nsys;
-        assert!(nnode > 0, "step_cluster_multi: call upload_cluster_ports_multi first");
+        assert!(port_kernel == PortKernel::Current, "step_cluster_multi: PortKernel::{port_kernel:?} not yet implemented for multi-replica (Current only)");
+        let kc = self.k_collision.as_ref().expect("step_cluster_multi: call upload_cluster_ports_multi first; persistent kernels are not built");
+        let kp = self.k_ports_current.as_ref().expect("step_cluster_multi: Current kernel is not built");
+        let kr = self.k_corrections.as_ref().expect("step_cluster_multi: corrections kernel is not built");
 
-        // 1. Zero corrections
-        let kz = Kernel::builder()
-            .program(&self.program).name("zero_corrections_multi").queue(self.queue.clone())
-            .global_work_size((gs, ns)).local_work_size((gs, 1))
-            .arg(&self.cl_dpos_coll).arg(&self.cl_dpos_node).arg(&self.cl_drot_node).arg(&self.cl_dpos_neigh)
-            .arg(n).arg(nnode)
-            .build()?;
-        unsafe { kz.enq()?; }
-
-        // 2. Collision
-        let kc = Kernel::builder()
-            .program(&self.program).name("compute_collision_multi").queue(self.queue.clone())
-            .global_work_size((gs, ns)).local_work_size((gs, 1))
-            .arg(&self.cl_pos).arg(&self.cl_radius).arg(&self.cl_excl1).arg(&self.cl_excl2)
-            .arg(&self.cl_dpos_coll).arg(n).arg(cfg.k_coll)
-            .build()?;
-        unsafe { kc.enq()?; }
-
-        // 3. Ports (Current variant — only one implemented for multi-replica Phase 1)
-        match port_kernel {
-            PortKernel::Current => {
-                let kp = Kernel::builder()
-                    .program(&self.program).name("compute_ports_current_multi").queue(self.queue.clone())
-                    .global_work_size((gs, ns)).local_work_size((gs, 1))
-                    .arg(&self.cl_pos).arg(&self.cl_quat).arg(&self.cl_radius)
-                    .arg(&self.cl_neighs).arg(&self.cl_port_local).arg(&self.cl_kflat)
-                    .arg(&self.cl_dpos_node).arg(&self.cl_drot_node).arg(&self.cl_dpos_neigh)
-                    .arg(n).arg(nnode).arg(cfg.dt).arg(cfg.rot_mass_scale)
-                    .build()?;
-                unsafe { kp.enq()?; }
-            }
-            _ => panic!("step_cluster_multi: PortKernel::{port_kernel:?} not yet implemented for multi-replica (Phase 1: Current only)"),
+        if self.collisions_enabled {
+            kc.set_arg(6, cfg.k_coll)?;
+            unsafe { kc.enq()?; }
         }
 
-        // 4. Corrections
-        let massless = port_kernel.is_massless() as i32;
-        let kr = Kernel::builder()
-            .program(&self.program).name("apply_corrections_multi").queue(self.queue.clone())
-            .global_work_size((gs, ns)).local_work_size((gs, 1))
-            .arg(n).arg(nnode)
-            .arg(&self.cl_pos).arg(&self.cl_quat).arg(&self.cl_fixmask)
-            .arg(&self.cl_bk_slots)
-            .arg(&self.cl_dpos_node).arg(&self.cl_drot_node).arg(&self.cl_dpos_neigh)
-            .arg(&self.cl_dpos_coll).arg(&self.cl_dpos_mom).arg(&self.cl_dquat_mom)
-            .arg(cfg.relaxation).arg(cfg.momentum_beta).arg(massless)
-            .arg(&self.cl_port_local).arg(&self.cl_tips)
-            .build()?;
-        unsafe { kr.enq()?; }
+        kp.set_arg(11, cfg.dt)?;
+        kp.set_arg(12, cfg.rot_mass_scale)?;
+        unsafe { kp.enq()?; }
 
+        kr.set_arg(12, cfg.relaxation)?;
+        kr.set_arg(13, cfg.momentum_beta)?;
+        kr.set_arg(14, 0i32)?;
+        unsafe { kr.enq()?; }
         Ok(())
     }
 

@@ -1860,18 +1860,16 @@ __kernel void compute_ports_current_multi(
     l_pos[lid] = pi4;
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Zero dpos_neigh for this node's 4 ports (all threads that are nodes)
-    if (lid < nnode_per_group) {
-        int i4 = lid * 4;  // local node index * 4
-        for (int k = 0; k < 4; k++) {
-            dpos_neigh[i0n4 + i4 + k] = (float4)(0.0f);
-        }
-    }
-
     if (lid >= natoms) return;
     if (lid >= nnode_per_group) return;
     float invMi = pi4.w;
-    if (invMi <= 1e-12f) return;
+    if (invMi <= 1e-12f) {
+        int i4 = lid * 4;
+        for (int k = 0; k < 4; k++) dpos_neigh[i0n4 + i4 + k] = (float4)(0.0f);
+        dpos_node[i0n + lid] = (float4)(0.0f);
+        drot_node[i0n + lid] = (float4)(0.0f);
+        return;
+    }
 
     float3 xi = pi4.xyz;
     float4 qi = quat[ia];  // per-replica
@@ -1889,15 +1887,15 @@ __kernel void compute_ports_current_multi(
 
     for (int k = 0; k < 4; k++) {
         int idx = i4 + k;  // local slot index
+        int out = i0n4 + idx;
         int jloc = neighbors[k];
-        if (jloc < 0) continue;
+        if (jloc < 0 || jloc >= natoms) { dpos_neigh[out] = (float4)(0.0f); continue; }
         float K = stiffness_flat[idx];  // shared
-        if (K <= 0.0f) continue;
+        if (K <= 0.0f) { dpos_neigh[out] = (float4)(0.0f); continue; }
 
-        if (jloc >= natoms) continue;
         float4 pj4 = l_pos[jloc];
         float invMj = pj4.w;
-        if (invMj <= 1e-12f) continue;
+        if (invMj <= 1e-12f) { dpos_neigh[out] = (float4)(0.0f); continue; }
         float3 xj = pj4.xyz;
 
         float3 r_local = port_local[idx].xyz;  // shared
@@ -1906,7 +1904,7 @@ __kernel void compute_ports_current_multi(
 
         float3 diff = xj - tip;
         float dist2 = dot(diff, diff);
-        if (dist2 < 1e-16f) continue;
+        if (dist2 < 1e-16f) { dpos_neigh[out] = (float4)(0.0f); continue; }
         float dist = sqrt(dist2);
         float3 n = diff / dist;
 
@@ -1927,7 +1925,7 @@ __kernel void compute_ports_current_multi(
 
         sum_dpos   += P * w_i;
         sum_dtheta += cross(r_arm, P) * invI;
-        dpos_neigh[i0n4 + idx] = (float4)(-P * w_j, 0.0f);  // per-replica
+        dpos_neigh[out] = (float4)(-P * w_j, 0.0f);  // exactly one global write per port slot
     }
 
     dpos_node[i0n + lid] = (float4)(sum_dpos, 0.0f);   // per-replica
@@ -1991,8 +1989,8 @@ __kernel void apply_corrections_multi(
     if (msk & 2) dx.y = 0.0f;
     if (msk & 4) dx.z = 0.0f;
 
-    float3 d_mom = dpos_mom[ia].xyz;  // per-replica
-    float3 move = dx * relaxation + d_mom * beta;
+    float3 move = dx * relaxation;
+    if (beta != 0.0f) move += dpos_mom[ia].xyz * beta;  // uniform branch avoids dead global read when momentum is disabled
 
     if (msk & 8) {
         float3 p_old = pos[ia].xyz;
@@ -2023,8 +2021,8 @@ __kernel void apply_corrections_multi(
             q_new = q_jacobi;
             dquat_mom[ia] = (float4)(0.0f);
         } else {
-            float4 dq_mom = dquat_mom[ia];  // per-replica
-            q_new = q_jacobi + dq_mom * beta;
+            q_new = q_jacobi;
+            if (beta != 0.0f) q_new += dquat_mom[ia] * beta;  // preserve output while avoiding dead read at beta=0
             q_new = quat_normalize(q_new);
         }
 

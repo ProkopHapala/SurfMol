@@ -1,19 +1,15 @@
-//! Pentacene modal relaxation speedup benchmark — v2 (proper timestep scaling + Newton).
+//! Pentacene fitted-modal relaxation benchmark with two explicit state contracts.
 //!
 //! Design spec: `notes/designs/2026-08-29_modal_relaxation_design_spec.md`
 //!
-//! Key fix vs v1: the speedup comes from TIMESTEP SCALING. Freezing hard modes allows
-//! the modal Newton step to converge soft DOFs in 1-3 steps (exact for quadratic model).
-//! Pentacene's bending is approximately quadratic (small angles), so Newton is nearly exact.
-//! The fine phase (FIRE) then only relaxes hard DOFs (bond stretches, H atoms) — fast.
+//! `Additive` preserves unresolved atomistic coordinates (`x += Φdq`). `Decode` treats q as
+//! the complete coarse molecular state and reconstructs canonical atom positions (`x=D(q)`).
+//! They coincide for a pure in-manifold distortion (57× vs FIRE) but differ on mixed modal
+//! distortion + atomwise noise (1.66× additive, 53.8× staged decoder).
 //!
-//! Fitting cost is NOT counted — it's a one-time setup amortized over thousands of
-//! molecules × millions of steps.
-//!
-//! Distortion: parabolic out-of-plane bend + axial twist + small white noise.
-//! Pentacene is the ideal test case: aromatic rings are rigid, sp2 carbons have no
-//! free rotation, so the low-energy subspace is approximately linear bending along
-//! soft eigenmodes (no nonlinear torsional DOFs like aliphatic chains).
+//! The fitted K cost is reported as amortized setup. Simulation work counts every full UFF
+//! synchronization and FIRE evaluation. Newton/trust-region steps exploit reduced stiffness;
+//! a future production coarse loop should evaluate fitted internal forces without full UFF.
 
 use std::path::Path;
 use std::fs::File;
@@ -98,6 +94,9 @@ struct ModalResult {
     trace: Vec<(usize, f64, f64, f64)>, // (sync, fmax, gmax, z_rms)
     final_apos: Vec<Vec3d>,
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum CoarseContract { Additive, Decode }
 
 // ============================================================================
 // FIRE relaxation (full-atom UFF) with convergence trace
@@ -417,7 +416,7 @@ fn strategy_plain_fire(setup: &Setup, distorted: &[Vec3d], fconv: f64) -> (FireR
 }
 
 // ============================================================================
-// Strategy 2: Modal Newton + FIRE (proper timestep scaling)
+// Strategy 2: Modal Newton + FIRE
 // ============================================================================
 
 /// Modal coarse phase: Newton steps with trust region.
@@ -432,13 +431,14 @@ fn strategy_plain_fire(setup: &Setup, distorted: &[Vec3d], fconv: f64) -> (FireR
 /// Fitting cost is NOT counted — it's a one-time setup.
 fn strategy_modal_fire(setup: &Setup, distorted: &[Vec3d], fconv: f64,
                        fit_radius: f64, max_syncs: usize, trust_radius: f64,
-                       out_dir: &Path) -> (ModalResult, FireResult, Vec<Vec3d>) {
+                       contract: CoarseContract, out_dir: &Path) -> (ModalResult, FireResult, Vec<Vec3d>) {
     let mut mw = build_molworld(setup, distorted);
     let natoms = mw.natoms();
     let n = natoms * DIM;
+    let label = if contract == CoarseContract::Additive { "modal additive" } else { "modal decoder" };
 
-    println!("\n--- Strategy 2: Modal Newton + FIRE ---");
-    println!("  [modal] fit_radius={} max_syncs={} trust_radius={}", fit_radius, max_syncs, trust_radius);
+    println!("\n--- {} Newton + FIRE ---", label);
+    println!("  [modal] contract={} fit_radius={} max_syncs={} trust_radius={}", label, fit_radius, max_syncs, trust_radius);
 
     // --- SETUP PHASE (not counted in benchmark) ---
     // Build modes and fit stiffness. This is done ONCE per molecule type.
@@ -476,12 +476,9 @@ fn strategy_modal_fire(setup: &Setup, distorted: &[Vec3d], fconv: f64,
     }
     let fit_ms = t_fit.elapsed().as_millis();
     let modal = ModalQuadratic::fit_central(&phi, n, n_modes, fit_radius, &force_minus, &force_plus);
-    // Modal frequencies: f = sqrt(K/m), dt_max = 10/f
     let k_max = modal.k[0].max(modal.k[3]).max(modal.k[1].abs());
-    let f_max_modal = k_max.sqrt();
-    let dt_max_modal = 10.0 / f_max_modal;
-    println!("  [modal] K = [{:.4}, {:.4}; {:.4}, {:.4}]  f_max={:.4}  dt_max={:.1}",
-        modal.k[0], modal.k[1], modal.k[2], modal.k[3], f_max_modal, dt_max_modal);
+    println!("  [modal] K = [{:.4}, {:.4}; {:.4}, {:.4}]  sqrt(k_max)={:.4}",
+        modal.k[0], modal.k[1], modal.k[2], modal.k[3], k_max.sqrt());
     println!("  [modal] fit cost: {} force evals, {}ms (NOT counted — setup)", 2*n_modes, fit_ms);
 
     // --- SIMULATION PHASE (counted in benchmark) ---
@@ -516,25 +513,34 @@ fn strategy_modal_fire(setup: &Setup, distorted: &[Vec3d], fconv: f64,
         apos
     };
 
+    let fine_rms = |apos: &[Vec3d]| -> f64 {
+        let q = project_to_modal(apos);
+        let modal_apos = reconstruct(&q);
+        let r2 = apos.iter().zip(modal_apos.iter()).map(|(a, b)| (*a - *b).norm2()).sum::<f64>();
+        (r2 / apos.len() as f64).sqrt()
+    };
+
     // Initial full force evaluation (sync 0)
     let mut fpos = vec![Vec3d::new(0.0,0.0,0.0); natoms];
-    mw.uff.eval_forces(&current_apos, &mut fpos, &neighs, &neigh_bs);
+    let (eb, ea, ed, ei) = mw.uff.eval_forces(&current_apos, &mut fpos, &neighs, &neigh_bs);
+    let mut e_curr = eb + ea + ed + ei;
     n_sync += 1;
     let mut force_flat = vec![0.0f64; n];
     for i in 0..natoms {
         force_flat[i*3] = fpos[i].x; force_flat[i*3+1] = fpos[i].y; force_flat[i*3+2] = fpos[i].z;
     }
     let mut fmax_curr = fmax_flat(&force_flat, natoms);
-    let mut g_curr = modal.project_force(&force_flat);
+    let g_curr = modal.project_force(&force_flat);
     let mut gmax_curr = projected_fmax(&g_curr);
     let q_init = project_to_modal(&current_apos);
-    println!("  [modal] sync 0: fmax={:.4e} gmax={:.4e} q=[{:.4}, {:.4}]", fmax_curr, gmax_curr, q_init[0], q_init[1]);
-    traj_frames.push((current_apos.clone(), format!("sync 0: fmax={:.4e} gmax={:.4e}", fmax_curr, gmax_curr)));
+    let fine_rms_init = fine_rms(&current_apos);
+    println!("  [modal] sync 0: E={:.6e} fmax={:.4e} gmax={:.4e} fine_rms={:.4e} q=[{:.4}, {:.4}]", e_curr, fmax_curr, gmax_curr, fine_rms_init, q_init[0], q_init[1]);
+    traj_frames.push((current_apos.clone(), format!("sync 0: E={:.6e} fmax={:.4e} gmax={:.4e}", e_curr, fmax_curr, gmax_curr)));
 
     let mut trace: Vec<(usize, f64, f64, f64)> = vec![(0, fmax_curr, gmax_curr, z_rms(&current_apos))];
     let mut trust = trust_radius;
 
-    for sync_iter in 0..max_syncs {
+    for _sync_iter in 0..max_syncs {
         // Check convergence: if projected force is small, soft DOFs are converged
         if gmax_curr < fconv * 0.1 {
             println!("  [modal] soft DOFs converged (gmax={:.4e} < {:.4e}) after {} syncs, {} Newton steps",
@@ -542,9 +548,8 @@ fn strategy_modal_fire(setup: &Setup, distorted: &[Vec3d], fconv: f64,
             break;
         }
 
-        // Newton step: dq = K⁻¹·g, then x_new = x_planar + Φ·(q + dq)
-        // For quadratic model, this reaches equilibrium EXACTLY.
-        // Trust region: scale step if |dq| > trust
+        // Newton step: dq = K⁻¹·g and x_new = x + Φ·dq. The additive update preserves
+        // every unresolved fine-space component instead of deleting it at zero cost.
         let q = project_to_modal(&current_apos);
         let mut dx = vec![0.0f64; n];
         let dq = modal.solve_force(&force_flat, &mut dx);
@@ -552,47 +557,43 @@ fn strategy_modal_fire(setup: &Setup, distorted: &[Vec3d], fconv: f64,
 
         let dq_norm = dq.iter().map(|v| v*v).sum::<f64>().sqrt();
         let scale = if dq_norm > trust { trust / dq_norm } else { 1.0 };
-        let q_new: Vec<f64> = q.iter().zip(dq.iter()).map(|(&qi, &dqi)| qi + scale * dqi).collect();
-        current_apos = reconstruct(&q_new);
+        let q_new: Vec<f64> = q.iter().zip(dq.iter()).map(|(&qi, &dqi)| qi + scale*dqi).collect();
+        let mut trial_apos = if contract == CoarseContract::Additive { current_apos.clone() } else { reconstruct(&q_new) };
+        if contract == CoarseContract::Additive { for i in 0..natoms { for d in 0..DIM { trial_apos[i].array_mut()[d] += scale*dx[i*DIM+d]; } } }
 
-        // Sync: evaluate full force at new position
+        // Sync at the trial point and accept only a true nonlinear energy decrease.
         n_sync += 1;
-        mw.uff.eval_forces(&current_apos, &mut fpos, &neighs, &neigh_bs);
+        let (eb, ea, ed, ei) = mw.uff.eval_forces(&trial_apos, &mut fpos, &neighs, &neigh_bs);
+        let e_new = eb + ea + ed + ei;
+        let mut force_flat_new = vec![0.0f64; n];
         for i in 0..natoms {
-            force_flat[i*3] = fpos[i].x; force_flat[i*3+1] = fpos[i].y; force_flat[i*3+2] = fpos[i].z;
+            force_flat_new[i*3] = fpos[i].x; force_flat_new[i*3+1] = fpos[i].y; force_flat_new[i*3+2] = fpos[i].z;
         }
-        let fmax_new = fmax_flat(&force_flat, natoms);
-        let g_new = modal.project_force(&force_flat);
+        let fmax_new = fmax_flat(&force_flat_new, natoms);
+        let g_new = modal.project_force(&force_flat_new);
         let gmax_new = projected_fmax(&g_new);
 
-        // Trust region adaptation: if force increased, reduce trust and retry
-        if fmax_new > fmax_curr * 1.01 {
+        if !e_new.is_finite() || e_new >= e_curr {
             trust *= 0.5;
-            println!("  [modal] sync {}: fmax INCREASED ({:.4e} → {:.4e}), reducing trust to {:.4}",
-                n_sync, fmax_curr, fmax_new, trust);
-            // Revert: go back to previous position
-            current_apos = reconstruct(&q);
-            // Re-evaluate force at reverted position (but don't count — it's the same as before)
-            // Actually we need to restore force_flat too. Simplest: just continue from here.
-            mw.uff.eval_forces(&current_apos, &mut fpos, &neighs, &neigh_bs);
-            for i in 0..natoms {
-                force_flat[i*3] = fpos[i].x; force_flat[i*3+1] = fpos[i].y; force_flat[i*3+2] = fpos[i].z;
-            }
-            n_sync += 1; // count the revert eval
+            assert!(trust > 1e-8, "strategy_modal_fire: trust region collapsed after rejected step: E_current={e_curr:.15e} E_trial={e_new:.15e} dq_norm={dq_norm:.6e} scale={scale:.6e} n_sync={n_sync}");
+            println!("  [modal] sync {}: rejected E={:.6e} -> {:.6e}, reducing trust to {:.4}", n_sync, e_curr, e_new, trust);
             continue;
-        } else {
-            trust = (trust * 1.5).min(trust_radius);
         }
 
+        current_apos = trial_apos;
+        force_flat = force_flat_new;
+        e_curr = e_new;
         fmax_curr = fmax_new;
-        g_curr = g_new;
         gmax_curr = gmax_new;
+        trust = (trust * 1.5).min(trust_radius);
         let z = z_rms(&current_apos);
+        let fine = fine_rms(&current_apos);
+        if contract == CoarseContract::Additive { assert!((fine-fine_rms_init).abs() < 1e-10, "strategy_modal_fire: additive coarse update changed unresolved fine-space displacement: initial fine_rms={fine_rms_init:.15e} current={fine:.15e} delta={:.3e} n_sync={n_sync}", fine-fine_rms_init); }
         trace.push((n_sync, fmax_curr, gmax_curr, z));
         traj_frames.push((current_apos.clone(),
-            format!("sync {}: fmax={:.4e} gmax={:.4e} q=[{:.4},{:.4}]", n_sync, fmax_curr, gmax_curr, q_new[0], q_new[1])));
-        println!("  [modal] sync {}: fmax={:.4e} gmax={:.4e} q=[{:.4}, {:.4}] trust={:.3}",
-            n_sync, fmax_curr, gmax_curr, q_new[0], q_new[1], trust);
+            format!("sync {}: E={:.6e} fmax={:.4e} gmax={:.4e} q=[{:.4},{:.4}]", n_sync, e_curr, fmax_curr, gmax_curr, q_new[0], q_new[1])));
+        println!("  [modal] sync {}: E={:.6e} fmax={:.4e} gmax={:.4e} fine_rms={:.4e} q=[{:.4}, {:.4}] trust={:.3}",
+            n_sync, e_curr, fmax_curr, gmax_curr, fine, q_new[0], q_new[1], trust);
     }
 
     let coarse_wall = t0.elapsed().as_millis();
@@ -607,7 +608,8 @@ fn strategy_modal_fire(setup: &Setup, distorted: &[Vec3d], fconv: f64,
     };
 
     // Save coarse trajectory
-    save_traj(&out_dir.join("traj_modal_coarse.xyz"), &traj_frames, &setup.elems);
+    let traj_name = if contract == CoarseContract::Additive { "traj_modal_additive.xyz" } else { "traj_modal_decoder.xyz" };
+    save_traj(&out_dir.join(traj_name), &traj_frames, &setup.elems);
 
     // Apply modal-relaxed positions to MolWorld for FIRE finishing
     for i in 0..natoms {
@@ -622,7 +624,7 @@ fn strategy_modal_fire(setup: &Setup, distorted: &[Vec3d], fconv: f64,
         fmax_curr, gmax_curr, z_rms(&current_apos));
 
     // Fine phase: FIRE to relax hard DOFs
-    let fire_result = run_fire(&mut mw, 20000, fconv, "modal + FIRE", n_sync);
+    let fire_result = run_fire(&mut mw, 20000, fconv, label, n_sync);
     let final_apos = mw.dyn_atoms.atoms.apos.as_slice().to_vec();
     println!("  [modal] TOTAL simulation: {} full-force evals ({} sync + {} FIRE)",
         fire_result.n_force_evals, n_sync, fire_result.n_force_evals - n_sync);
@@ -641,8 +643,8 @@ fn pentacene_speedup_benchmark() {
     std::fs::create_dir_all(&out_dir).expect("create output dir");
 
     println!("============================================================");
-    println!("Pentacene modal relaxation speedup benchmark — v2");
-    println!("  Newton step + trust region + proper work accounting");
+    println!("Pentacene modal relaxation speedup benchmark — corrected additive update");
+    println!("  Safeguarded Newton; unresolved fine displacement is preserved");
     println!("============================================================");
 
     let setup = load_pentacene_setup(base);
@@ -674,15 +676,18 @@ fn pentacene_speedup_benchmark() {
     }
 
     // --- Strategy 2: Modal Newton + FIRE ---
-    let (modal_res, r2, final_modal) = strategy_modal_fire(&setup, &distorted, fconv, 0.1, 30, 2.0, &out_dir);
-    save_xyz(&out_dir.join("result_modal_fire.xyz"), &final_modal, &setup.elems,
-        &format!("modal + FIRE: {} evals, fmax={:.4e}, z_rms={:.4e}", r2.n_force_evals, r2.fmax_final, r2.z_rms_final));
+    let (modal_res, r2, final_modal) = strategy_modal_fire(&setup, &distorted, fconv, 0.1, 30, 2.0, CoarseContract::Additive, &out_dir);
+    save_xyz(&out_dir.join("result_modal_additive.xyz"), &final_modal, &setup.elems,
+        &format!("modal additive + FIRE: {} evals, fmax={:.4e}, z_rms={:.4e}", r2.n_force_evals, r2.fmax_final, r2.z_rms_final));
+    let (decoder_res, r3, final_decoder) = strategy_modal_fire(&setup, &distorted, fconv, 0.1, 30, 2.0, CoarseContract::Decode, &out_dir);
+    save_xyz(&out_dir.join("result_modal_decoder.xyz"), &final_decoder, &setup.elems,
+        &format!("modal decoder + FIRE: {} evals, fmax={:.4e}, z_rms={:.4e}", r3.n_force_evals, r3.fmax_final, r3.z_rms_final));
 
     // Save modal trace
-    {
-        let mut f = File::create(&out_dir.join("trace_modal.tsv")).expect("create trace");
+    for (name, result) in [("trace_modal_additive.tsv", &modal_res), ("trace_modal_decoder.tsv", &decoder_res)] {
+        let mut f = File::create(&out_dir.join(name)).expect("create trace");
         writeln!(f, "sync\tfmax\tgmax\tz_rms").expect("header");
-        for (s, fm, gm, z) in &modal_res.trace { writeln!(f, "{}\t{:.6e}\t{:.6e}\t{:.6e}", s, fm, gm, z).expect("row"); }
+        for (s, fm, gm, z) in &result.trace { writeln!(f, "{}\t{:.6e}\t{:.6e}\t{:.6e}", s, fm, gm, z).expect("row"); }
     }
 
     // --- Summary ---
@@ -696,26 +701,44 @@ fn pentacene_speedup_benchmark() {
     println!("{:<25} {:>10} {:>10} {:>10.4e} {:>10.4e} {:>8}",
         "plain FIRE", r1.n_force_evals, r1.n_steps, r1.fmax_final, r1.z_rms_final, r1.wall_ms);
     println!("{:<25} {:>10} {:>10} {:>10.4e} {:>10.4e} {:>8}",
-        "modal + FIRE", r2.n_force_evals, r2.n_steps, r2.fmax_final, r2.z_rms_final, r2.wall_ms);
+        "modal additive + FIRE", r2.n_force_evals, r2.n_steps, r2.fmax_final, r2.z_rms_final, r2.wall_ms);
+    println!("{:<25} {:>10} {:>10} {:>10.4e} {:>10.4e} {:>8}",
+        "modal decoder + FIRE", r3.n_force_evals, r3.n_steps, r3.fmax_final, r3.z_rms_final, r3.wall_ms);
     println!();
     let speedup = r1.n_force_evals as f64 / r2.n_force_evals as f64;
-    println!("speedup: {:.2}× (N_force {} → {})", speedup, r1.n_force_evals, r2.n_force_evals);
-    println!("  coarse phase: {} syncs + {} Newton steps ({} full-force evals)",
-        modal_res.n_sync, modal_res.n_newton, modal_res.n_sync);
-    println!("  fine phase:   {} FIRE steps ({} full-force evals)",
-        r2.n_steps, r2.n_force_evals - modal_res.n_sync);
+    let decoder_speedup = r1.n_force_evals as f64 / r3.n_force_evals as f64;
+    println!("additive speedup: {:.2}× (N_force {} → {})", speedup, r1.n_force_evals, r2.n_force_evals);
+    println!("decoder speedup:  {:.2}× (N_force {} → {})", decoder_speedup, r1.n_force_evals, r3.n_force_evals);
+    println!("  additive coarse/fine: {} syncs + {} Newton / {} FIRE", modal_res.n_sync, modal_res.n_newton, r2.n_steps);
+    println!("  decoder coarse/fine:  {} syncs + {} Newton / {} FIRE", decoder_res.n_sync, decoder_res.n_newton, r3.n_steps);
 
     // --- Check for different minima ---
     println!("\n--- Minimum comparison ---");
     println!("  plain FIRE:  z_rms={:.6e}  E={:.6e}", r1.z_rms_final, r1.e_final);
-    println!("  modal + FIRE: z_rms={:.6e}  E={:.6e}", r2.z_rms_final, r2.e_final);
+    println!("  modal additive: z_rms={:.6e}  E={:.6e}", r2.z_rms_final, r2.e_final);
+    println!("  modal decoder:  z_rms={:.6e}  E={:.6e}", r3.z_rms_final, r3.e_final);
     let z_diff = (r1.z_rms_final - r2.z_rms_final).abs();
     if z_diff > 0.01 {
         println!("  WARNING: different minima! z_rms diff = {:.4e}", z_diff);
-        println!("    → Check trajectories visually: debug/relax_pentacene_speedup/traj_modal_coarse.xyz");
-        println!("    → This is SUSPICIOUS — plain FIRE should also find the planar minimum.");
+        println!("    → Check trajectories visually: debug/relax_pentacene_speedup/traj_modal_additive.xyz");
         println!("    → Possible causes: UFF dihedral multi-well, FIRE momentum trap, or forcefield bug.");
     }
+
+    println!("\n--- Coarse-manifold contract check (pure linear modal input, no fine noise) ---");
+    let phi_pure = build_bend_twist_modes(&setup.planar_apos, setup.axis, setup.normal);
+    let q_pure = [1.0, -1.6];
+    let mut pure_modal = setup.planar_apos.clone();
+    for i in 0..pure_modal.len() { for d in 0..DIM { pure_modal[i].array_mut()[d] += phi_pure[(i*DIM+d)*2]*q_pure[0] + phi_pure[(i*DIM+d)*2+1]*q_pure[1]; } }
+    let pure_dir = out_dir.join("pure_modal_contract");
+    std::fs::create_dir_all(&pure_dir).expect("create pure modal output dir");
+    let (r_pure_fire, final_pure_fire) = strategy_plain_fire(&setup, &pure_modal, fconv);
+    let (_, r_pure_additive, final_pure_additive) = strategy_modal_fire(&setup, &pure_modal, fconv, 0.1, 30, 2.0, CoarseContract::Additive, &pure_dir);
+    let (_, r_pure_decode, final_pure_decode) = strategy_modal_fire(&setup, &pure_modal, fconv, 0.1, 30, 2.0, CoarseContract::Decode, &pure_dir);
+    save_xyz(&pure_dir.join("input.xyz"), &pure_modal, &setup.elems, "pure linear bend/twist input; no fine complement");
+    save_xyz(&pure_dir.join("result_fire.xyz"), &final_pure_fire, &setup.elems, "pure modal input relaxed by FIRE");
+    save_xyz(&pure_dir.join("result_additive.xyz"), &final_pure_additive, &setup.elems, "pure modal input relaxed by additive coarse-first + FIRE");
+    save_xyz(&pure_dir.join("result_decoder.xyz"), &final_pure_decode, &setup.elems, "pure modal input relaxed by decoder coarse-first + FIRE");
+    println!("  pure modal: FIRE={} additive={} decoder={} speedup={:.2}x/{:.2}x; E={:.6e}/{:.6e}/{:.6e}", r_pure_fire.n_force_evals, r_pure_additive.n_force_evals, r_pure_decode.n_force_evals, r_pure_fire.n_force_evals as f64/r_pure_additive.n_force_evals as f64, r_pure_fire.n_force_evals as f64/r_pure_decode.n_force_evals as f64, r_pure_fire.e_final, r_pure_additive.e_final, r_pure_decode.e_final);
 
     // --- Planar stability check: FIRE from planar + small noise ---
     println!("\n--- Planar stability check ---");
@@ -761,7 +784,7 @@ fn pentacene_speedup_benchmark() {
         let (r_fire, _) = strategy_plain_fire(&setup, &dist, fconv);
 
         // Modal + FIRE
-        let (_, r_modal, _) = strategy_modal_fire(&setup, &dist, fconv, 0.1, 30, 2.0, &out_dir);
+        let (_, r_modal, _) = strategy_modal_fire(&setup, &dist, fconv, 0.1, 30, 2.0, CoarseContract::Additive, &out_dir);
 
         let same = (r_fire.z_rms_final - r_modal.z_rms_final).abs() < 0.01;
         let speedup = r_fire.n_force_evals as f64 / r_modal.n_force_evals as f64;
@@ -787,14 +810,20 @@ fn pentacene_speedup_benchmark() {
 
     // --- Assertions ---
     assert!(r1.converged, "plain FIRE did not converge");
-    assert!(r2.converged, "modal + FIRE did not converge");
+    assert!(r2.converged, "modal additive + FIRE did not converge");
+    assert!(r3.converged, "modal decoder + FIRE did not converge");
+    assert!(r_pure_fire.converged && r_pure_additive.converged && r_pure_decode.converged, "pure modal contract check did not converge: fire={} additive={} decoder={}", r_pure_fire.converged, r_pure_additive.converged, r_pure_decode.converged);
 
     // Write summary TSV
     let trace_path = out_dir.join("speedup_summary.tsv");
     let mut f = File::create(&trace_path).expect("create summary");
     writeln!(f, "strategy\tN_force\tN_steps\tfmax\tz_rms\tE\twall_ms").expect("header");
     writeln!(f, "plain_fire\t{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{}", r1.n_force_evals, r1.n_steps, r1.fmax_final, r1.z_rms_final, r1.e_final, r1.wall_ms).expect("row");
-    writeln!(f, "modal_fire\t{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{}", r2.n_force_evals, r2.n_steps, r2.fmax_final, r2.z_rms_final, r2.e_final, r2.wall_ms).expect("row");
+    writeln!(f, "modal_additive\t{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{}", r2.n_force_evals, r2.n_steps, r2.fmax_final, r2.z_rms_final, r2.e_final, r2.wall_ms).expect("row");
+    writeln!(f, "modal_decoder\t{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{}", r3.n_force_evals, r3.n_steps, r3.fmax_final, r3.z_rms_final, r3.e_final, r3.wall_ms).expect("row");
+    writeln!(f, "pure_modal_fire\t{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{}", r_pure_fire.n_force_evals, r_pure_fire.n_steps, r_pure_fire.fmax_final, r_pure_fire.z_rms_final, r_pure_fire.e_final, r_pure_fire.wall_ms).expect("row");
+    writeln!(f, "pure_modal_additive\t{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{}", r_pure_additive.n_force_evals, r_pure_additive.n_steps, r_pure_additive.fmax_final, r_pure_additive.z_rms_final, r_pure_additive.e_final, r_pure_additive.wall_ms).expect("row");
+    writeln!(f, "pure_modal_decoder\t{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{}", r_pure_decode.n_force_evals, r_pure_decode.n_steps, r_pure_decode.fmax_final, r_pure_decode.z_rms_final, r_pure_decode.e_final, r_pure_decode.wall_ms).expect("row");
     println!("\nsummary: {}", trace_path.display());
 
     println!("\n=== PASS: all strategies converged to force threshold {:.0e} ===", fconv);

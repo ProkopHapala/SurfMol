@@ -760,3 +760,60 @@ __kernel void getSurfFolded_tensor_poly(
     forces[iav] += (float4)(F_tot.x, F_tot.y, F_tot.z, -E_tot);
 }
 
+// ======================================================================
+//  Surface injection macros (Axis 3) for getNonBond_generic
+// ======================================================================
+//
+// FAF (Folded Atomic Forcefield) injection. Samples the precomputed
+// folded-basis surface potential at the atom position.
+//
+// Reference: FireCore Surface.cl:432-502 (getSurfFolded)
+//            uses folded_eval_basis() + folded_eval_grad() from this file.
+//
+// The folded basis is separable: E(u,v,z) = Σ_b c_b · Bx(u)·By(v)·Bz(z)
+// where (u,v) are fractional 2D lattice coords and z is height.
+// Force F = -∇E is computed via folded_eval_grad().
+
+// ---- SURF_FAF — folded atomic forcefield (simple per-atom loop) ----
+#define SURF_ARGS_FAF  \
+    , __global float*   folded_coeffs     \
+    , __global float4*  folded_kxyz       \
+    , __global int*     folded_atom_type  \
+    , const int4        folded_meta       \
+    , const float4      folded_lvec2d
+
+#define SURF_INJECT_FAF(posi, REQKi, fe)  {                              \
+    const int nbasis = folded_meta.x;                                    \
+    const int ntypes = folded_meta.y;                                    \
+    if(nbasis<=0 || nbasis>64 || ntypes>8) { /* skip if invalid */ }     \
+    else {                                                               \
+        __local float4 LBASIS[64];                                      \
+        __local float  LCOEFFS[8*64];                                   \
+        for(int j=iL; j<nbasis; j+=nL)        LBASIS[j] = folded_kxyz[j]; \
+        for(int j=iL; j<nbasis*ntypes; j+=nL) LCOEFFS[j] = folded_coeffs[j]; \
+        barrier(CLK_LOCAL_MEM_FENCE);                                    \
+        float ax=folded_lvec2d.x, bx=folded_lvec2d.y;                   \
+        float ay=folded_lvec2d.z, by=folded_lvec2d.w;                   \
+        float det = ax*by - bx*ay;                                      \
+        if(fabs(det) >= 1e-12f) {                                       \
+            float4 invLvec2d = (float4)( by/det, -bx/det, -ay/det, ax/det ); \
+            float u = invLvec2d.x*posi.x + invLvec2d.y*posi.y;          \
+            float v = invLvec2d.z*posi.x + invLvec2d.w*posi.y;          \
+            u = u - floor(u);  v = v - floor(v);                        \
+            int ityp = folded_atom_type[iG];                            \
+            if(ityp>=0 && ityp<ntypes) {                                \
+                float E=0.0f; float3 F=(float3)(0,0,0);                 \
+                int ioff = ityp*nbasis;                                 \
+                for(int ib=0; ib<nbasis; ib++){                         \
+                    float c = LCOEFFS[ioff+ib];                         \
+                    float4 prm = LBASIS[ib];                            \
+                    E += c * folded_eval_basis(u,v,posi.z,prm);         \
+                    F -= c * folded_eval_grad (u,v,posi.z,prm,invLvec2d); \
+                }                                                       \
+                fe += (float4)(F.x, F.y, F.z, -E);                      \
+            }                                                           \
+        }                                                               \
+        barrier(CLK_LOCAL_MEM_FENCE);                                    \
+    }                                                                   \
+}
+

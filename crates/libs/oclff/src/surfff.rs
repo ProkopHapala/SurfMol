@@ -20,8 +20,6 @@ fn make_assembler() -> ClAssembler {
     let mut asm = ClAssembler::new();
     asm.add_fragment("common.cl",       include_str!("../../../../opencl/common.cl"));
     asm.add_fragment("Forces.cl",       include_str!("../../../../opencl/Forces.cl"));
-    asm.add_fragment("gridff_spammm.cl", include_str!("../../../../opencl/gridff_spammm.cl"));
-    asm.add_fragment("surface_spammm.cl", include_str!("../../../../opencl/surface_spammm.cl"));
     asm
 }
 

@@ -1,7 +1,7 @@
 ---
 type: report
 title: GPU RAFF multi-replica benchmark — first results
-description: Throughput benchmark of the multi-replica RRsp3 OpenCL harness on xylitol (22 atoms). 5000 independent replicas on GTX 1650 achieve 2.8×10⁸ atoms/s (2494 steps/s, 0.4ms/step). Launch-bound below 1000 replicas, compute-bound above 2000. Force converges (4.1e-4 → 1.0e-4 over 1500 steps). No ghost atoms needed for independent replicas — massive simplification vs single-system RRsp3.
+description: Multi-replica RRsp3 optimization benchmark on xylitol (22 atoms). Persistent kernels, WG32, producer-owned single writes, radius-zero collision omission, and avoiding dead momentum reads raise GTX 1650 throughput from 2.83×10⁸ to about 5.6×10⁸ real atom-steps/s at 5000 replicas. Direct legacy-vs-multi parity remains the next correctness gate.
 tags: [gpu, opencl, rrsp3, multi-replica, benchmark, throughput, xylitol, gtx1650, launch-bound, compute-bound, memory-bound]
 timestamp: 2026-08-29
 ---
@@ -10,50 +10,53 @@ timestamp: 2026-08-29
 
 ## 1. Summary
 
-The multi-replica `RRsp3Multi` harness achieves **2.8×10⁸ atoms/s** (2494 steps/s) on 5000 independent xylitol replicas on an NVIDIA GTX 1650. The force converges monotonically. The key architectural simplification: **independent replicas need no ghost atoms** — all neighbors are intra-workgroup, so the O(N²) broad-phase topology build is completely eliminated.
+The optimized multi-replica path achieves approximately **5.6×10⁸ real atom-steps/s** (5.1k simulation steps/s, 0.194–0.197 ms/step) for 5000 xylitol replicas on an NVIDIA GTX 1650—about **2× the original WG64 implementation**. Retained changes: WG32, persistent kernels, no redundant zero launch, one recoil-buffer write per port, no collision launch when all radii are zero, and no old-momentum reads when `beta=0`. Independent replicas still require no ghosts or O(N²) broad phase.
 
 ## 2. Setup
 
 | Parameter | Value |
 |-----------|-------|
 | Molecule | Xylitol (C₅H₁₂O₅, 22 atoms, 21 bonds, 10 nodes) |
-| Group size | 64 (padded from 22, 65% waste) |
+| Group size | 32 (padded from 22, 31% waste); original baseline used 64 |
 | Port kernel | Current (massfull XPBD) |
 | Stiffness K | 200.0 |
-| Collisions | Disabled (radius=0, k_coll=0) — xylitol has 1-4 pairs not excluded by 1st+2nd |
+| Collisions | Disabled by `radius=0`; collision launch omitted and `dpos_coll` initialized once. `k_coll` remains semantically unresolved/unused. |
 | Perturbation | 0.2Å (H: 0.3Å) random per replica |
 | GPU | NVIDIA GeForce GTX 1650 (896 CUDA cores, 128 GB/s, 4GB) |
-| Steps (benchmark) | 1000 (timed, after 10 warmup) |
+| Steps (benchmark) | 5000 for optimization comparisons (timed after 10 warmup) |
 | Steps (convergence) | 2000 (sampled every 100) |
 
 ## 3. Throughput vs system size
 
-| nsys | Real atoms | ms/step | steps/s | atoms/s | Regime |
-|------|-----------|---------|---------|---------|--------|
-| 64 | 1,408 | 0.123 | 8,130 | 1.15×10⁷ | launch-bound |
-| 512 | 11,264 | 0.126 | 7,937 | 8.94×10⁷ | launch-bound |
-| 1,000 | 22,000 | 0.12 | 8,333 | 1.83×10⁸ | launch-bound |
-| 2,000 | 44,000 | 0.178 | 5,618 | 2.47×10⁸ | transition |
-| 5,000 | 110,000 | 0.388 | 2,577 | 2.84×10⁸ | compute-bound |
+| Configuration | nsys | Real atoms | ms/step | steps/s | real atom-steps/s |
+|---------------|------|------------|---------|---------|-------------------|
+| Original, WG64, transient kernels, 4 launches | 64 | 1,408 | 0.123 | 8,130 | 1.15×10⁷ |
+| **Optimized, WG32, persistent kernels, 3 launches** | **64** | **1,408** | **0.0123** | **81,301** | **1.15×10⁸** |
+| Original, WG64, transient kernels, 4 launches | 5,000 | 110,000 | 0.388 | 2,576 | 2.83×10⁸ |
+| WG32 only (before removing zero) | 5,000 | 110,000 | 0.298 | 3,351 | 3.69×10⁸ |
+| WG32 + no zero launch | 5,000 | 110,000 | 0.251 | 3,987 | 4.39×10⁸ |
+| WG32 + no zero + persistent kernels | 5,000 | 110,000 | 0.251 | 3,984 | 4.38×10⁸ |
+| + one `dpos_neigh` write per port | 5,000 | 110,000 | 0.247 | 4,052 | 4.46×10⁸ |
+| + omit collision when all radii zero | 5,000 | 110,000 | 0.212 | 4,722 | 5.19×10⁸ |
+| **+ avoid old-momentum reads at beta=0 (final)** | **5,000** | **110,000** | **0.194–0.197** | **5,068–5,156** | **5.58–5.67×10⁸** |
+
+At saturation, WG32 gives +30%, removing the redundant zero launch +19%, single-write recoil ~1.7%, radius-zero collision omission ~16.5%, and avoiding dead momentum reads ~7%. Persistent kernels do not change saturated GPU time but dominate small-batch improvement. End-to-end saturated throughput is now approximately **2× the original path**. At 64 replicas the latest measured path reaches 93.2k steps/s versus 8.1k originally (~11.5×).
 
 <ref_file file="/home/prokohapala/git/SurfMol/debug/raff_ocl_benchmark/throughput_sweep.png" />
 
-### 3.1 Launch-bound regime (nsys ≤ 1000)
+### 3.1 Host overhead and persistent kernels
 
-For small nsys, the per-step time is constant at ~0.12ms regardless of nsys. This is **kernel launch overhead**: 3 kernels per step × ~40µs per launch = 120µs. The GPU finishes the compute before the host can enqueue the next kernel.
+The original ~0.12 ms floor was not pure GPU launch time: `step_cluster_multi()` rebuilt four `ocl::Kernel` objects and reset every invariant argument on every step. Caching three persistent kernels reduces the optimized 64-replica path to ~0.012 ms/step. This confirms repeated kernel construction was a major host-side bottleneck.
 
-**Implication**: for small systems, batching more replicas is "free" — 64 replicas take the same time as 1 replica. Always batch as many replicas as possible.
+### 3.2 Saturated throughput
 
-### 3.2 Compute-bound regime (nsys ≥ 2000)
+At 5000 replicas, persistent kernel caching alone has no measurable effect: GPU work dominates. The complete retained sequence raises throughput from 2.83×10⁸ to roughly 5.6×10⁸ real atom-steps/s. The largest post-WG32 kernel-path gain is recognizing that radius-zero systems need no collision launch; `dpos_coll` is initialized once when radii are uploaded.
 
-For large nsys, the per-step time grows linearly with nsys. At 5000 replicas, 0.388ms/step = 0.078µs per replica per step.
+The earlier bandwidth estimate is withdrawn: host wall time alone cannot establish memory-bound behavior. Per-kernel `cl::Event` timing plus measured bytes and device counters are required before classifying the optimized path.
 
-**Memory bandwidth analysis**: each step reads/writes ~20 MB (pos + quat + dpos buffers for 5000×64 atoms). At 0.388ms: 20MB / 0.388ms = 51.5 GB/s = **40% of GTX 1650's 128 GB/s peak**. The kernel is memory-bound, as expected for a lightweight force kernel (~2000 FLOPs per replica, ~25 GFLOPs/s = ~1% of compute peak).
+### 3.3 Peak measured throughput
 
-### 3.3 Peak throughput
-
-**2.84×10⁸ atoms/s** at 5000 replicas. For the FireCore reference benchmark (6000 replicas of xylitol, 10000 MD steps), this would take:
-- 10000 steps / 2494 steps/s ≈ **4 seconds** (molecular relaxation only, no surface GridFF)
+**5.58–5.67×10⁸ real atom-steps/s** at 5000 replicas across the final runs. At this rate, 10000 molecular-relaxation steps take about **1.9–2.0 seconds** (surface GridFF excluded).
 
 ## 4. Convergence
 
@@ -100,7 +103,7 @@ New struct `RRsp3Multi` with:
 - `new(natoms_per_sys, group_size, nsys, prefer_gpu)` — creates context, allocates buffers
 - `upload_radius`, `upload_neighs_and_exclusions`, `upload_cluster_ports_multi`, `upload_bk_slots_multi` — shared topology
 - `upload_state_multi(pos3_flat, inv_mass, quat_flat)` — per-replica state (all replicas at once)
-- `step_cluster_multi(port_kernel, cfg)` — one step for ALL replicas (4 kernel launches)
+- `step_cluster_multi(port_kernel, cfg)` — one step for ALL replicas (2 persistent launches for radius-zero systems; 3 when collisions are active; no per-step construction)
 - `download_pos_replica(isys)`, `download_dpos_coll_replica(isys)`, etc. — per-replica download
 - `finish()` — wait for queue completion
 
@@ -121,7 +124,7 @@ New struct `RRsp3Multi` with:
 | `neighs_local` remapping | Required (global → local + ghost) | **Eliminated** | neighs are already local |
 | `excl_local` remapping | Required | **Eliminated** | excl are already local |
 
-**Result**: 4 kernel launches per step (zero + collision + ports + corrections) vs 6+ for single-system (bboxes + topology + zero + collision + ports + corrections). And no O(N²) topology build.
+**Result after optimization**: radius-zero systems use 2 persistent launches (ports + corrections); systems with positive collision radii use 3 (collision + ports + corrections). There is no per-step `Kernel::build` and no O(N²) topology build. `dpos_coll` is initialized once when collisions are disabled; `zero_corrections_multi` remains available for future accumulating variants.
 
 ## 7. Limitations and next steps
 
@@ -159,18 +162,39 @@ Two concerns make kernel fusion risky:
 1. **Combinatorial explosion**: fused collision+ports+corrections would need 20+ variants (5 port kernels × collision on/off × dynamics on/off). Solution: use the `ClAssembler` macro metaprogramming system (`crates/libs/oclff/src/assemble.rs`) to generate only needed variants — but this is engineering effort for uncertain gain.
 2. **Register spill + local memory limits**: `__local` arrays are additive across fused phases (`l_pos` from collision + `l_pos` from ports = 2× local memory). Too much `__local` reduces occupancy. Register spill to private memory kills performance. **OpenCL requires `__local` declared at kernel top — cannot scope into blocks.** Private variables CAN be scoped into `{}` blocks to shorten register lifetimes.
 
-**Decision**: do NOT fuse for Phase 2. The 4-launch overhead is ~0.12ms (launch-bound regime), small relative to 0.39ms compute at 5000 replicas. Profile with `cl::Event` first to confirm launch is actually the bottleneck.
+**Decision**: do NOT fuse now. Persistent kernels plus removal of redundant zeroing already reduce the path to three launches and ~0.012 ms/step at 64 replicas. At 5000 replicas, measured time is 0.251 ms/step; profile each kernel with `cl::Event` before accepting fusion's register/local-memory risks.
 
-#### What to optimize instead
-- **Shared memory for port geometry**: `port_local` and `kflat` are shared across all replicas but in global memory. Load to `__local` once per workgroup.
-- **Smaller GROUP_SIZE**: GROUP_SIZE=32 for xylitol (22 atoms) = 31% waste vs 65% at 64. Free parameter change — benchmark it.
-- **Multiple molecules per workgroup**: pack 2 xylitols (44 atoms) per GROUP_SIZE=64 = 31% waste. Needs `mol_start[igroup]` boundaries. Concern: if molecules fly apart, workgroup AABB inflates. Covalent bonds keep molecules compact, so OK for bonded relaxation. For small molecules (water, methanol) this is essential. See task spec for full discussion.
-- **Scope private variables** into `{}` blocks to reduce register spill (good practice regardless).
-- **`cl::Event` profiling**: measure per-kernel GPU time to identify which kernel dominates.
+#### Ranked next work after static kernel review
 
-### 7.3 Parity verification
-- Need to compare multi-replica GPU output with single-system RRsp3 output for the same molecule + perturbation. If they match (Kabsch RMSD < 1e-3), the multi-replica kernels are correct.
-- The convergence trace (4.1e-4 → 1.0e-4) is consistent with the single-system xylitol test, but a direct comparison hasn't been done yet.
+1. **Correctness gate first**: direct one-replica parity against legacy `RRsp3`. Finite positions and decreasing correction are necessary but not sufficient.
+2. **Cache persistent `ocl::Kernel` objects**: `step_cluster_multi()` currently runs `Kernel::builder().build()` four times on every step. Removing repeated `clCreateKernel` and invariant argument setup should be the largest low-risk host-side gain, especially below saturation.
+3. **Eliminate redundant zero launch for Current mode**: collision overwrites every `dpos_coll`; Current ports zero all node recoil slots and overwrite node outputs. This can remove one launch and buffer write, but only after parity confirms the overwrite invariant.
+4. **Benchmark GROUP_SIZE=32**: xylitol uses 22 real lanes, so 32 wastes 31% versus 66% for 64 and occupies one NVIDIA warp rather than two.
+5. **Resolve collision-disable semantics**: `k_coll` is currently accepted but unused; radius=0 actually disables collision. Only then skip the collision kernel when disabled while preserving deterministic zero `dpos_coll`.
+6. **Add `cl::Event` profiling and resource queries** before changing `__local` use or fusing kernels.
+
+Explicitly staging `port_local`/`kflat` in `__local` is lower priority than previously stated: these arrays are tiny and identical for every replica, so GPU caches may already serve them well. Local staging adds cooperative loads, barriers, and occupancy cost. Likewise, private-variable scopes may reduce register lifetime but are compiler-dependent and must be measured.
+
+The complete ranked table and verification gate are in the existing task specification.
+
+### 7.3 Verification status
+- `cargo test -p oclff`: 20 tests passed after optimization, including OpenCL compilation tests.
+- Removing zeroing and caching kernels preserves the deterministic printed final xylitol coordinates exactly to 6 decimals; the sampled residual is unchanged (`1.147e-5` after the 5000-step timing sequence).
+- A fresh convergence run remains monotonic (`max|F| 5.879e-3` at step 0 → `8.409e-4` at step 500), with finite positions.
+- **Still required**: direct legacy `RRsp3` versus multi-system comparison for identical initial state and step count. The current before/after check validates these optimizations, not the original multi-system port itself.
+
+### 7.4 Repository-wide hot-path audit
+
+The persistent-kernel speedup triggered a read-only audit rather than more implementation. Main findings:
+
+- **Legacy `RRsp3` remains a major violation**: 5 kernel builds per cluster step and 7+ per dynamics step, plus per-step GPU→CPU radius readback and host zero-vector allocations/transfers.
+- **Legacy Eigen cluster mode has a correctness risk**: `tips_valid` is not invalidated when cluster steps update geometry.
+- **`UffOcl::eval_bonds` is not simulation-ready**: every call allocates/uploads all buffers, builds two kernels, allocates output storage, and reads results back.
+- **Collision control is misleading**: `k_coll` is dead in both collision implementations. Radius zero—not `k_coll=0`—is what disables xylitol collisions.
+- **Next likely multi-system gains**: skip collision work after semantics are defined; single-write `dpos_neigh`; generated no-momentum correction variant for `beta=0`; partial replica downloads rather than transferring all replicas.
+- **Lower-confidence ideas**: constant address space for shared topology, node-only quaternion buffers, pair deduplication, and fusion require profiling/parity before implementation.
+
+The complete ranked audit, evidence, and implementation order are recorded in the existing task specification. No code was changed for these audit findings.
 
 ## 8. Files
 

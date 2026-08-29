@@ -624,3 +624,56 @@ __kernel void sampleGridFF(
     forces[iG] = fe_Paul*cP  + fe_Lond*cL  +  fe_Coul*REQ.z;
 }
 
+// ======================================================================
+//  Surface injection macros (Axis 3) for getNonBond_generic
+// ======================================================================
+//
+// Each surface variant defines ALL of:
+//   SURF_ARGS_VARIANT        — extra kernel arguments (appended after GFFParams)
+//   SURF_INJECT_VARIANT(posi, REQKi, fe)  — self-contained block that samples
+//                              the surface potential at posi and accumulates
+//                              into fe (float4 force+energy accumulator).
+//
+// The template calls:
+//   SURF_INJECT_*(posi, REQKi, fe);
+// after the NB loop, guarded by if(iG<natoms).
+//
+// Available variables in scope at injection point:
+//   iG, iS, iL, nL, natoms, i0a, iaa, posi (float3), REQKi (float4),
+//   fe (float4), GFFParams (float4), grid_ns/grid_invStep/grid_p0 (if declared)
+//
+// Reference: FireCore UFF.cl:1670-1710 (getNonBond_GridFF_Bspline gridff block)
+
+// ---- SURF_NONE — no surface interaction (pure NB kernel) ----
+#define SURF_ARGS_NONE
+#define SURF_INJECT_NONE(posi, REQKi, fe)
+
+// ---- SURF_GRIDFF_BSPLINE — tricubic B-spline GridFF ----
+// Reference: UFF.cl:1670-1710, fe3d_pbc_comb() in this file.
+// Samples the precomputed BsplinePLQ grid (Pauli+London+Coulomb+Hbond)
+// at the atom position, scales by atom-specific PLQH prefactor, and
+// accumulates into fe. The grid stores (Fx,Fy,Fz,E) per voxel.
+#define SURF_ARGS_GRIDFF_BSPLINE  \
+    , __global float4*  BsplinePLQ  \
+    , const int4        grid_ns     \
+    , const float4      grid_invStep \
+    , const float4      grid_p0
+
+#define SURF_INJECT_GRIDFF_BSPLINE(posi, REQKi, fe)  {                    \
+    __local int4 xqs[4]; __local int4 yqs[4];                            \
+    if      (iL<4){             xqs[iL]=make_inds_pbc(grid_ns.x,iL); }  \
+    else if (iL<8){ int i=iL-4; yqs[i ]=make_inds_pbc(grid_ns.y,i ); }  \
+    barrier(CLK_LOCAL_MEM_FENCE);                                        \
+    const float ej = exp( GFFParams.y * REQKi.x );                       \
+    const float4 PLQH = (float4){                                        \
+        ej*ej*REQKi.y,  /* London dispersion prefactor */               \
+        ej*   REQKi.y,  /* Pauli repulsion prefactor */                  \
+        REQKi.z,        /* Coulomb charge */                             \
+        0.0f                                                          }; \
+    const float3 u = (posi - grid_p0.xyz) * grid_invStep.xyz;            \
+    float4 fg = fe3d_pbc_comb(u, grid_ns.xyz, BsplinePLQ, PLQH, xqs, yqs); \
+    fg.xyz *= -grid_invStep.xyz;                                         \
+    fe += fg;                                                            \
+}
+
+

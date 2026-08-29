@@ -1,7 +1,7 @@
 ---
 type: topical-audit
 title: Multigrid Solver
-description: Cross-implementation map for coarse-grained molecular relaxation in SurfMol — linear V-cycle solver (TrussOp, UffHessianOp, Galerkin, geometric prolongation) and modal coarse-graining (fitted modal Newton, bend/twist modes, force-projection Galerkin V-shape). The modal approach achieves 53× speedup on pentacene; the linear V-cycle is retained as diagnostic infrastructure.
+description: Cross-implementation map for coarse-grained molecular relaxation in SurfMol — linear V-cycle solver and modal methods. Contract-separated pentacene benchmarks give 57× for pure in-manifold relaxation, 53.8× for staged canonical decoding, and 1.66× for additive preservation of a mixed atomistic state. Force-projection Galerkin V-shape remains the nonlinear fallback.
 tags: [multigrid, solver, truss-elasticity, uff-hessian, prolongation, coarse-space, jacobi, v-cycle, modal, bend-twist, topical-audit]
 timestamp: 2026-09-29
 ---
@@ -64,7 +64,7 @@ V-cycle: pre-smooth (block Jacobi with optional heavy-ball momentum) → restric
 | TrussOp matvec | ✅ Parity verified (T1: max err 1.5e-8 vs dense) |
 | Diagonal blocks | ✅ Parity verified (T2: exact) |
 | Direct solve | ✅ Parity verified (T3: max err 2.9e-13 vs Gaussian elimination) |
-| V-cycle convergence (regular grid) | ✅ 4.7× speedup over Jacobi on 8×8 grid (T4) |
+| V-cycle convergence (regular grid) | ✅ 3.9× fewer smoothing steps than Jacobi on 8×8 grid (T4: 144 vs 561) |
 | Cached coarse force parity | ✅ GalerkinLevel vs exact coarse correction (T5) |
 | Fitted modal quadratic parity | ✅ K fitted to 4.4e-16, response to 2.2e-16 (T6) |
 | Bend/twist orthonormality | ✅ Gram matrix = I to 1e-14 (T7) |
@@ -91,12 +91,13 @@ V-cycle: pre-smooth (block Jacobi with optional heavy-ball momentum) → restric
 | Geometric pivots (BFS farthest-point + inverse-distance) | ✅ Implemented | `build_pivot_prolongation` | Retained as diagnostic; not physically motivated for molecules |
 | Spectral (vibration eigenmodes as P) | ❌ Planned | needs dense `eigh` for K | Quality target for linear V-cycle |
 | Beam (coarse sticks with bending modes) | ❌ Future | for elongated molecules | Related to RAFF rigid-cluster coarse graining |
-| **Fitted modal (bend/twist basis + fitted quadratic K)** | ✅ **Implemented + verified** | `build_bend_twist_modes` + `ModalQuadratic` | **53× speedup on pentacene (Approach A)** |
-| Force-projection Galerkin V-shape (no K fitting) | ❌ Designed | uses `project_force` + modal damped MD | Approach B — robust for nonlinear systems |
+| **Fitted staged modal decoder** | ✅ Implemented benchmark | `build_bend_twist_modes` + `ModalQuadratic` | **57× pure in-manifold; 53.8× mixed canonical decode** |
+| Additive fitted modal correction | ✅ Implemented benchmark | same + `CoarseContract::Additive` | **57× pure in-manifold; 1.66× mixed atomistic state** |
+| Force-projection Galerkin V-shape (no K fitting) | ❌ Designed | uses `project_force` + projected line search/FIRE | Nonlinear fallback; preserves full atomistic state |
 
 ## See also
 
-- `notes/reports/2026-08-29_multigrid_consolidated_report.md` — **consolidated report**: full history, all benchmark data, conceptual insights, negative results, and the 53× modal speedup
+- `notes/reports/2026-08-29_multigrid_consolidated_report.md` — **consolidated report**: full history, corrected benchmark data, conceptual insights, negative results, and prioritized improvements
 - `notes/designs/2026-08-29_modal_relaxation_design_spec.md` — **design spec**: both approaches (fitted modal + force-projection Galerkin V-shape), RAFF/GPU roadmap, test molecule assignments
 - `userguide/uff_spff.md` — UFF/SPFF end-user guide (parameter pipeline, real UFF setup, pentacene relaxation tests)
 - `opencl/README.md` — kernel listing

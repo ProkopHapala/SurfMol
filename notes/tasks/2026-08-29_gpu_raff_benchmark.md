@@ -275,13 +275,39 @@ Based on Phase 1 results, optimize. **Each optimization must be benchmarked in i
 - **Scoping local (private) variables** (not `__local`) into `{}` blocks CAN help the compiler shorten register lifetimes, reducing spill. This is worth doing regardless of fusion.
 - **Decision**: do NOT fuse kernels for Phase 2. The 4-kernel-launch overhead is ~0.12ms (launch-bound regime), which is small relative to the 0.39ms compute time at 5000 replicas. Fusion would save ~30% in the launch-bound regime but risk register spill in the compute-bound regime where it matters more. **Profile first with `cl::Event` to confirm launch overhead is actually the bottleneck before attempting fusion.**
 
-#### What to optimize instead (Phase 2)
+#### Ranked optimization priorities
 
-- **Shared memory reuse**: load `port_local` and `kflat` into `__local` once per workgroup (they're shared across all replicas but currently in global memory). This reduces global memory traffic per step.
-- **Register pressure**: tune GROUP_SIZE (32 vs 64) based on occupancy. Use `CL_KERNEL_PRIVATE_MEM_SIZE` and `CL_KERNEL_LOCAL_MEM_SIZE` to check spill.
-- **Scope private variables** into `{}` blocks to shorten register lifetimes (helps compiler reduce spill).
-- **Coalesced memory**: ensure pos/quat arrays are accessed in coalesced pattern (currently `pos[i0a + lid]` — coalesced since lid is the fastest-changing dimension).
-- **`cl::Event` profiling**: measure per-kernel GPU time to identify which kernel dominates. Essential before attempting any structural optimization.
+Apply one change at a time and retain it only after direct parity plus timing at both 64 and 5000 replicas.
+
+| Priority | Change | Expected gain | Risk / reason |
+|----------|--------|---------------|---------------|
+| **P0** | Add direct `RRsp3` ↔ multi-system parity for one identical replica | correctness prerequisite | Current finite/convergent checks do not prove equivalent corrections or geometry |
+| **P1 — implemented** | Cache persistent `ocl::Kernel` objects instead of rebuilding them every step | optimized 64-replica path is ~10× faster than original combined with zero-launch removal | scalar step parameters are updated with `set_arg`; saturated 5000-replica timing is unchanged |
+| **P1 — implemented** | Remove redundant `zero_corrections_multi` for Current mode | +19% at 5000 replicas with WG32 (3.69×10⁸ → 4.39×10⁸ atom-steps/s) | safe while collision and Current ports overwrite every consumed correction slot; accumulating variants may still need zeroing |
+| **P1 — implemented/configured** | Benchmark and prefer GROUP_SIZE=32 for 22-atom xylitol | +30% at 5000 replicas (2.83×10⁸ → 3.69×10⁸ atom-steps/s before zero removal) | benchmark default is 32; device/molecule dependent, not a universal harness hard-code |
+| **P2** | Skip collision dispatch when collisions are disabled, while keeping `dpos_coll` deterministically zero | one fewer launch | must fix/define `k_coll` semantics first: current collision kernels accept `k_coll` but do not use it; radius=0 is presently what disables collisions |
+| **P2** | Add `cl::Event` timings and device/kernel resource queries | diagnostic, not direct speedup | needed to distinguish enqueue/build overhead, GPU execution, register spill, and local-memory occupancy |
+| **P3** | Scope private variables into `{}` blocks | possible spill reduction | compiler-dependent; measure private-memory usage and runtime |
+| **P3** | Consider staging shared topology/port constants in `__local` | uncertain | all replicas read the same small arrays, so hardware constant/L1/L2 cache may already serve them efficiently; cooperative copies add instructions, barriers, and local-memory occupancy |
+| **P4** | Kernel fusion via `ClAssembler` generated variants | uncertain; launch-bound cases only | variant explosion, additive `__local` use, register pressure/spill; profile first |
+
+#### Current static kernel findings
+
+- Layout `pos[iS*natoms + lid]` is coalesced within each workgroup; do not transpose it without evidence.
+- `compute_collision_multi` writes `dpos_coll` for every lane, including padding/inactive lanes.
+- `compute_ports_current_multi` zeros all four `dpos_neigh` slots for every node and then overwrites `dpos_node`/`drot_node` for every active node. Therefore the preceding global zero kernel is redundant for **Current** mode if these invariants are asserted and covered by parity tests.
+- `apply_corrections_multi` is one-owner gather code and should remain separate unless profiling proves fusion worthwhile.
+- `radius` is passed to `compute_ports_current_multi` but not used; remove this argument when touching the persistent kernel interface.
+- `k_coll` is passed to collision kernels but currently does not scale or gate the correction. This is a semantic issue to resolve before using `k_coll == 0` as a dispatch condition.
+- `port_local`, `kflat`, neighbor and exclusion data are tiny and identical across replicas. They are strong cache candidates; explicit `__local` staging is not automatically faster.
+
+#### Verification gate for every optimization
+
+1. Identical initial state in legacy `RRsp3` and multi-system path (`nSys=1`), Current port mode, collision disabled consistently.
+2. Compare one-step positions, quaternions, node corrections, and final relaxed geometry; initial target tolerance `max_abs ≤ 1e-6` for one step and Kabsch RMSD `< 1e-3 Å` after relaxation.
+3. Assert every real output is finite and padding remains inactive.
+4. Benchmark release build after warmup using `queue.finish()` outside the timed loop; sizes 64 and 5000 distinguish host/launch-bound and saturated throughput.
+5. Keep full stdout and record before/after numbers in the existing benchmark report.
 
 #### Multiple molecules per workgroup — reducing padding waste
 
@@ -410,6 +436,56 @@ for (int s = 0; s < 4; s++) {
 ```
 
 This is the gather pattern that avoids atomics — each atom collects its recoil contributions from the pre-recorded slots.
+
+## Read-only performance audit after the first optimization pass
+
+Three delegated audits reviewed legacy RRsp3 host dispatch, other `oclff` harnesses, and multi-system kernels. These are analysis findings only; no additional code was changed.
+
+### P0 — correctness or active hot-loop violations
+
+1. **Legacy `RRsp3` repeatedly builds kernels.** `step_cluster` creates 5 OpenCL kernel objects per step; `step_dynamics` creates 7 or more. Builders occur in `run_bboxes_and_topology`, `run_collision`, all five `run_ports` variants, `run_corrections`, `run_predict`, and `run_update_velocities`. This violates the persistent-object rule and should be converted to the same initialization-time kernel cache now used by the multi-system path.
+2. **Legacy `margin_sq()` performs GPU→CPU readback and allocation every step.** It allocates `Vec<f32>[natoms]`, downloads invariant radii, reduces `rmax`, then computes the margin. Cache host `radius_max` in `upload_radius`; only the scalar bbox margin may vary per step.
+3. **Legacy zero/reset paths allocate and transfer host arrays every step.** `zero_corrections()` allocates three zero vectors and performs up to four H→D writes; dynamics also allocates another zero vector and writes two momentum buffers. Producers should own complete outputs where possible; otherwise use persistent fill storage/commands.
+4. **Legacy Eigen cluster mode can reuse stale tips.** `step_dynamics` invalidates `tips_valid`, but `step_cluster` does not even though positions/quaternions change. This is a correctness bug, not only performance work.
+5. **`UffOcl::eval_bonds()` rebuilds its entire GPU invocation per evaluation.** It allocates every input/output buffer, builds clear + force kernels, creates flattening/zero vectors, uploads all inputs, and reads output back. This API is test-oriented and cannot be used as a simulation hot path until buffers/kernels are persistent and readback is optional.
+6. **Collision semantics are internally inconsistent.** Both collision kernels accept `k_coll` but never use it. Thus `k_coll=0` does not disable or scale collisions; current xylitol runs are collision-free only because all radii are zero. Resolve against the FireCore reference before optimizing dispatch.
+
+### P1 — high-value multi-system improvements
+
+| Finding | Measured/status | Constraints / verification |
+|---------|-----------------|----------------------------|
+| **Implemented: omit collision when all uploaded radii are zero** | +16.5% at 5000 replicas; +14.6% at 64 replicas | `dpos_coll` is zeroed once during construction/radius reconfiguration; does not reinterpret unresolved `k_coll` semantics |
+| **Implemented: one write per `dpos_neigh` slot** | ~1.7% at 5000 replicas | invalid/inactive ports write zero once; valid ports write recoil once; inactive nodes still clear all outputs |
+| **Implemented: avoid old momentum reads when `beta=0`** | ~7% at 5000 replicas | output momentum is still written exactly as before, preserving behavior if beta becomes nonzero later; uniform branch |
+| Full no-momentum generated correction variant | not implemented; could also remove momentum writes/allocations | macro-generate/select variant; requires explicit policy for changing beta and direct parity |
+| Partial replica downloads | current `download_*_replica(i)` allocates/downloads the entire `nSys` buffer | use offset/sub-buffer reads and caller-provided reusable output storage; diagnostics only, not timed hot path |
+| Current-only correction signature | `tips` allocation and `port_local`/`tips` correction arguments are dead when `massless_rot=0` | macro-generated Current variant can omit them; keep future massless variants separate |
+| Node-only quaternion storage | `quat` and `dquat_mom` are per atom although only node lanes use them | meaningful memory reduction, but indexing/API change is moderate risk |
+| Shared topology address space/cache experiment | topology is tiny and invariant across replicas | `__constant` may help but lane indices are not always broadcast-uniform; compare event timings before retaining |
+
+### P2 — lower priority or higher-risk kernel ideas
+
+- Collision computes each pair twice. An unordered-pair algorithm could halve distance/sqrt work but requires contested writes, atomics, or additional local reduction/barriers. Preserve the current owner-gather implementation unless profiling proves collision dominates.
+- Node-node ports are also evaluated twice with a `0.5` correction. `rev_slot` exists and could deduplicate them, but this changes dynamics/physics and requires CPU parity—not a pure optimization.
+- Replace `int*` aliasing casts of `int4` (`neighbors`, `bk`) with explicit components for OpenCL portability; expected speed gain is small.
+- Remove the unused `radius` argument from `compute_ports_current_multi`; clarity gain, negligible runtime gain after kernels are persistent.
+- **Rejected experiment:** storing precomputed compliance `1/K` and replacing per-port `1/(K·dt²)` with multiplication changed rounding (`1.147e-5 → 1.146e-5` residual) and improved wall time only ~0.7%, within run variance. Reverted to preserve stiffness-buffer semantics.
+- Scope port-loop private temporaries to shorten register lifetimes, then inspect kernel private-memory/resource reports. Do not assume source scopes change generated registers.
+- Explicit `__local` staging and kernel fusion remain profiling-dependent. Current local arrays are only ~1.0–1.3 KiB/workgroup at WG64, so local capacity is not presently the primary concern; register pressure is more plausible.
+
+### Latent API hazards elsewhere in `oclff`
+
+`SpffOcl::kernel()` and GridFF/FAF `kernel()` methods return a newly built kernel on every call. They are currently factories used outside a demonstrated hot loop, so they are not yet active violations, but their API shape invites misuse. Before adding eval/scan loops, replace them with initialization-time named kernel caches or make the one-shot nature explicit. Program assembly/compilation in constructors and topology fragment parsing are legitimate setup work.
+
+### Recommended implementation order from this audit
+
+1. Direct legacy-vs-multi parity test (Current, identical state).
+2. Fix legacy Eigen stale-tip correctness.
+3. Convert legacy RRsp3 kernels/radius/zero storage to persistent state.
+4. Define and test collision semantics; then omit collision work when disabled.
+5. Single-write `dpos_neigh` and no-momentum generated correction variant, measured separately with events.
+6. Refactor `UffOcl::eval_bonds` before using it in any simulation loop.
+7. Only then consider constant address space, node-only quaternion packing, pair deduplication, or fusion.
 
 ## References
 

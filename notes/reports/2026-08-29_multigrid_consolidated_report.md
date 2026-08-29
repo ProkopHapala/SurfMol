@@ -1,7 +1,7 @@
 ---
 type: report
 title: Multigrid and modal relaxation for molecular geometry optimization — consolidated report
-description: Complete history and current status of coarse-grained molecular relaxation in SurfMol. Covers (1) the linear V-cycle solver ported from NumericalMathPlayground, (2) why it underperformed on real molecules, (3) the pivot to modal coarse-graining with timestep scaling, (4) the 53× speedup achieved with fitted modal Newton on pentacene, and (5) the two-approach design (fitted modal + force-projection Galerkin V-shape). Includes all benchmark data, conceptual insights, negative results, and lessons learned.
+description: Complete history and current status of coarse-grained molecular relaxation in SurfMol. Separates two valid contracts: staged coarse-manifold decoding (57× on pure in-manifold pentacene; 53.8× on mixed canonical decode) and additive same-state Galerkin relaxation (1.66× on mixed input). Covers fitted modal Newton, timestep/stiffness separation, nonlinear force-projection V-shape fallback, and implementation priorities.
 tags: [multigrid, modal, coarse-graining, timestep-scaling, pentacene, benchmark, speedup, fire, uff, newton, dihedral-multi-well, galerkin, v-shape, force-projection, relaxation, projective-dynamics]
 timestamp: 2026-08-29
 ---
@@ -12,13 +12,13 @@ timestamp: 2026-08-29
 
 This report consolidates all work on coarse-grained molecular relaxation in SurfMol. The project went through three phases:
 
-1. **Linear V-cycle solver** (ported from NumericalMathPlayground): implemented and tested. Works well on synthetic grids (4.7× speedup) but underperforms on real molecules (1.4–3.6×) because each V-cycle is dominated by fine-level smoothing work, and the geometric prolongation doesn't capture molecular soft modes efficiently.
+1. **Linear V-cycle solver** (ported from NumericalMathPlayground): implemented and tested. Works well on synthetic grids (current T4: 3.9× fewer smoothing steps) but underperforms on real molecules (1.4–3.6×) because each V-cycle is dominated by fine-level smoothing work, and the geometric prolongation doesn't capture molecular soft modes efficiently.
 
 2. **Conceptual corrections** (from user feedback): the coarse solver handles low-frequency modes, the smoother handles high-frequency modes. High coarse compression is the goal, not a problem. The dt tradeoff (inner stability vs outer speed) must be measured jointly. The test must initialize with low-frequency distortion. H atoms are fast epiphenomena, not a bottleneck.
 
-3. **Modal coarse-graining with timestep scaling**: the speedup comes from freezing hard modes, allowing 1000× larger timesteps for soft modes. Two approaches: (A) fitted modal Newton (53× speedup on pentacene, finds true planar ground state) and (B) force-projection Galerkin V-shape (designed, not yet implemented — robust for nonlinear systems).
+3. **Modal coarse-graining**: two complementary approaches remain promising: (A) fitted reduced stiffness + safeguarded Newton, and (B) true force-projection Galerkin updates alternating with fine smoothing. Projection can permit larger update scales because atomistic stiff directions are excluded, but the stable scale is governed by the current reduced Hessian and must be estimated or globalized.
 
-**Current best result: 53× speedup** on pentacene using fitted modal Newton + FIRE finishing (6 full-force evals vs 323 for plain FIRE).
+**Both speedups are meaningful under different contracts.** Additive same-state relaxation preserves unresolved atomistic coordinates and gives **1.66×** on the mixed input (323→194). Staged coarse-manifold simulation intentionally retains only q and decodes canonical atom positions; it gives **53.8×** on the mixed workflow (323→6). On a pure in-manifold input, where no coordinates are discarded, both additive and decoder updates give **57×** (285→5). Thus the order-of-magnitude modal acceleration is real when the deformation is represented by the coarse state; decoder use must simply not be mislabeled as atomistic microstate preservation.
 
 ## 2. Implementation map
 
@@ -57,7 +57,7 @@ Both copied verbatim with provenance headers. Not yet loaded by any Rust crate.
 | TrussOp matvec | ✅ Parity verified (T1: max err 1.5e-8 vs dense) |
 | Diagonal blocks | ✅ Parity verified (T2: exact) |
 | Direct solve | ✅ Parity verified (T3: max err 2.9e-13 vs Gaussian elimination) |
-| V-cycle convergence (regular grid) | ✅ 4.7× speedup over Jacobi on 8×8 grid (T4) |
+| V-cycle convergence (regular grid) | ✅ 3.9× fewer smoothing steps than Jacobi on 8×8 grid (T4: 144 vs 561) |
 | Cached coarse force parity | ✅ GalerkinLevel vs exact coarse correction (T5) |
 | Fitted modal quadratic parity | ✅ K fitted to 4.4e-16, response to 2.2e-16 (T6) |
 | Bend/twist orthonormality | ✅ Gram matrix = I to 1e-14 (T7) |
@@ -82,9 +82,9 @@ Both copied verbatim with provenance headers. Not yet loaded by any Rust crate.
 ### 3.1 Synthetic test (8×8 grid, T4) — GOOD
 
 On the canonical hard case (8×8 triangular grid, bottom row fixed, gravity load):
-- **MG: 120 smooth-steps** (20 V-cycles × 6) to reach 1e-6
+- **MG: 144 smooth-steps** (24 V-cycles × 6) to reach 1e-6
 - **Jacobi: 561 steps** to reach 1e-6
-- **Speedup: 4.7×** — multigrid works as expected on a regular grid.
+- **Smoothing-step reduction: 3.9×** — multigrid works on the regular grid, before counting coarse/setup work.
 
 ### 3.2 Real molecules (cantilever, mass-dominated) — MG converges but no end-to-end speedup
 
@@ -207,114 +207,94 @@ The inner solve should use a dt large enough that the outer loop converges fast,
 
 A fixed β=0.5 is not universally beneficial. In the mass-dominated regime (mass/k ratio > 1), heavy-ball causes overshoot and slows convergence. In the stiffness-dominated regime (mass/k < 1), it helps. Momentum parameters must depend on the spectrum and should be reset after a discontinuous coarse correction. For nonlinear relaxation, FIRE or adaptive momentum is safer than a fixed heavy-ball coefficient.
 
-## 6. Modal coarse-graining with timestep scaling — the breakthrough
+## 6. Modal coarse-graining: corrected algorithmic picture
 
-### 6.1 Where the speedup comes from
+### 6.1 Where acceleration can come from
 
-The primary speedup mechanism is **timestep scaling**, not fewer iterations:
+Projection excludes atomistic directions outside the coarse span. The relevant curvature is therefore the reduced Hessian `H_c=ΦᵀHΦ` (and reduced mass `M_c=ΦᵀMΦ` for dynamics), which can be much better conditioned than the full atomistic problem. This permits larger **validated** update scales and direct movement of collective modes. It does not justify a universal `dt≈22`: nonlinearity changes `H_c`, and a projected gradient sample does not determine its spectrum.
 
-- **Full-atom dynamics:** f_max ≈ sqrt(k_bond/m) ≈ 4.1 → dt ≈ 0.02
-- **Modal coarse dynamics:** only soft modes evolved, hard modes frozen. f_max ≈ sqrt(K_twist) ≈ 0.45 → dt ≈ 22 — **1000× larger**
-- **Newton step** (for fitted modal): for a quadratic model, one Newton step reaches the exact equilibrium — equivalent to infinite timestep.
-
-The coarse phase converges soft DOFs in a few large-timestep steps. Then the fine phase only needs to relax hard DOFs (bond stretches, H atoms), which converge fast because they're stiff and local.
+The second potential gain is cost: a reusable fitted or independently evaluable coarse model can take cheap internal steps between fine-force synchronizations. Without such a model, every true nonlinear projected-force step still costs a full force evaluation.
 
 ### 6.2 Two complementary approaches
 
-**Approach A: Fitted modal (coarse-first, then fine)** — IMPLEMENTED, 53× SPEEDUP
-- Fit stiffness K once from 2×n_modes force evals (setup, amortized)
-- Newton steps: dq = K⁻¹·g (exact for quadratic model)
-- Trust region for large distortions
-- Best for: approximately quadratic systems (aromatic molecules, rigid frameworks)
+**Approach A: fitted staged coarse-manifold/decoder**
+- The simulation state is q; atomistic microstate outside q is intentionally absent.
+- Fit reduced internal K/E_c once, evolve q with Newton or large-step modal FIRE, decode `x=D(q)`, then refine.
+- Canonical decoding is desirable because it restores valid local bond/angle geometry without carrying unnecessary high-frequency noise through coarse global search.
+- For production, use fitted internal forces cheaply between sparse full synchronizations; only external/surface/intermolecular coarse forces need updating during the coarse loop.
+- Best when the decoder spans relevant conformations and one model is reused across many molecular instances.
 
-**Approach B: Force-projection Galerkin V-shape (no fitting)** — DESIGNED
-- Don't fit K. Project atomic forces onto modes at each sync: g = ΦᵀF(x)
-- Large-timestep modal damped MD: dt_modal ≈ 22 (large, because only soft modes evolved)
-- V-shape: alternate coarse (soft DOFs) and fine (hard DOFs) phases
-- Online K estimation: after 2+ syncs, estimate K ≈ -Δg/Δq (secant/BFGS) → switch to Newton
-- Best for: nonlinear systems (aliphatic chains with torsions, large distortions, conformational changes)
+**Approach B: force-projection Galerkin V-shape**
+- Evaluate the true reduced gradient `g=ΦᵀF(x)` without a pre-fitted Hessian.
+- Use projected gradient/modal FIRE with backtracking or a safeguarded online BB/BFGS scale.
+- Alternate with fine smoothing only when soft-hard coupling regenerates coarse force.
+- Best for nonlinear landscapes where a fixed K is unreliable, although it still fails if Φ does not span the important deformation.
 
-**Key insight for Approach B:** the timestep is large even without K — stability is set by the highest frequency in the evolved subspace, not by whether we know K. Since we only evolve soft modes, dt_modal ≈ 22 regardless.
-
-**What "Galerkin" means in Approach B:** the full equation is F(x) = 0 (force balance). Projecting onto modes: ΦᵀF(x) = 0 (modal force balance). The force projection g = ΦᵀF(x) is the Galerkin restriction. The V-shape is the standard multigrid pattern: restrict → solve coarse → prolongate → smooth fine — but with physically-motivated modes instead of geometric prolongation, and nonlinear force balance instead of linear system.
+The full force-balance equation is `F(x)=0`; `ΦᵀF(x)=0` is its Galerkin restriction. A nonlinear coarse update requires a new force evaluation at its trial point unless a fitted/online model or independent coarse forcefield supplies a validated prediction.
 
 ### 6.3 Critical prerequisite: real UFF parameters
 
-The existing dummy-UFF/truss model does NOT contain physical aromatic out-of-plane bending or torsional stiffness. At a planar unstressed geometry, axial bonds have zero linear transverse stiffness. A "soft bend mode" tested with this model is a mechanism controlled only by mass regularization and nonlinear bond stretching, not pentacene physics.
+The dummy-UFF/truss model does not contain physical aromatic out-of-plane bending or torsional stiffness. At planar equilibrium, axial bonds have zero linear transverse stiffness. The benchmark therefore loads real UFF bonds, angles, dihedrals, and aromatic inversions.
 
-A trustworthy benchmark must load real parameters from `data/{ElementTypes,AtomTypes,BondTypes,AngleTypes,DihedralTypes}.dat` and enable aromatic inversion terms. The pentacene speedup benchmark (`relax_pentacene_speedup.rs`) does this correctly.
+## 7. Contract-separated pentacene modal benchmark
 
-## 7. Pentacene modal speedup benchmark (Approach A) — 53× speedup
+### 7.1 Why the original 53× result needs a contract, not deletion
 
-### 7.1 Setup
+`x=x_ref+Φq` intentionally maps a coarse state to canonical atom coordinates. This is valid for staged coarse-grained simulation, where q is the complete molecular state during the coarse phase. It is not equivalent to relaxing an arbitrary existing atomistic microstate, because `(I−ΦΦᵀ)(x−x_ref)` is discarded by restriction/decoding.
 
-1. Load pentacene (36 atoms) with real UFF parameters (bonds + angles + dihedrals + inversions)
-2. In-plane relax (inversions OFF) → remove in-plane strain
-3. Full relax (inversions ON, fconv=1e-5) → true planar ground state (E=3.70e-9, fmax=9.98e-6)
-4. Build bend/twist modes Φ from planar reference
-5. Fit modal stiffness K from 2×2=4 force evals (central differences) — NOT counted (setup)
-6. Factor K (Cholesky) — reusable
+The benchmark now exposes both contracts:
+- **Additive:** `x←x+ΦΔq`, asserting that the fine complement is unchanged.
+- **Decoder:** `x←D(q)=x_ref+Φq`, intentionally replacing unresolved atomistic coordinates.
 
-### 7.2 Main benchmark (bend=0.5 Å, twist=0.3 rad, noise=0.02 Å)
+Both use the same fitted K, true-energy acceptance, trust region, and full-force accounting.
 
-| Strategy | N_force | N_steps | fmax | z_rms | E | Ground state? |
-|----------|---------|---------|------|-------|---|---------------|
-| plain FIRE | 323 | 323 | 8.30e-4 | 0.3035 | 1.06e-7 | NO (local min) |
-| **modal + FIRE** | **6** | **1** | **1.77e-5** | **0.00003** | **4.67e-9** | **YES** |
+### 7.2 Mixed bend/twist/noise input
 
-- Coarse phase: 5 syncs + 4 Newton steps = 5 full-force evals
-- Fine phase: 1 FIRE step = 1 full-force eval
-- **Speedup: 53.8×**
+| Strategy | N_force | Fine FIRE | fmax | z_rms | reported E | Interpretation |
+|----------|--------:|----------:|-----:|------:|-----------:|----------------|
+| plain FIRE | 323 | 323 | 8.30e-4 | 0.30348 | 1.06e-7 | Atomistic baseline |
+| modal additive | 194 | 184 | 8.32e-4 | 0.30350 | 1.42e-5 | Same-state correction: **1.66×** |
+| modal decoder | 6 | 1 | 1.77e-5 | 0.000027 | 4.67e-9 | Canonical coarse-to-fine: **53.8×** |
 
-### 7.3 Distortion amplitude sweep
+The mixed input has complementary RMS `0.30504 Å`. Additive mode preserves it; decoder mode intentionally resets it. Therefore 53.8× is valid for the decoder workflow but must not be described as preserving the same atomistic microstate.
 
-| amp (Å) | FIRE N | FIRE z_rms | FIRE E | modal N | modal z_rms | modal E | speedup | same min? |
-|---------|--------|-----------|--------|---------|------------|---------|---------|-----------|
-| 0.01 | 148 | 0.0069 | 2.61e-5 | 4 | 0.00001 | 3.90e-9 | 37× | SAME |
-| 0.05 | 230 | 0.0308 | 4.37e-5 | 4 | 0.00002 | 3.98e-9 | 57.5× | DIFF |
-| 0.10 | 239 | 0.0611 | 7.51e-5 | 4 | 0.00003 | 4.40e-9 | 59.8× | DIFF |
-| 0.20 | 261 | 0.1216 | 7.42e-5 | 5 | 0.000002 | 3.70e-9 | 52.2× | DIFF |
-| 0.30 | 290 | 0.1823 | 5.92e-5 | 5 | 0.00002 | 4.08e-9 | 58.0× | DIFF |
-| 0.50 | 303 | 0.3037 | 1.92e-7 | 6 | 0.00003 | 4.65e-9 | 50.5× | DIFF |
-| 0.70 | 312 | 0.4253 | 5.74e-7 | 6 | 0.00003 | 5.18e-9 | 52.0× | DIFF |
-| 1.00 | 325 | 0.6077 | 6.83e-7 | 6 | 0.000009 | 3.89e-9 | 54.2× | DIFF |
+### 7.3 Pure coarse-manifold input: fair common test
 
-Key observations:
-- **Modal always finds the true ground state** (E≈4e-9, z_rms≈0) regardless of distortion amplitude
-- **Plain FIRE gets trapped in non-planar local minima** for amp ≥ 0.05 (E up to 7.51e-5, 17000× higher)
-- **Speedup is 37-60×** consistently across all amplitudes
-- **At amp=0.01, both find the same minimum** — FIRE doesn't get trapped for small distortions
+A second input was generated exactly as `x=x_ref+Φq` with `q=[1.0,-1.6]` and no fine noise. Initial complement RMS is approximately `7e-17`, so additive and decoder updates are mathematically the same operation.
 
-### 7.4 Modal convergence trace (amp=0.5)
+| Strategy | N_force | Fine FIRE | fmax | reported E | Speedup |
+|----------|--------:|----------:|-----:|-----------:|--------:|
+| plain FIRE | 285 | 285 | 8.70e-4 | 4.20e-7 | 1× |
+| modal additive | 5 | 1 | 1.29e-5 | 4.09e-9 | **57×** |
+| modal decoder | 5 | 1 | 1.29e-5 | 4.09e-9 | **57×** |
 
-```
-sync 0: fmax=1.2235e0 gmax=4.5624e-1 q=[0.9937, -1.6115]  (initial distorted)
-sync 2: fmax=3.4112e-1 gmax=1.8115e-1 q=[-0.7437, -0.6209] (Newton overshoot, trust region)
-sync 3: fmax=8.2862e-2 gmax=5.2418e-2 q=[0.4344, 0.2039]   (converging)
-sync 4: fmax=3.9884e-3 gmax=3.9664e-3 q=[-0.0497, -0.0134] (nearly there)
-sync 5: fmax=1.7748e-5 gmax=1.4257e-5 q=[-0.0002, -0.0001] (converged!)
-```
+This establishes that the order-of-magnitude speedup is not solely caused by deleting random noise. When the slow deformation lies in the fitted coarse subspace, three Newton steps plus four force synchronizations remove it, while explicit full-atom FIRE requires 285 evaluations.
 
-4 Newton steps + 5 syncs = 5 full-force evals. The quadratic model converges exactly as expected for pentacene's approximately linear bending.
+### 7.4 Additive amplitude sweep on mixed inputs
 
-### 7.5 Why plain FIRE fails
+| amp | FIRE N | corrected modal N | speedup | modal final z_rms | modal reported E |
+|----:|-------:|------------------:|--------:|------------------:|-----------------:|
+| 0.01 | 148 | 130 | 1.14× | 0.00638 | 7.92e-6 |
+| 0.05 | 230 | 131 | 1.76× | 0.03026 | 7.73e-6 |
+| 0.10 | 239 | 132 | 1.81× | 0.06060 | 7.59e-6 |
+| 0.20 | 261 | 140 | 1.86× | 0.12137 | 8.86e-6 |
+| 0.30 | 290 | 140 | 2.07× | 0.18216 | 1.26e-5 |
+| 0.50 | 303 | 176 | 1.72× | 0.30373 | 6.57e-6 |
+| 0.70 | 312 | 266 | 1.17× | 0.42542 | 9.62e-5 |
+| 1.00 | 325 | 223 | 1.46× | 0.60769 | 4.70e-6 |
 
-Plain FIRE gets trapped in non-planar local minima because of the **UFF dihedral multi-well landscape**:
+The large-amplitude cases expose fixed-K model breakdown and repeated line-search rejection. More importantly, the intended finite twist is a curvilinear rotation while the current twist column is only its tangent at the planar reference. For the main input, the two linear modes leave `fine_rms≈0.305 Å`; the coarse solver cannot remove a deformation it does not represent.
 
-- UFF sp2-sp2 dihedral terms have minima at multiple angles (cosine potential with n>1)
-- When the molecule is distorted with a large bend+twist, FIRE's momentum carries it past the planar minimum and into a twisted local minimum where some dihedrals are at their alternative minima
-- The energy difference is small in absolute terms (1e-7 vs 4e-9 eV) but the geometric difference is large (z_rms=0.30 vs 0.00003)
-- The planar geometry IS the true ground state (verified: E=3.70e-9, fmax=9.98e-6)
+### 7.5 Current optimization priorities
 
-The modal approach avoids this by projecting onto smooth bend/twist modes that filter out the local dihedral trapping. The quadratic model has a single minimum at q=0 (planar), which coincides with the true ground state. **This is both a speedup AND a global optimization benefit.**
+1. **Use the fitted model during the coarse loop:** internal `g_int≈−Kq` is cheap; do not call full UFF at every coarse step. Update only coarse external/surface/intermolecular forces, then synchronize once before refinement. This is the main production speed mechanism.
+2. **Curvilinear decoder:** represent finite ring/fragment rotations and bends with rigid transforms or internal coordinates rather than a linear tangent Φ. This keeps decoded geometries chemically valid over large amplitudes.
+3. **Large reduced steps:** for relaxation, Newton/trust-region steps dominate explicit time integration. For coarse dynamics, use the reduced mass and reduced curvature to permit a larger stable timestep than full atoms.
+4. **Nonlinear Galerkin fallback:** projected gradient/FIRE + backtracking and online SPD BFGS when the fitted model ceases to predict the true reduced force.
+5. **Optimize synchronization and handoff:** minimize expensive external/full-force evaluations and fine refinement work, not nominal coarse-step count.
+6. **Benchmark same physical endpoint:** use tighter convergence/common post-processing before comparing final energies or basins.
 
-### 7.6 Three errors fixed (v1 → v2)
-
-1. **Newton instead of FIRE with tiny timestep:** v1 used modal FIRE with dt=0.05 (full-atom timestep). The modal K gives dt_max=22 — 400× larger. v2 uses Newton (exact for quadratic, equivalent to infinite timestep).
-
-2. **Fitting cost excluded:** v1 counted the 4 fitting evals. v2 correctly excludes them — fitting is one-time setup, amortized over thousands of molecules × millions of steps.
-
-3. **Reference geometry properly relaxed:** v1 relaxed with inversions OFF, then turned inversions ON, leaving residual forces (fmax≈1e-3). v2 does full relaxation with inversions ON (fmax=9.98e-6), finding the true planar ground state.
+Mechanical parameter sweeps, table generation, larger test runs, and helper extraction can be delegated to cheaper agents. Curvilinear coordinates, reduced-mass/stability derivation, force/Jacobian consistency, and basin interpretation require expert attention.
 
 ## 8. Cost model and benchmark protocol
 
