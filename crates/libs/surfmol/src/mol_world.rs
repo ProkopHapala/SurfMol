@@ -2,6 +2,7 @@
 use moltopo::molecular::DynamicAtoms;
 use moltopo::topology::Topology;
 use molff::uff::Uff;
+use molff::multigrid::GalerkinLevel;
 use molff::nonbonded::NonBondedFF;
 use surfff::{SurfaceFolded, SurfaceScratch};
 use molff::rigid_sp3::RigidSp3FF;
@@ -126,6 +127,16 @@ impl MolWorld {
         }
     }
 
+    /// Apply a cached Galerkin coarse displacement from the forces currently in `dyn_atoms.fapos`.
+    /// Call `eval_forces` explicitly first; this method performs no hidden full-force evaluation.
+    pub fn apply_coarse_force_step(&mut self, level: &GalerkinLevel, free_mask: &[bool], scale: f64) -> (f64, f64) {
+        assert_eq!(level.n_dof, self.natoms()*3, "MolWorld::apply_coarse_force_step: level.n_dof={} != natoms*3={}", level.n_dof, self.natoms()*3);
+        let force = self.dyn_atoms.fapos.as_slice().to_vec();
+        let out = level.apply_force_step(self.dyn_atoms.atoms.apos.as_mut_slice(), &force, free_mask, scale);
+        self.dyn_atoms.clean_velocity();
+        out
+    }
+
     /// Run MD for niter steps or until force convergence.
     pub fn run_md(&mut self, niter: i32, dt: f64, fconv: f64, flim: f64, damping: f64) -> i32 {
         let f2conv = fconv * fconv;
@@ -154,6 +165,11 @@ impl MolWorld {
 
     // === Topology setup wrappers ===
     pub fn set_dummy_params(&mut self) { self.uff.set_dummy_params(self.dyn_atoms.apos()); }
+    /// Assign real UFF parameters from loaded Params + assigned UFF atom types.
+    /// Replaces set_dummy_params for physical simulations.
+    pub fn setup_uff_params(&mut self, params: &moltopo::params::Params, types: &[String]) {
+        self.uff.setup_params(params, types, self.dyn_atoms.neighs());
+    }
     pub fn make_neigh_bs(&mut self) { self.dyn_atoms.atoms.make_neigh_bs(self.uff.bon_atoms.as_slice()); }
     pub fn bake_angle_neighs(&mut self) { self.uff.bake_angle_neighs(self.dyn_atoms.neighs()); }
     pub fn bake_dihedral_neighs(&mut self) { self.uff.bake_dihedral_neighs(self.dyn_atoms.neighs()); }

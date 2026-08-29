@@ -129,7 +129,9 @@ pub fn build_angles_from_bonds(natoms: i32, bonds: &[[i32; 2]]) -> Vec<[i32; 3]>
 }
 
 pub fn build_dihedrals_from_bonds(bonds: &[[i32; 2]]) -> Vec<Quat4i> {
-    // placeholder enumerator for now; the dynamic Builder will eventually provide a canonical + incremental implementation
+    // Enumerate all unique dihedral chains i-j-k-l where j-k is a bond.
+    // Dedup: keep only one of (i,j,k,l) and (l,k,j,i) — same dihedral from opposite ends.
+    // FireCore UFFbuilder.h:1159 uses `i4 > i1` to avoid double-counting.
     use std::collections::{HashMap, HashSet};
     let mut adj: HashMap<i32, Vec<i32>> = HashMap::new();
     for b in bonds {
@@ -145,7 +147,8 @@ pub fn build_dihedrals_from_bonds(bonds: &[[i32; 2]]) -> Vec<Quat4i> {
                     if let Some(ls) = adj.get(&k) {
                         for &l in ls {
                             if l == j { continue; }
-                            set.insert((i, j, k, l));
+                            // Dedup: only keep if first atom < last atom (FireCore i4 > i1 convention)
+                            if l > i { set.insert((i, j, k, l)); }
                         }
                     }
                 }
@@ -156,7 +159,10 @@ pub fn build_dihedrals_from_bonds(bonds: &[[i32; 2]]) -> Vec<Quat4i> {
 }
 
 pub fn build_inversions_from_bonds(natoms: i32, bonds: &[[i32; 2]]) -> Vec<Quat4i> {
-    // placeholder: for atoms with 3 neighbors pick one triple
+    // For each trigonal center (3 neighbors), generate 3 inversions — one per neighbor
+    // being the "out-of-plane" atom. This matches FireCore UFFbuilder.h:1318-1332.
+    // Each inversion measures one neighbor's out-of-plane angle w.r.t. the other two.
+    // The parameter setup divides K by 3 to avoid triple-counting the energy.
     let mut neigh: Vec<Vec<i32>> = vec![Vec::new(); natoms as usize];
     for b in bonds {
         neigh[b[0] as usize].push(b[1]);
@@ -166,7 +172,10 @@ pub fn build_inversions_from_bonds(natoms: i32, bonds: &[[i32; 2]]) -> Vec<Quat4
     for i in 0..natoms {
         let ns = &neigh[i as usize];
         if ns.len() == 3 {
+            // 3 permutations: (i, j, k, l), (i, l, j, k), (i, k, l, j)
             invs.push(Quat4i::new(i, ns[0], ns[1], ns[2]));
+            invs.push(Quat4i::new(i, ns[2], ns[0], ns[1]));
+            invs.push(Quat4i::new(i, ns[1], ns[2], ns[0]));
         }
     }
     invs

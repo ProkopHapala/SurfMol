@@ -27,8 +27,12 @@ End-user documentation for **finished, polished** modules of SurfMol. This folde
 
 ## Guides
 
-- **[`editor.md`](editor.md)** — Interactive molecular editor & on-surface MD simulator. CLI options (`--nmols`, `--layout`, `--show-aabb`, `--raff`, `--2d`), keyboard shortcuts, GUI panels, usage examples with benzoic acid / pyrrol / benzene, broad-phase AABB collision visualization, and didactic theory (forcefields, AABB collision).
+- **[`editor.md`](editor.md)** — Interactive molecular editor & on-surface MD simulator. CLI options (`--nmols`, `--layout`, `--show-aabb`, `--raff`, `--raff-solver`, `--box`, `--2d`), keyboard shortcuts, GUI panels, usage examples with benzoic acid / pyrrol / benzene, broad-phase AABB collision visualization, and didactic theory (forcefields, AABB collision).
+
+- **[`raff.md`](raff.md)** — RAFF solver modes & relaxation. Six solver modes (ForceMD, InertialReset, FIRE, PBD, XPBD, Projective), two orientation strategies (Adiabatic vs Dynamic), harmonic box constraint, CLI flags, GUI controls, performance comparison, and didactic theory (port-spring forcefield, position-based dynamics, inner-coupled rotation, FIRE).
+
+- **[`uff_spff.md`](uff_spff.md)** — UFF & SPFF forcefields. The parameter pipeline (topology → UFF types → `setup_uff_params`), bond/angle/dihedral/inversion formulas, FIRE relaxation, pentacene bend/pyramidalization tests, `.dat` file loading, and theory (inversion term, local pyramidalization vs global bending, SPFF pi-orbital coupling).
 
 ## Status
 
-One guide populated (`editor`). Add more as modules become polished and user-facing.
+Three guides populated (`editor`, `raff`, `uff_spff`). Add more as modules become polished and user-facing.

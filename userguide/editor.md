@@ -43,6 +43,16 @@ cargo run -p editor -- [file.xyz] [CLI flags]    # full control
 | `--spacing S` | `12.0` | Extra spacing between molecules in lattice layout (Å) |
 | `--show-aabb` | off | Render cluster bounding boxes: green = tight AABB, red = expanded by rcut (overlap test region) |
 | `--raff` | off | Start in RAFF mode (simulation, not Kekule editor; show ports; enable non-bonded; disable surface; damping=0.1, per_frame=20) |
+| `--raff-solver MODE` | `forcemd` | RAFF solver: `forcemd` / `inertial` / `fire` / `pbd` / `xpbd` / `projective` |
+| `--raff-orient MODE` | `adiabatic` | RAFF orientation: `adiabatic` / `dynamic` |
+| `--raff-iters N` | `4` | Inner iterations for position-based solvers (PBD/XPBD/Projective) |
+| `--raff-pd-inertia` / `--raff-no-pd-inertia` | on | Enable/disable PD outer-loop inertia |
+| `--raff-vel-reset` / `--raff-no-vel-reset` | on | Enable/disable velocity reset when v·F < 0 |
+| `--raff-hb M` | `0.0` | Heavy-ball momentum for inner Jacobi (0 = disabled, 0.5–0.75 typical) |
+| `--box` | off | Enable harmonic box constraint (soft AABB confinement) |
+| `--box-min x,y,z` | `-10,-10,0` | Box min corner (comma-separated) |
+| `--box-max x,y,z` | `10,10,10` | Box max corner (comma-separated) |
+| `--box-k K` | `50.0` | Box spring constant (eV/Å²) |
 | `--2d` | off | Flatten atoms to z=0 plane, constrain forces/velocities/positions to 2D |
 | `--atom-scale S` | `0.25` | Atom render size multiplier (range 0.05–0.5; also adjustable via GUI slider) |
 | `--perFrame N` | `100` (or `20` with `--raff`) | MD iterations per render frame |
@@ -91,7 +101,7 @@ cargo run -p editor -- [file.xyz] [CLI flags]    # full control
 - **SurfMol** (top-left): Title + live energy display (Etotal, bond, angle, dihed, inv, nb, surf).
 - **Atom Info** (top-right): Selected atom info (element, UFF type, charge, position, RvdW, pin status).
 - **Settings** (right): Physics (iters/frame, dt, damping, zero-V-on-opposition), Display (atom size slider, label mode, bonded FF mode), non-bonded/surface status, **AABB checkbox**, cluster count + BP pair count.
-- **RAFF Settings** (right, RAFF mode only): Non-bonded toggle, 2D plane, orient mode (Adiabatic/Dynamic), rcut/k_coll/f_max sliders, exclusion checkboxes, live energy display.
+- **RAFF Settings** (right, RAFF mode only): Solver mode dropdown (ForceMD/InertialReset/FIRE/PBD/XPBD/Projective), orient mode (Adiabatic/Dynamic), non-bonded toggle, 2D plane, PD Options (inner iters, PD inertia, vel reset, heavy-ball momentum), non-bonded params (rcut/k_coll/f_max, exclusions), box constraint (enable, k_box, min/max corners), live energy display (E_port, E_nb, E_tot).
 - **Kekule Editor** (left, edit mode): Edit mode selector, atom type, ribbon generator, bake/export buttons.
 - **Help** (bottom-left): Keyboard shortcuts + CLI flags.
 - **Status** (bottom-center): Relaxation ON/OFF indicator.
@@ -188,6 +198,31 @@ The editor supports three bonded forcefield modes, cycled with the `F` key:
 
 RAFF mode is recommended for multi-molecule collision simulations. Start with `--raff` to enter RAFF mode directly.
 
+### RAFF solver modes
+
+RAFF supports six solver modes, selectable from the GUI dropdown or `--raff-solver` CLI flag:
+
+- **ForceMD** — damped symplectic Euler (default, simplest)
+- **InertialReset** — ForceMD + velocity reset on v·F<0 (simple FIRE variant)
+- **FIRE** — Fast Inertial Relaxation Engine with adaptive dt (standard optimizer)
+- **PBD** — Position-Based Dynamics with compliance (simplest position-based)
+- **XPBD** — True XPBD with lagged multiplier (stiffness-independent)
+- **Projective** — Projective Dynamics with inner-coupled rotation (fastest for stiff systems)
+
+See [`raff.md`](raff.md) for the full solver guide with performance comparison, theory, and examples.
+
+### UFF parameter setup
+
+When the editor loads a molecule, it automatically:
+1. Builds topology (bonds, angles, dihedrals, inversions) from atom positions
+2. Assigns UFF atom types (`C_R`, `C_3`, `H_`, etc.) from hybridization
+3. Loads UFF parameters from `.dat` files in `data/` (bond stiffness, angle Fourier coefficients, dihedral V/d/n, inversion K)
+4. Auto-selects UFF mode if sp²/aromatic atoms are detected
+
+The parameter setup uses `Params` lookups from `BondTypes.dat`, `AngleTypes.dat`, `DihedralTypes.dat` — see [`uff_spff.md`](uff_spff.md) for the full pipeline and formulas. If `.dat` files are missing, the editor falls back to a bond-only dummy setup (k=100, l0=current length) with no angle/dihedral/inversion stiffness.
+
+For programmatic UFF setup (tests, scripts), use `MolWorld::setup_uff_params(&params, &types)` which ports FireCore's `assignUFFparams` and fills all four parameter arrays from UFF formulas.
+
 ## Broad-phase AABB collision
 
 When `--nmols N` with N > 1, the editor creates a `BroadPhase` struct that holds per-molecule AABBs. Each relaxation step:
@@ -230,6 +265,7 @@ This avoids the O(N²) atom-atom distance check when molecules are far apart. Th
 
 ## See also
 
+- [`raff.md`](raff.md) — RAFF solver modes guide (ForceMD/FIRE/PBD/XPBD/Projective, box constraint, theory)
 - [`/crates/apps/editor/README.md`](/crates/apps/editor/README.md) — developer README for the editor crate
 - [`/doc/topical_audit/spatial_acceleration.md`](/doc/topical_audit/spatial_acceleration.md) — cross-implementation map for AABB/broad-phase
 - [`/doc/topical_audit/raff.md`](/doc/topical_audit/raff.md) — RAFF forcefield cross-implementation map

@@ -30,6 +30,6 @@ tmp/
 *.csv
 
 # Debug/diagnostic plots (gitignored) — but keep folder READMEs
-debug/*
+#debug/*
 !debug/README.md
 !debug/raff_bench/README.md

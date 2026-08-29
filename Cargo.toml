@@ -6,6 +6,7 @@ members = [
     "crates/libs/pgraph",
     "crates/libs/spacc",
     "crates/libs/molff",
+    "crates/libs/oclff",
     "crates/libs/surfff",
     "crates/libs/surfmol",
     "crates/libs/molrender",
@@ -31,6 +32,7 @@ pgraph = { path = "crates/libs/pgraph" }
 spacc = { path = "crates/libs/spacc" }
 molff = { path = "crates/libs/molff" }
 surfff = { path = "crates/libs/surfff" }
+oclff = { path = "crates/libs/oclff" }
 surfmol = { path = "crates/libs/surfmol" }
 molrender = { path = "crates/libs/molrender" }
 molgui = { path = "crates/libs/molgui" }

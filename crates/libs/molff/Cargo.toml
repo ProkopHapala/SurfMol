@@ -6,6 +6,7 @@ description = "Intra-molecular forcefields: UFF, RigidSp3, NonBonded"
 
 [dependencies]
 numtypes = { workspace = true }
+numcore = { workspace = true }
 moltopo = { workspace = true }
 spacc = { workspace = true }
 ndarray = { workspace = true }

@@ -2,62 +2,9 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use serde::{Serialize, Deserialize};
-
 use moltopo::xyz;
 use moltopo::builder::Builder;
-use moltopo::topology::hybridization;
 use moltopo::assign_uff::assign_uff_types;
-
-/// Human-readable JSON output of topology + UFF assignment.
-#[derive(Serialize, Deserialize, Debug)]
-struct AtomInfo {
-    index: usize,
-    element: String,
-    position: [f64; 3],
-    uff_type: String,
-    hybridization: i32,  // 1=sp, 2=sp2, 3=sp3
-    neighbors: Vec<i32>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct BondInfo {
-    index: usize,
-    atoms: [i32; 2],
-    order: i32,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct AngleInfo {
-    index: usize,
-    atoms: [i32; 3],
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct DihedralInfo {
-    index: usize,
-    atoms: [i32; 4],
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct InversionInfo {
-    index: usize,
-    atoms: [i32; 4],
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct TopologyJson {
-    natoms: usize,
-    nbonds: usize,
-    nangles: usize,
-    ndihedrals: usize,
-    ninversions: usize,
-    atoms: Vec<AtomInfo>,
-    bonds: Vec<BondInfo>,
-    angles: Vec<AngleInfo>,
-    dihedrals: Vec<DihedralInfo>,
-    inversions: Vec<InversionInfo>,
-}
 
 /// Simple binary format for dense array ingestion by MD engine.
 /// Header: magic "UFFTOPO" + u8 version(1) + 5xi32 counts + 1xi32 flags
@@ -154,54 +101,11 @@ fn main() {
     println!("\n=== UFF type histogram ===");
     for (t, c) in kv.iter() { println!("{:6}  {}", t, c); }
 
-    // 6. JSON output
+    // 6. JSON output (canonical TopologyData format — consumed by molengine)
     if let Some(ref path) = json_path {
-        let mut atoms = Vec::with_capacity(top.natoms() as usize);
-        for i in 0..top.natoms() as usize {
-            let p = top.apos[i];
-            let n: Vec<i32> = neighs[i].iter().take_while(|&&n| n >= 0).copied().collect();
-            atoms.push(AtomInfo {
-                index: i,
-                element: sys.elems[i].clone(),
-                position: [p.x, p.y, p.z],
-                uff_type: uff_types[i].clone(),
-                hybridization: hybridization(&sys.elems[i], n.len() as i32),
-                neighbors: n,
-            });
-        }
-
-        let mut bonds = Vec::with_capacity(top.bonds.len());
-        for (ib, b) in top.bonds.iter().enumerate() {
-            bonds.push(BondInfo { index: ib, atoms: *b, order: 1 });
-        }
-
-        let mut angles = Vec::with_capacity(top.angles.len());
-        for (ia, a) in top.angles.iter().enumerate() {
-            angles.push(AngleInfo { index: ia, atoms: *a });
-        }
-
-        let mut dihedrals = Vec::with_capacity(top.dihedrals.len());
-        for (id, d) in top.dihedrals.iter().enumerate() {
-            dihedrals.push(DihedralInfo { index: id, atoms: [d.x, d.y, d.z, d.w] });
-        }
-
-        let mut inversions = Vec::with_capacity(top.inversions.len());
-        for (ii, inv) in top.inversions.iter().enumerate() {
-            inversions.push(InversionInfo { index: ii, atoms: [inv.x, inv.y, inv.z, inv.w] });
-        }
-
-        let out = TopologyJson {
-            natoms: top.natoms() as usize,
-            nbonds: top.bonds.len(),
-            nangles: top.angles.len(),
-            ndihedrals: top.dihedrals.len(),
-            ninversions: top.inversions.len(),
-            atoms, bonds, angles, dihedrals, inversions,
-        };
-
-        let json = serde_json::to_string_pretty(&out).expect("serialize JSON");
-        fs::write(path, json).expect("write JSON");
+        top.export_json(path, &sys.elems).expect("export_json failed");
         println!("Wrote JSON to {:?}", path);
+        println!("  Format: TopologyData (natoms, elements, positions, bonds, angles, dihedrals, inversions)");
     }
 
     // 7. Binary output

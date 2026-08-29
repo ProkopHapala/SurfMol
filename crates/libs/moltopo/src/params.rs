@@ -313,6 +313,13 @@ impl Params {
         self.atom_type_dict.get(name).map(|&i| &self.atom_types[i])
     }
 
+    /// Look up the ElementType for a given atom type name (via AtomType.element field).
+    /// Parity with FireCore MMFFparams::elementOfAtomType.
+    pub fn element_of_atom_type(&self, atype_name: &str) -> Option<&ElementType> {
+        let at = self.get_atom_type(atype_name)?;
+        self.get_element_type(&at.element)
+    }
+
     pub fn get_bond_param(&self, a: &str, b: &str, order: u8) -> Option<&BondParam> {
         let (a_sorted, b_sorted) = if a <= b { (a, b) } else { (b, a) };
         self.bond_dict.get(&(a_sorted.to_string(), b_sorted.to_string(), order)).map(|&i| &self.bonds[i])
@@ -596,17 +603,28 @@ pub fn get_reqh(params: &Params, atype_name: &str) -> [f64; 4] {
     [1.5, 0.0, 0.0, 0.0]
 }
 
-/// Determine bond order from assigned UFF atom type hybridization suffix
-fn bond_order_from_types(ta: &str, tb: &str) -> f64 {
+/// 1 kcal/mol in eV. Used by UFF dihedral/inversion parameter assignment.
+pub const KCAL_TO_EV: f64 = 4.1840 / 60.2214076 / 1.602176634;
+
+/// Determine bond order from assigned UFF atom type hybridization suffix.
+/// Ported from FireCore UFFbuilder type assignment logic:
+///   - sp1 (_1) atoms → triple bond (BO=3)
+///   - sp2 (_2) atoms → double bond (BO=2), but ONLY if the other atom is also _2
+///   - aromatic (_R) atoms → single bond (BO=1) — UFF treats aromatic bonds as single
+///   - H_ → always single bond
+/// Note: FireCore sets bond order explicitly during type assignment, not by suffix inference.
+/// This function approximates that logic: _R is aromatic (BO=1), _2 is true double bond.
+pub fn bond_order_from_types(ta: &str, tb: &str) -> f64 {
     let is_sp1 = |t: &str| t.ends_with("_1");
-    let is_sp2 = |t: &str| t.ends_with("_2") || t.ends_with("_R");
+    let is_double = |t: &str| t.ends_with("_2"); // true sp2 double bond, NOT aromatic _R
     if is_sp1(ta) || is_sp1(tb) { 3.0 }
-    else if is_sp2(ta) || is_sp2(tb) { 2.0 }
-    else { 1.0 }
+    else if is_double(ta) && is_double(tb) { 2.0 }
+    else { 1.0 } // aromatic _R, sp3, H, etc. → single bond
 }
 
-/// UFF bond length from atom type radii and element electronegativities
-fn uff_bond_length(ti: &AtomType, tj: &AtomType, ei: &ElementType, ej: &ElementType, bo: f64) -> f64 {
+/// UFF bond length from atom type radii and element electronegativities.
+/// Ported from FireCore UFFbuilder.h:1043 assignUFFparams_calcrij.
+pub fn uff_bond_length(ti: &AtomType, tj: &AtomType, ei: &ElementType, ej: &ElementType, bo: f64) -> f64 {
     let r_bo = -0.1332 * (ti.r_uff + tj.r_uff) * bo.ln();
     let r_en = if ei.e_aff < 0.0 && ej.e_aff < 0.0 {
         let s = (-ei.e_aff).sqrt() - (-ej.e_aff).sqrt();
@@ -615,26 +633,26 @@ fn uff_bond_length(ti: &AtomType, tj: &AtomType, ei: &ElementType, ej: &ElementT
     ti.r_uff + tj.r_uff + r_bo - r_en
 }
 
-/// UFF bond force constant
-fn uff_bond_k(ei: &ElementType, ej: &ElementType, l0: f64) -> f64 {
+/// UFF bond force constant. Ported from FireCore UFFbuilder.h:1075.
+pub fn uff_bond_k(ei: &ElementType, ej: &ElementType, l0: f64) -> f64 {
     0.5 * 28.7989689090648 * ei.q_uff * ej.q_uff / (l0 * l0 * l0)
 }
 
-/// UFF angle Fourier coefficients for sp3
-fn uff_angle_sp3(ct: f64, st2: f64) -> (f64, f64, f64, f64) {
+/// UFF angle Fourier coefficients for sp3. Ported from FireCore UFFbuilder.h:1122-1127.
+pub fn uff_angle_sp3(ct: f64, st2: f64) -> (f64, f64, f64, f64) {
     let c2 = 1.0 / (4.0 * st2);
     let c1 = -4.0 * c2 * ct;
     let c0 = c2 * (2.0 * ct * ct + 1.0);
     (c0, c1, c2, 0.0)
 }
 
-/// UFF angle Fourier coefficients for sp2/R
-fn uff_angle_sp2() -> (f64, f64, f64, f64) {
+/// UFF angle Fourier coefficients for sp2/R. Ported from FireCore UFFbuilder.h:1115-1120.
+pub fn uff_angle_sp2() -> (f64, f64, f64, f64) {
     (1.0, 0.0, 0.0, -1.0)
 }
 
-/// UFF angle Fourier coefficients for sp1
-fn uff_angle_sp1() -> (f64, f64, f64, f64) {
+/// UFF angle Fourier coefficients for sp1. Ported from FireCore UFFbuilder.h:1108-1114.
+pub fn uff_angle_sp1() -> (f64, f64, f64, f64) {
     (1.0, 1.0, 0.0, 0.0)
 }
 
@@ -647,8 +665,6 @@ fn hybridization(tname: &str) -> char {
     if tname == "H" || tname == "H_" { return '3'; }
     '3'
 }
-
-const KCAL_TO_EV: f64 = 4.1840 / 60.2214076 / 1.602176634; // 1 kcal/mol to eV
 
 // TODO: setup_forcefield depends on UFF and NonBondedFF which belong in mol_engine
 // This function should be moved to mol_engine or refactored to be forcefield-agnostic

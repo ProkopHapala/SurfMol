@@ -1395,7 +1395,8 @@ inline int4 make_inds_pbc(const int n, const int iG) {
     // iqs[3] = (int4)(0, 1-n, 2-n, 3-n);
 }
 
-inline int4 choose_inds_pbc(const int i, const int n, const int4* iqs) {
+// ported: __local qualifier added to match fe3d_pbc_comb local-memory table on strict OpenCL (Intel).
+inline int4 choose_inds_pbc(const int i, const int n, __local const int4* iqs) {
     if (i >= (n-3)) {
         const int ii = i + 4 - n;
         return iqs[ii];
@@ -1403,7 +1404,7 @@ inline int4 choose_inds_pbc(const int i, const int n, const int4* iqs) {
     return (int4)(0, +1, +2, +3);
 }
 
-inline int4 choose_inds_pbc_3( const int i, const int n, const int4* iqs ){
+inline int4 choose_inds_pbc_3( const int i, const int n, __local const int4* iqs ){
     if(i>=(n-3)){
         const int ii = i+4-n;
         //printf( "choose_inds_pbc() ii=%i i=%i n=%i \n", ii, i, n );

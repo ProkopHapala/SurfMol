@@ -50,6 +50,20 @@ pub enum PosSolver {
     Projective,
 }
 
+/// Harmonic box constraint — confines atoms within an AABB with restoring spring force.
+/// F = k * (limit - x) when x is beyond the limit, 0 inside. Simulates a soft surface boundary.
+#[derive(Copy, Clone, Debug)]
+pub struct BoxCfg {
+    pub enabled: bool,
+    pub min: Vec3d,  // lower corner of the free region
+    pub max: Vec3d,  // upper corner of the free region
+    pub k: f64,      // spring constant (eV/Å²) — restoring force per unit displacement
+}
+
+impl Default for BoxCfg {
+    fn default() -> Self { Self { enabled: false, min: Vec3d::new(-10.0, -10.0, 0.0), max: Vec3d::new(10.0, 10.0, 10.0), k: 50.0 } }
+}
+
 /// Solver configuration. Separated from state and topology (§11).
 #[derive(Copy, Clone, Debug)]
 pub struct RaffConfig {
@@ -74,6 +88,8 @@ pub struct RaffConfig {
     pub bmix_end: f64,    // momentum mixing at end of ramp (typically 0.75)
     pub bmix_istart: usize, // iteration to start ramping (0 = from the beginning)
     pub bmix_iend: usize,   // iteration to end ramping (after this, bmix_end)
+    // --- Harmonic box constraint (soft AABB confinement) ---
+    pub box_cfg: BoxCfg,
 }
 
 impl Default for RaffConfig {
@@ -83,7 +99,8 @@ impl Default for RaffConfig {
             dt: 0.01, cdamp: 0.95, rot_damp: 0.95, flim: 100.0,
             xpbd_iters: 16, xpbd_over_relax: 1.0,
             pd_inertia: true, vel_reset: false,
-            bmix_start: 0.0, bmix_end: 0.75, bmix_istart: 3, bmix_iend: 10 }
+            bmix_start: 0.0, bmix_end: 0.75, bmix_istart: 3, bmix_iend: 10,
+            box_cfg: BoxCfg::default() }
     }
 }
 
@@ -530,6 +547,28 @@ impl RaffState {
 
 /// Evaluate port forces and energy. Returns total port energy.
 /// Fills fapos and tau (scratch arrays passed by caller).
+/// Evaluate harmonic box constraint forces. Adds F = k*(limit - x) to fapos for atoms outside the AABB.
+/// Returns the total box potential energy (0.5*k*δ² per violated axis per atom).
+/// Atoms inside the box feel no force.
+pub fn eval_box_forces(state: &RaffState, box_cfg: &BoxCfg, fapos: &mut [Vec3d]) -> f64 {
+    if !box_cfg.enabled { return 0.0; }
+    let k = box_cfg.k;
+    let mut e_box = 0.0f64;
+    for i in 0..state.natoms {
+        let p = state.pos[i];
+        // x-axis
+        if p.x < box_cfg.min.x { let d = box_cfg.min.x - p.x; fapos[i].x += k * d; e_box += 0.5 * k * d * d; }
+        else if p.x > box_cfg.max.x { let d = p.x - box_cfg.max.x; fapos[i].x -= k * d; e_box += 0.5 * k * d * d; }
+        // y-axis
+        if p.y < box_cfg.min.y { let d = box_cfg.min.y - p.y; fapos[i].y += k * d; e_box += 0.5 * k * d * d; }
+        else if p.y > box_cfg.max.y { let d = p.y - box_cfg.max.y; fapos[i].y -= k * d; e_box += 0.5 * k * d * d; }
+        // z-axis
+        if p.z < box_cfg.min.z { let d = box_cfg.min.z - p.z; fapos[i].z += k * d; e_box += 0.5 * k * d * d; }
+        else if p.z > box_cfg.max.z { let d = p.z - box_cfg.max.z; fapos[i].z -= k * d; e_box += 0.5 * k * d * d; }
+    }
+    e_box
+}
+
 ///
 /// Convention (§1 corrected): E = k_p/2 |e|², F = k_p · e
 /// where e = x_j - tip_i (port error vector).
@@ -877,7 +916,8 @@ pub fn step_force_md(
 ) -> (f64, f64, f64) {
     let e_port = eval_port_forces(state, topo, fapos, tau);
     let e_nb = eval_nonbonded(state, topo, nbcfg, fapos);
-    let e = e_port + e_nb;
+    let e_box = eval_box_forces(state, &cfg.box_cfg, fapos);
+    let e = e_port + e_nb + e_box;
     let mut max_f: f64 = 0.0;
     let mut max_t: f64 = 0.0;
     for i in 0..topo.natoms {
@@ -923,7 +963,8 @@ pub fn step_inertial_reset(
     let np = topo.natoms;
     let e_port = eval_port_forces(state, topo, fapos, tau);
     let e_nb = eval_nonbonded(state, topo, nbcfg, fapos);
-    let e = e_port + e_nb;
+    let e_box = eval_box_forces(state, &cfg.box_cfg, fapos);
+    let e = e_port + e_nb + e_box;
 
     let mut max_f = 0.0f64;
     let mut max_t = 0.0f64;
@@ -987,6 +1028,10 @@ pub struct FireState {
     pub alpha0: f64,       // initial alpha (0.1)
 }
 
+impl Default for FireState {
+    fn default() -> Self { Self { dt: 0.001, dt_max: 0.02, alpha: 0.1, n_pos: 0, n_min: 5, f_inc: 1.1, f_dec: 0.5, f_alpha: 0.99, alpha0: 0.1 } }
+}
+
 impl FireState {
     pub fn new(dt0: f64, dt_max: f64) -> Self {
         Self { dt: dt0, dt_max, alpha: 0.1, n_pos: 0,
@@ -1011,7 +1056,8 @@ pub fn step_fire(
     // (1) Evaluate forces at current position
     let e_port = eval_port_forces(state, topo, fapos, tau);
     let e_nb = eval_nonbonded(state, topo, nbcfg, fapos);
-    let e = e_port + e_nb;
+    let e_box = eval_box_forces(state, &cfg.box_cfg, fapos);
+    let e = e_port + e_nb + e_box;
 
     let mut max_f = 0.0f64;
     let mut max_t = 0.0f64;
@@ -1194,6 +1240,24 @@ pub fn step_position_based(
         PosSolver::Projective    => solve_projective_jacobi(state, topo, cfg, nbcfg, dt2),
     }
 
+    // (2b) Box constraint: explicit position correction (harmonic spring, one Euler step).
+    //      Unilateral — doesn't fit pairwise inner solve, so apply as post-solve nudge.
+    //      δx = F_box * dt² / m = k*(limit - x) * dt² / m
+    if cfg.box_cfg.enabled {
+        let dt2_m: Vec<f64> = (0..np).map(|i| dt2 / topo.mass[i]).collect();
+        for i in 0..np {
+            let p = state.pos[i];
+            let k = cfg.box_cfg.k;
+            let s = dt2_m[i] * k;
+            if p.x < cfg.box_cfg.min.x { state.pos[i].x += s * (cfg.box_cfg.min.x - p.x); }
+            else if p.x > cfg.box_cfg.max.x { state.pos[i].x -= s * (p.x - cfg.box_cfg.max.x); }
+            if p.y < cfg.box_cfg.min.y { state.pos[i].y += s * (cfg.box_cfg.min.y - p.y); }
+            else if p.y > cfg.box_cfg.max.y { state.pos[i].y -= s * (p.y - cfg.box_cfg.max.y); }
+            if p.z < cfg.box_cfg.min.z { state.pos[i].z += s * (cfg.box_cfg.min.z - p.z); }
+            else if p.z > cfg.box_cfg.max.z { state.pos[i].z -= s * (p.z - cfg.box_cfg.max.z); }
+        }
+    }
+
     // (3) Corrector: v = (x_new - x_old) / dt  (ALWAYS — not multiplied by cdamp)
     //     This is the key fix: velocity carries momentum from the position change.
     //     For dynamic mode: ω = (q_new - q_old) / dt  (quaternion difference → angular velocity)
@@ -1225,6 +1289,7 @@ pub fn step_position_based(
     let mut fapos = vec![VEC3D_ZERO; np];
     let mut tau = vec![VEC3D_ZERO; np];
     let e = eval_port_forces(state, topo, &mut fapos, &mut tau);
+    let e_box = eval_box_forces(state, &cfg.box_cfg, &mut fapos);
     if cfg.vel_reset {
         let mut power = 0.0f64;
         for i in 0..np {
@@ -1235,7 +1300,7 @@ pub fn step_position_based(
             for i in 0..np { state.vel[i] = VEC3D_ZERO; state.omega[i] = VEC3D_ZERO; }
         }
     }
-    e
+    e + e_box
 }
 
 /// PBD with compliance (the original `step_xpbd` behavior, kept as a benchmark variant).

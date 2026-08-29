@@ -13,6 +13,7 @@ surfmol = { workspace = true }
 molff = { workspace = true }
 moltopo = { workspace = true }
 numcore = { workspace = true }
+numtypes = { workspace = true }
 rhai = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

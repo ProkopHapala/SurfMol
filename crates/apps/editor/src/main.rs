@@ -5,7 +5,9 @@ use std::sync::Arc;
 use glam::{Quat, Vec2, Vec3};
 use surfmol::mol_world::{BondedFFMode, MolWorld};
 use molff::nonbonded::{NonBondedFF, BroadPhase};
-use molff::raff::{RaffState, RaffTopology, RaffConfig, NbConfig, NbParams, OrientMode, eval_port_forces, eval_nonbonded, eval_nonbonded_broad, quat_from_omega_dt, quat_mul, quat_normalize, quat_conj};
+use molff::raff::{RaffState, RaffTopology, RaffConfig, NbConfig, NbParams, OrientMode, DynMode, PosSolver, FireState, BoxCfg,
+    eval_port_forces, eval_nonbonded, eval_nonbonded_broad, quat_from_omega_dt, quat_mul, quat_normalize, quat_conj,
+    step_force_md, step_inertial_reset, step_fire, step_position_based};
 use molrender::impostor::{AtomInstance, ImpostorRenderer};
 use molrender::line_renderer::{LineRenderer, LineVertex};
 use molrender::surface_renderer::SurfaceRenderer;
@@ -26,6 +28,25 @@ use winit::window::{Window, WindowAttributes};
 
 const ATOM_SCALE: f32 = 0.25;
 const K_PICK: f64 = 30.0;
+
+/// RAFF solver mode selector — chooses which integration strategy to use.
+/// ForceMD = damped symplectic Euler (force-based)
+/// InertialReset = full inertia + dot(v,F)<0 velocity reset (force-based)
+/// FIRE = Fast Inertial Relaxation Engine with adaptive dt (force-based)
+/// PBD/XPBD/Projective = position-based solvers (implicit, via step_position_based)
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RaffSolverMode { ForceMD, InertialReset, FIRE, PBD, XPBD, Projective }
+
+impl RaffSolverMode {
+    fn is_position_based(self) -> bool { matches!(self, Self::PBD | Self::XPBD | Self::Projective) }
+    fn label(self) -> &'static str {
+        match self { Self::ForceMD => "ForceMD", Self::InertialReset => "InertialReset", Self::FIRE => "FIRE",
+            Self::PBD => "PBD", Self::XPBD => "XPBD", Self::Projective => "Projective" }
+    }
+    fn pos_solver(self) -> Option<PosSolver> {
+        match self { Self::PBD => Some(PosSolver::PbdCompliance), Self::XPBD => Some(PosSolver::Xpbd), Self::Projective => Some(PosSolver::Projective), _ => None }
+    }
+}
 const PER_FRAME: i32 = 100;
 const PICK_RAY_R: f32 = 0.5;
 const LATTICE_A: f64 = 5.66;  // NaCl conventional cell, Na-Cl = a/2 = 2.83 Å
@@ -85,6 +106,8 @@ struct App {
     raff_cfg: RaffConfig,
     raff_nbcfg: NbConfig,
     raff_nb_enabled: bool,
+    raff_solver_mode: RaffSolverMode,
+    raff_fire: Option<FireState>,
     raff_e_port: f64,
     raff_e_nb: f64,
     plane_2d: bool,  // constrain atoms to z=0 plane (for easier 2D testing)
@@ -134,6 +157,16 @@ impl App {
         let mut nmols: usize = 2; let mut layout = "lattice".to_string(); let mut spacing: f64 = 12.0;
         let mut group_size: usize = GROUP_SIZE_DEFAULT; let mut per_frame: i32 = PER_FRAME; let mut dt: f64 = 0.02;
         let mut flag_raff = false; let mut flag_2d = false; let mut flag_show_aabb = false; let mut atom_scale: f32 = ATOM_SCALE;
+        let mut flag_raff_solver = RaffSolverMode::ForceMD;
+        let mut flag_raff_orient = OrientMode::Adiabatic;
+        let mut flag_raff_iters: usize = 4;
+        let mut flag_raff_pd_inertia = true;
+        let mut flag_raff_vel_reset = true;
+        let mut flag_raff_hb: f64 = 0.0;  // heavy-ball momentum end value (0 = disabled)
+        let mut flag_box_enabled = false;
+        let mut flag_box_min: [f64; 3] = [-10.0, -10.0, 0.0];
+        let mut flag_box_max: [f64; 3] = [10.0, 10.0, 10.0];
+        let mut flag_box_k: f64 = 50.0;
         let mut xyz_path_arg: Option<String> = None;
         { let mut it = args.iter().skip(1); while let Some(a) = it.next() { match a.as_str() {
             "--raff" => { flag_raff = true; },
@@ -146,6 +179,18 @@ impl App {
             "--group-size" => { group_size = it.next().unwrap_or(&"32".to_string()).parse().unwrap_or(GROUP_SIZE_DEFAULT); },
             "--perFrame" => { per_frame = it.next().unwrap_or(&"100".to_string()).parse().unwrap_or(PER_FRAME); },
             "--dt" => { dt = it.next().unwrap_or(&"0.02".to_string()).parse().unwrap_or(0.02); },
+            "--raff-solver" => { flag_raff_solver = match it.next().map(|s| s.as_str()) { Some("forcemd") => RaffSolverMode::ForceMD, Some("inertial") => RaffSolverMode::InertialReset, Some("fire") => RaffSolverMode::FIRE, Some("pbd") => RaffSolverMode::PBD, Some("xpbd") => RaffSolverMode::XPBD, Some("projective") => RaffSolverMode::Projective, _ => RaffSolverMode::ForceMD }; },
+            "--raff-orient" => { flag_raff_orient = match it.next().map(|s| s.as_str()) { Some("dynamic") => OrientMode::Dynamic, _ => OrientMode::Adiabatic }; },
+            "--raff-iters" => { flag_raff_iters = it.next().unwrap_or(&"4".to_string()).parse().unwrap_or(4); },
+            "--raff-pd-inertia" => { flag_raff_pd_inertia = true; },
+            "--raff-no-pd-inertia" => { flag_raff_pd_inertia = false; },
+            "--raff-vel-reset" => { flag_raff_vel_reset = true; },
+            "--raff-no-vel-reset" => { flag_raff_vel_reset = false; },
+            "--raff-hb" => { flag_raff_hb = it.next().unwrap_or(&"0.0".to_string()).parse().unwrap_or(0.0); },
+            "--box" => { flag_box_enabled = true; },
+            "--box-min" => { let default = "-10,-10,0".to_string(); let v = it.next().unwrap_or(&default); let p: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect(); if p.len() >= 3 { flag_box_min = [p[0], p[1], p[2]]; } },
+            "--box-max" => { let default = "10,10,10".to_string(); let v = it.next().unwrap_or(&default); let p: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect(); if p.len() >= 3 { flag_box_max = [p[0], p[1], p[2]]; } },
+            "--box-k" => { flag_box_k = it.next().unwrap_or(&"50.0".to_string()).parse().unwrap_or(50.0); },
             _ => { if !a.starts_with("--") { xyz_path_arg = Some(a.clone()); } }
         } } }
         let xyz_path: PathBuf = xyz_path_arg.map(|s| { let p = PathBuf::from(s); if p.is_absolute() { p } else { workspace_root.join(p) } }).unwrap_or_else(|| workspace_root.join("data/xyz/benzene.xyz"));
@@ -333,7 +378,7 @@ impl App {
         // RAFF mode: use higher damping (0.1 → cdamp=0.9) and fewer steps/frame for stable relaxation
         let damping_init = if flag_raff { 0.1 } else { 0.0 };
         let per_frame_init = if flag_raff { 20 } else { per_frame };
-        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: show_surface_init, show_help: true, show_groups: false, show_ports: show_ports_init, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: damping_init, zero_v_on_opposition: true, per_frame: per_frame_init, atom_scale, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, clipboard: Clipboard::new(), etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0, kekule_editor, builder: b, show_kekule_editor: show_kekule_editor_init, show_hex_grid: true, show_ghost_hexes: true, edit_from_builder: false, raff_state: None, raff_topo: None, raff_cfg: RaffConfig { dt: 0.02, cdamp: 0.9, rot_damp: 0.9, flim: 1000.0, xpbd_iters: 4, xpbd_over_relax: 1.0, orient_mode: OrientMode::Adiabatic, ..Default::default() }, raff_nbcfg: NbConfig { enabled: false, rcut: 10.0, r_damp: 0.1, f_max: 50.0, k_coll: 100.0, excl_12: true, excl_13: true }, raff_nb_enabled: raff_nb_enabled_init, raff_e_port: 0.0, raff_e_nb: 0.0, plane_2d: flag_2d, broad_phase, show_aabb: flag_show_aabb, n_clusters };
+        let mut app = Self { window, instance, world, elems, params, uff_types, charges, cam, selected: None, pinned: vec![false; natoms], pick_k: K_PICK, show_bonds: true, show_surface: show_surface_init, show_help: true, show_groups: false, show_ports: show_ports_init, show_labels: true, show_debug_cursor: true, label_mode: LabelMode::ElementName, run_relax: false, dt, flim: 1000.0, damping: damping_init, zero_v_on_opposition: true, per_frame: per_frame_init, atom_scale, dirty, device, queue, config, renderer, instances, line_renderer, surface_renderer, surface_texture: None, surface_origin: [0.0; 3], surface_u: [0.0; 3], surface_v: [0.0; 3], mouse_now: Vec2::ZERO, mouse_delta: Vec2::ZERO, prev_mouse: Vec2::ZERO, lmb_down: false, mouse_down: Vec2::ZERO, trackballing: false, trackball_prev: Vec2::ZERO, window_size: (ww, wh), surface, egui_ctx, egui_state, egui_renderer, clipboard: Clipboard::new(), etot: 0.0, eb: 0.0, ea: 0.0, ed: 0.0, ei: 0.0, enb: 0.0, es: 0.0, kekule_editor, builder: b, show_kekule_editor: show_kekule_editor_init, show_hex_grid: true, show_ghost_hexes: true, edit_from_builder: false, raff_state: None, raff_topo: None, raff_cfg: RaffConfig { dt: 0.02, cdamp: 0.9, rot_damp: 0.9, flim: 1000.0, xpbd_iters: flag_raff_iters, xpbd_over_relax: 1.0, orient_mode: flag_raff_orient, pd_inertia: flag_raff_pd_inertia, vel_reset: flag_raff_vel_reset, bmix_end: flag_raff_hb, box_cfg: BoxCfg { enabled: flag_box_enabled, min: Vec3d::new(flag_box_min[0], flag_box_min[1], flag_box_min[2]), max: Vec3d::new(flag_box_max[0], flag_box_max[1], flag_box_max[2]), k: flag_box_k }, ..Default::default() }, raff_nbcfg: NbConfig { enabled: false, rcut: 10.0, r_damp: 0.1, f_max: 50.0, k_coll: 100.0, excl_12: true, excl_13: true }, raff_nb_enabled: raff_nb_enabled_init, raff_solver_mode: flag_raff_solver, raff_fire: None, raff_e_port: 0.0, raff_e_nb: 0.0, plane_2d: flag_2d, broad_phase, show_aabb: flag_show_aabb, n_clusters };
         // --raff: build RAFF topology immediately
         if flag_raff { app.build_raff_from_world(); }
         app.rebuild_surface_cache();
@@ -462,7 +507,7 @@ impl App {
         println!("[RAFF] Built topology: {} atoms, {} bonds, {} exclusions", natoms, nbonds, natoms);
     }
 
-    /// One RAFF relaxation step: eval port + non-bonded forces, add spring drag, integrate, sync.
+    /// One RAFF relaxation step: dispatch to the selected solver, apply GUI constraints, sync.
     fn do_raff_step(&mut self) {
         // Lazy init: build RAFF state on first step
         if self.raff_state.is_none() || self.raff_topo.is_none() {
@@ -475,6 +520,11 @@ impl App {
         cfg.flim = self.flim;
         cfg.cdamp = 1.0 - self.damping;
         cfg.rot_damp = 1.0 - self.damping;
+        // For position-based solvers: set dyn_mode + pos_solver from the GUI selector
+        if self.raff_solver_mode.is_position_based() {
+            cfg.dyn_mode = DynMode::Xpbd;
+            cfg.pos_solver = self.raff_solver_mode.pos_solver().unwrap();
+        }
         let mut nbcfg = self.raff_nbcfg;
         nbcfg.enabled = self.raff_nb_enabled;
         // Rebuild broad-phase AABBs from current RAFF state positions (if enabled)
@@ -482,81 +532,54 @@ impl App {
             let pos_vec: Vec<Vec3d> = if let Some(ref state) = self.raff_state { state.pos[0..natoms].to_vec() } else { self.world.dyn_atoms.atoms.apos.as_slice()[0..natoms].to_vec() };
             bp.rebuild(&pos_vec);
         }
+        // Save pinned positions to restore after step
+        let pinned_pos: Vec<Vec3d> = if let Some(ref state) = self.raff_state {
+            (0..natoms).map(|i| if self.pinned[i] { state.pos[i] } else { numtypes::VEC3D_ZERO }).collect()
+        } else { vec![numtypes::VEC3D_ZERO; natoms] };
         for _ in 0..self.per_frame {
-            let (state, topo) = self.raff_state_take();  // borrow workaround
+            let (mut state, topo) = self.raff_state_take();  // borrow workaround
             let mut fapos = vec![numtypes::VEC3D_ZERO; natoms];
             let mut tau = vec![numtypes::VEC3D_ZERO; natoms];
-            // 1. Eval port forces
-            let e_port = eval_port_forces(&state, &topo, &mut fapos, &mut tau);
-            // 2. Eval non-bonded (accumulates into fapos) — use broad phase if available
-            let e_nb = if let Some(ref bp) = self.broad_phase {
-                eval_nonbonded_broad(&state, &topo, &nbcfg, bp, &mut fapos)
-            } else {
-                eval_nonbonded(&state, &topo, &nbcfg, &mut fapos)
+            // Dispatch to selected solver — all evaluate forces internally
+            let e_tot = match self.raff_solver_mode {
+                RaffSolverMode::ForceMD => step_force_md(&mut state, &topo, &cfg, &mut fapos, &mut tau, &nbcfg).0,
+                RaffSolverMode::InertialReset => step_inertial_reset(&mut state, &topo, &cfg, &mut fapos, &mut tau, &nbcfg).0,
+                RaffSolverMode::FIRE => {
+                    if self.raff_fire.is_none() {
+                        self.raff_fire = Some(FireState { dt: cfg.dt, dt_max: cfg.dt * 5.0, ..Default::default() });
+                    }
+                    let fire = self.raff_fire.as_mut().unwrap();
+                    step_fire(&mut state, &topo, &cfg, fire, &mut fapos, &mut tau, &nbcfg).0
+                }
+                _ if self.raff_solver_mode.is_position_based() => step_position_based(&mut state, &topo, &cfg, &nbcfg),
+                _ => unreachable!(),
             };
-            // 3. Spring drag force on selected atom (mouse pulling)
+            // Spring drag on selected atom (post-step nudge — works for all solver modes)
             if !self.show_kekule_editor {
                 if let Some(idx) = self.selected {
                     let atom_pos = glam::Vec3::new(state.pos[idx].x as f32, state.pos[idx].y as f32, state.pos[idx].z as f32);
                     let (ray0, hray) = self.cam.screen_ray(self.prev_mouse, self.window_size.0, self.window_size.1);
                     let f_spring = get_force_spring_ray(atom_pos, hray, ray0, self.pick_k as f32);
-                    fapos[idx].x += f_spring.x as f64;
-                    fapos[idx].y += f_spring.y as f64;
-                    fapos[idx].z += f_spring.z as f64;
+                    let nudge = cfg.dt * cfg.dt / topo.mass[idx];
+                    state.pos[idx].x += f_spring.x as f64 * nudge;
+                    state.pos[idx].y += f_spring.y as f64 * nudge;
+                    state.pos[idx].z += f_spring.z as f64 * nudge;
                 }
             }
-            // --2d: zero out z-component of forces and torques (constrain to xy plane)
-            if self.plane_2d {
-                for i in 0..natoms { fapos[i].z = 0.0; tau[i].x = 0.0; tau[i].y = 0.0; }  // only allow rotation around z
-            }
-            // 4. Integrate (symplectic Euler, same as step_force_md but with pinning)
-            let dt = cfg.dt;
-            let cdamp = cfg.cdamp;
-            let rot_damp = cfg.rot_damp;
-            let flim = cfg.flim;
-            let mut state = state;
-            // Stopping criterion: if total dot(v,f) < 0 (force opposing motion), zero all velocities.
-            // Same as FireCore MolWorld_sp3 zero_v_on_opposition — prevents oscillation, converges to equilibrium.
-            if self.zero_v_on_opposition {
-                let mut fv = 0.0;
-                for i in 0..natoms { fv += state.vel[i].dot(fapos[i]); }
-                if fv < 0.0 {
-                    for i in 0..natoms { state.vel[i] = numtypes::VEC3D_ZERO; state.omega[i] = numtypes::VEC3D_ZERO; }
-                }
-            }
+            // Apply pinning: restore pinned atoms to their saved positions
             for i in 0..natoms {
-                if self.pinned[i] { continue; }
-                let mut f = fapos[i];
-                let f2 = f.norm2();
-                if flim > 0.0 && f2 > flim * flim { f.mul(flim / f2.sqrt()); }
-                let mut v = state.vel[i];
-                v.mul(cdamp);
-                v.add_mul(f, dt / topo.mass[i]);
-                state.vel[i] = v;
-                state.pos[i].add_mul(v, dt);
-                // Rotation (only if atom has ports and inertia)
-                if topo.inv_inertia[i] > 0.0 && topo.nport[i] > 0 {
-                    let t = tau[i];
-                    let mut w = state.omega[i];
-                    w.mul(rot_damp);
-                    w.add_mul(t, topo.inv_inertia[i] * dt);
-                    state.omega[i] = w;
-                    let dq = quat_from_omega_dt(w, dt);
-                    state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
-                }
-            }
-            // Adiabatic: re-solve rotations after position updates
-            if cfg.orient_mode == OrientMode::Adiabatic {
-                molff::raff::solve_all_rotations(&mut state, &topo);
+                if self.pinned[i] { state.pos[i] = pinned_pos[i]; state.vel[i] = numtypes::VEC3D_ZERO; state.omega[i] = numtypes::VEC3D_ZERO; }
             }
             // --2d: clamp z position to 0 and zero z velocity
             if self.plane_2d {
                 for i in 0..natoms { state.pos[i].z = 0.0; state.vel[i].z = 0.0; state.omega[i].x = 0.0; state.omega[i].y = 0.0; }
             }
+            // Energy split for display: eval port forces at new state
+            let e_port = eval_port_forces(&state, &topo, &mut fapos, &mut tau);
             self.raff_state = Some(state);
             self.raff_e_port = e_port;
-            self.raff_e_nb = e_nb;
-            self.etot = e_port + e_nb;
+            self.raff_e_nb = e_tot - e_port;
+            self.etot = e_tot;
         }
         // Sync positions back to world for rendering
         if let Some(ref state) = self.raff_state {
@@ -1224,9 +1247,18 @@ impl App {
                 .title_bar(true)
                 .frame(egui::Frame::window(&ctx.style()))
                 .show(ctx, |ui| {
-                    ui.heading("RAFF Physics");
-                    ui.checkbox(&mut self.raff_nb_enabled, "Non-bonded (LJ+Coul+Coll)");
-                    ui.checkbox(&mut self.plane_2d, "2D plane (z=0 constraint)");
+                    ui.heading("Solver");
+                    ui.horizontal(|ui| {
+                        ui.label("Mode:");
+                        egui::ComboBox::from_id_source("raff_solver_combo")
+                            .width(110.0)
+                            .selected_text(self.raff_solver_mode.label())
+                            .show_ui(ui, |ui| {
+                                for m in [RaffSolverMode::ForceMD, RaffSolverMode::InertialReset, RaffSolverMode::FIRE, RaffSolverMode::PBD, RaffSolverMode::XPBD, RaffSolverMode::Projective] {
+                                    ui.selectable_value(&mut self.raff_solver_mode, m, m.label());
+                                }
+                            });
+                    });
                     ui.horizontal(|ui| {
                         ui.label("Orient:");
                         egui::ComboBox::from_id_source("raff_orient_combo")
@@ -1237,6 +1269,25 @@ impl App {
                                 ui.selectable_value(&mut self.raff_cfg.orient_mode, OrientMode::Dynamic, "Dynamic");
                             });
                     });
+                    ui.checkbox(&mut self.raff_nb_enabled, "Non-bonded (LJ+Coul+Coll)");
+                    ui.checkbox(&mut self.plane_2d, "2D plane (z=0 constraint)");
+                    // Position-based sub-options
+                    if self.raff_solver_mode.is_position_based() {
+                        ui.separator();
+                        ui.heading("PD Options");
+                        ui.add(egui::Slider::new(&mut self.raff_cfg.xpbd_iters, 1..=32).text("inner iters"));
+                        ui.checkbox(&mut self.raff_cfg.pd_inertia, "PD inertia (outer loop)");
+                        ui.checkbox(&mut self.raff_cfg.vel_reset, "vel reset (v·F<0 → v=0)");
+                        ui.add(egui::Slider::new(&mut self.raff_cfg.bmix_end, 0.0..=0.95).text("heavy-ball momentum"));
+                        if self.raff_cfg.bmix_end > 0.0 {
+                            let mut istart = self.raff_cfg.bmix_istart as i32;
+                            let mut iend = self.raff_cfg.bmix_iend as i32;
+                            ui.add(egui::Slider::new(&mut istart, 0..=10).text("HB start iter"));
+                            ui.add(egui::Slider::new(&mut iend, 1..=20).text("HB end iter"));
+                            self.raff_cfg.bmix_istart = istart as usize;
+                            self.raff_cfg.bmix_iend = iend as usize;
+                        }
+                    }
                     ui.separator();
                     ui.heading("Non-bonded Params");
                     ui.add(egui::Slider::new(&mut self.raff_nbcfg.rcut, 3.0..=20.0).text("rcut (Å)"));
@@ -1244,6 +1295,24 @@ impl App {
                     ui.add(egui::Slider::new(&mut self.raff_nbcfg.f_max, 0.0..=200.0).text("f_max"));
                     ui.checkbox(&mut self.raff_nbcfg.excl_12, "Exclude 1-2");
                     ui.checkbox(&mut self.raff_nbcfg.excl_13, "Exclude 1-3");
+                    ui.separator();
+                    ui.heading("Box Constraint");
+                    ui.checkbox(&mut self.raff_cfg.box_cfg.enabled, "Harmonic box (AABB)");
+                    if self.raff_cfg.box_cfg.enabled {
+                        ui.add(egui::Slider::new(&mut self.raff_cfg.box_cfg.k, 1.0..=500.0).text("k_box (eV/Å²)"));
+                        ui.label("Min corner:");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut self.raff_cfg.box_cfg.min.x).range(-50.0..=50.0).speed(0.1).prefix("x: "));
+                            ui.add(egui::DragValue::new(&mut self.raff_cfg.box_cfg.min.y).range(-50.0..=50.0).speed(0.1).prefix("y: "));
+                            ui.add(egui::DragValue::new(&mut self.raff_cfg.box_cfg.min.z).range(-50.0..=50.0).speed(0.1).prefix("z: "));
+                        });
+                        ui.label("Max corner:");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut self.raff_cfg.box_cfg.max.x).range(-50.0..=50.0).speed(0.1).prefix("x: "));
+                            ui.add(egui::DragValue::new(&mut self.raff_cfg.box_cfg.max.y).range(-50.0..=50.0).speed(0.1).prefix("y: "));
+                            ui.add(egui::DragValue::new(&mut self.raff_cfg.box_cfg.max.z).range(-50.0..=50.0).speed(0.1).prefix("z: "));
+                        });
+                    }
                     ui.separator();
                     ui.label(egui::RichText::new(format!("E_port = {:.4} eV", self.raff_e_port)).size(14.0).color(egui::Color32::from_rgb(100, 200, 255)));
                     ui.label(egui::RichText::new(format!("E_nb   = {:.4} eV", self.raff_e_nb)).size(14.0).color(egui::Color32::from_rgb(100, 200, 255)));

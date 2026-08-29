@@ -240,7 +240,7 @@ fn test_projective_dynamic_orientation_carries_omega() {
     let q0 = s.quat[0];
     let cfg = RaffConfig { orient_mode: OrientMode::Dynamic, dyn_mode: DynMode::Xpbd, pos_solver: PosSolver::Projective,
         dt: 0.001, cdamp: 1.0, rot_damp: 1.0, flim: 0.0, xpbd_iters: 1, xpbd_over_relax: 1.0,
-        pd_inertia: true, vel_reset: false, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 0, bmix_iend: 1 };
+        pd_inertia: true, vel_reset: false, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 0, bmix_iend: 1, ..Default::default() };
     let e = step_position_based(&mut s, &topo, &cfg, &nb_off());
     let w = s.omega[0].norm();
     let dq = ((s.quat[0].x-q0.x).powi(2) + (s.quat[0].y-q0.y).powi(2) + (s.quat[0].z-q0.z).powi(2) + (s.quat[0].w-q0.w).powi(2)).sqrt();
@@ -256,7 +256,7 @@ fn test_pd_dynamic_inner_rotation_converges() {
     let mut s = perturb(&state);
     let cfg = RaffConfig { orient_mode: OrientMode::Dynamic, dyn_mode: DynMode::Xpbd, pos_solver: PosSolver::Projective,
         dt: 0.1, cdamp: 1.0, rot_damp: 1.0, flim: 0.0, xpbd_iters: 4, xpbd_over_relax: 1.0,
-        pd_inertia: true, vel_reset: true, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 1, bmix_iend: 2 };
+        pd_inertia: true, vel_reset: true, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 1, bmix_iend: 2, ..Default::default() };
     let mut e_last = f64::INFINITY;
     let mut max_f = f64::INFINITY;
     let n = s.natoms;
@@ -280,7 +280,7 @@ fn test_pd_outer_inertia_retains_velocity() {
     s.vel[0] = Vec3d::new(2.0, -1.0, 0.5);
     let cfg = RaffConfig { orient_mode: OrientMode::Adiabatic, dyn_mode: DynMode::Xpbd, pos_solver: PosSolver::Projective,
         dt: 0.1, cdamp: 1.0, rot_damp: 1.0, flim: 0.0, xpbd_iters: 1, xpbd_over_relax: 1.0,
-        pd_inertia: true, vel_reset: false, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 0, bmix_iend: 1 };
+        pd_inertia: true, vel_reset: false, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 0, bmix_iend: 1, ..Default::default() };
     step_position_based(&mut s, &topo, &cfg, &nb_off());
     step_position_based(&mut s, &topo, &cfg, &nb_off());
     let p_ref = Vec3d::new(0.4, -0.2, 0.1);
@@ -299,7 +299,7 @@ fn test_pd_i4_heavy_ball_is_active() {
     solve_all_rotations(&mut sh, &topo);
     let base = RaffConfig { orient_mode: OrientMode::Adiabatic, dyn_mode: DynMode::Xpbd, pos_solver: PosSolver::Projective,
         dt: 0.2, cdamp: 0.0, rot_damp: 0.0, flim: 0.0, xpbd_iters: 4, xpbd_over_relax: 1.0,
-        pd_inertia: false, vel_reset: false, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 1, bmix_iend: 2 };
+        pd_inertia: false, vel_reset: false, bmix_start: 0.0, bmix_end: 0.0, bmix_istart: 1, bmix_iend: 2, ..Default::default() };
     let accelerated = RaffConfig { bmix_start: 0.75, bmix_end: 0.75, ..base };
     step_position_based(&mut s0, &topo, &base, &nb_off());
     step_position_based(&mut sh, &topo, &accelerated, &nb_off());
