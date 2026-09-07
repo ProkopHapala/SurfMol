@@ -15,7 +15,7 @@ Interactive molecular editor and physics simulator for molecules on surfaces. Co
 - **Load molecules** from XYZ files (CLI arg or default `data/xyz/benzene.xyz`), build topology via `Builder::from_positions_and_radii`, assign UFF types, set up nonbonded FF and NaCl surface.
 - **Edit structures** via Kekule hex-grid editor: paint/toggle hex rings, draw atoms, generate graphene nanoribbons with passivation, auto H-cap, then "Bake to Sim" to convert builder state to a simulation world.
 - **Relax structures** with real-time MD: three forcefield modes (`F` key cycles Uff → RigidSp3 → Raff). UFF/RigidSp3 uses velocity Verlet with force clamping, damping, spring-based atom dragging, "zero velocity on opposition" heuristic. RAFF uses symplectic Euler with adiabatic rotation solving, port-spring forces, non-bonded LJ+Coulomb, and the same stopping criterion.
-- **RAFF mode** (`--raff` flag): starts in simulation mode (not Kekule editor), shows ports, enables non-bonded, disables surface. Builds `RaffTopology` from world topology on init. `do_raff_step()` runs per-frame: eval port forces → eval non-bonded → apply spring drag → 2D constraint → stopping criterion → integrate → adiabatic rotation re-solve → sync positions back to world.
+- **RAFF mode** (`--raff` flag): starts in simulation mode (not Kekule editor), shows ports, enables non-bonded, disables surface. Builds `RaffTopology` from world topology on init. `do_raff_step()` dispatches to the selected solver (ForceMD/InertialReset/FIRE/PBD/XPBD/Projective), applies spring drag, 2D constraint, pinning, and syncs positions back to world. All 6 solver modes are selectable from GUI and CLI.
 - **2D constraint** (`--2d` flag): flattens all atoms to z=0 plane, zeros z-component of forces/torques, clamps z-position and z-velocity. Only rotation around z-axis allowed. For testing RAFF in a 2D plane.
 - **Visualize** atoms as impostor spheres (adjustable size via `--atom-scale` or GUI slider), bonds as multi-segment lines, ports as orange lines from atom center to rotated port tip (synced with RAFF quaternions), surface potential as a colored textured quad (blue-white-red diverging colormap), with axes, crosshairs, and selection rings.
 - **Interact** via trackball camera (arc-ball rotation, shift+drag pan, scroll zoom), ray-sphere atom picking (`PICK_RAY_R = 0.5` Å), atom pinning, spring dragging (LMB click to pick, LMB drag to pull).
@@ -25,15 +25,25 @@ Interactive molecular editor and physics simulator for molecules on surfaces. Co
 - **Ray-sphere picking** (`ray_sphere`): quadratic discriminant `b² - c` where `b = oc·rd`, `c = |oc|² - sr²`. Returns closest intersection distance.
 - **Spring dragging** (`get_force_spring_ray`): projects atom position onto mouse ray, applies perpendicular spring force `-dp_perp * k` to drag atom along ray. Ported from FireCore `MolWorld_sp3.h:1505` (`getForceSpringRay`). Force is perpendicular to the ray (screen-plane constraint), free along depth.
 - **MD relaxation loop** (`do_relax_step`): runs `per_frame` iterations, evaluates all forcefields, applies spring force to selected atom, zeros velocities if `Σ dot(v,f) < 0` (energy overshoot / stopping criterion), applies damping, moves unpinned atoms.
-- **RAFF relaxation loop** (`do_raff_step`): runs `per_frame` iterations — eval port forces (`eval_port_forces`) → eval non-bonded (`eval_nonbonded`) → apply spring drag → 2D constraint (zero z-force/torque) → stopping criterion (`Σ dot(v,f) < 0` → zero all velocities) → symplectic Euler integration (damped) → adiabatic rotation re-solve (`solve_all_rotations`) → 2D clamp (z=0, z-vel=0) → sync positions to world for rendering.
+- **RAFF relaxation loop** (`do_raff_step`): runs `per_frame` iterations — dispatches to the selected solver (`step_force_md` / `step_inertial_reset` / `step_fire` / `step_position_based`) which evaluates forces + integrates internally → apply spring drag (post-step nudge) → apply pinning (restore pinned positions) → 2D clamp (z=0, z-vel=0) → eval port forces for energy display → sync positions to world for rendering. The solver mode is selected via `RaffSolverMode` enum (ForceMD/InertialReset/FIRE/PBD/XPBD/Projective), set from GUI dropdown or `--raff-solver` CLI flag. Position-based modes set `cfg.dyn_mode = Xpbd` + `cfg.pos_solver` from the mode. FIRE lazily initializes a `FireState` (adaptive dt/alpha).
 - **Port rendering sync**: in RAFF mode, ports are drawn from `topo.port_tip(state, i, s)` which applies `state.quat[i]` — the actual rotated port arm from the physics solver. In RigidSp3 mode, ports use fixed geometry from `world.rigid_sp3.get_port_tip()`.
 - **Surface potential texture** (`rebuild_surface_cache`): samples NaCl surface on 257×257 grid aligned to lattice parallelogram, evaluates `surf.eval_atom` with unit charge probe, maps to blue-white-red colormap, uploads as wgpu texture.
-- **Builder-to-Sim pipeline** ("Bake to Sim"): `cleanup_dead` → `bake` → `MolWorld::from_topology` → rebuild neighbor lists → reassign UFF types → rebuild nonbonded FF with REQ → reload .dat params → rebuild surface.
+- **Builder-to-Sim pipeline** ("Bake to Sim"): `cleanup_dead` → `bake` → `MolWorld::from_topology` → rebuild neighbor lists → reassign UFF types → rebuild nonbonded FF with REQ → reload .dat params (bonds/angles/dihedrals/inversions) → rebuild surface. UFF parameters are set from `.dat` files in `App::new()` (`src/main.rs:308-311`) — bonds from `BondTypes.dat`, angles from `AngleTypes.dat` (Fourier c0-c3), dihedrals from `DihedralTypes.dat` (V, d, n), inversions with K=50 for sp² C_R/N_R/O_R (matching FireCore). If `.dat` files are missing, falls back to bond-only dummy params (k=100, l0=current length). For programmatic UFF setup, use `MolWorld::setup_uff_params` which ports FireCore's `assignUFFparams` — see [`/userguide/uff_spff.md`](/userguide/uff_spff.md).
 - **Broad-phase AABB collision** (`--nmols N`): when multiple molecules are loaded, a `BroadPhase` struct (`molff::nonbonded::BroadPhase`) holds per-cluster AABBs and a cutoff. Each relaxation step rebuilds AABBs from current positions, then `eval_broad` / `eval_nonbonded_broad` only evaluates atom pairs whose cluster AABBs overlap (expanded by `rcut`). This produces identical forces/energy as the O(N²) all-pairs path (verified by parity tests in `tests/test_broad_phase.rs`). AABBs are visualized with `--show-aabb` (green = tight, red = expanded by rcut). Design: `notes/designs/cluster_aabb_collision.md`.
 
 ## CLI arguments
 
 - `--raff` — start in RAFF mode (simulation, not Kekule editor; show ports; enable non-bonded; disable surface; damping=0.1, per_frame=20)
+- `--raff-solver MODE` — RAFF solver: `forcemd` (default) / `inertial` / `fire` / `pbd` / `xpbd` / `projective`
+- `--raff-orient MODE` — RAFF orientation: `adiabatic` (default) / `dynamic`
+- `--raff-iters N` — inner iterations for position-based solvers (default 4)
+- `--raff-pd-inertia` / `--raff-no-pd-inertia` — enable/disable PD outer-loop inertia (default: on)
+- `--raff-vel-reset` / `--raff-no-vel-reset` — enable/disable velocity reset on v·F<0 (default: on)
+- `--raff-hb M` — heavy-ball momentum for inner Jacobi (default 0.0 = disabled; 0.5–0.75 typical)
+- `--box` — enable harmonic box constraint (soft AABB confinement)
+- `--box-min x,y,z` — box min corner (default `-10,-10,0`, comma-separated)
+- `--box-max x,y,z` — box max corner (default `10,10,10`, comma-separated)
+- `--box-k K` — box spring constant in eV/Å² (default 50.0)
 - `--2d` — flatten atoms to z=0 plane, constrain forces/velocities/positions to 2D
 - `--atom-scale S` — atom render size multiplier (default 0.25, range 0.05–0.5; also adjustable via GUI slider)
 - `--nmols N` — number of molecule copies to spawn (default 2). Each molecule is its own cluster for broad-phase AABB collision.
@@ -51,7 +61,7 @@ Interactive molecular editor and physics simulator for molecules on surfaces. Co
 
 ## GUI panels
 
-- **Settings** (right): Physics (iters/frame, dt, damping, zero-V-on-opposition), Display (atom size slider, label mode, bonded FF mode), RAFF Settings (non-bonded toggle, orient mode, dt/damping/iters, exclusion checkboxes, 2D plane checkbox, live energy display).
+- **Settings** (right): Physics (iters/frame, dt, damping, zero-V-on-opposition), Display (atom size slider, label mode, bonded FF mode), RAFF Settings (solver mode dropdown, orient mode, non-bonded toggle, 2D plane, PD Options sub-panel for position-based solvers: inner iters, PD inertia, vel reset, heavy-ball momentum + ramp iters, non-bonded params, box constraint with k_box + min/max corners, live energy display E_port/E_nb/E_tot).
 - **Inspector** (left): selected atom info (element, UFF type, charge, position, RvdW, pin status).
 - **Kekule Editor** (left, edit mode): edit mode selector, ribbon generator, bake/export buttons.
 - **Help** (bottom): keyboard shortcuts + CLI flags.
@@ -77,6 +87,9 @@ Interactive molecular editor and physics simulator for molecules on surfaces. Co
 ## See also
 
 - **[`/userguide/editor.md`](/userguide/editor.md)** — end-user guide with CLI examples, GUI controls, and molecule walkthroughs
+- **[`/userguide/raff.md`](/userguide/raff.md)** — RAFF solver modes end-user guide (ForceMD/FIRE/PBD/XPBD/Projective, box constraint, theory)
+- **[`/userguide/uff_spff.md`](/userguide/uff_spff.md)** — UFF/SPFF forcefield setup, parameters, and relaxation guide
+- [`/doc/topical_audit/uff.md`](/doc/topical_audit/uff.md) — UFF cross-implementation map (SurfMol vs FireCore vs SPAMMM)
 - [`/doc/topical_audit/raff.md`](/doc/topical_audit/raff.md) — RAFF cross-implementation map
 - [`/doc/topical_audit/spatial_acceleration.md`](/doc/topical_audit/spatial_acceleration.md) — AABB/broad-phase collision cross-implementation map
 - [`/notes/designs/cluster_aabb_collision.md`](/notes/designs/cluster_aabb_collision.md) — broad-phase AABB collision design document

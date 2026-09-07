@@ -1,0 +1,17 @@
+[package]
+name = "oclff"
+version = "0.1.0"
+edition = "2021"
+description = "OpenCL GPU harness for forcefields (UFF, SPFF, RAFF/RRsp3, GridFF, FAF)."
+
+[dependencies]
+ocl = { workspace = true }
+numtypes = { workspace = true }
+molff = { workspace = true }
+moltopo = { workspace = true }
+surfff = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+molff = { workspace = true }
+moltopo = { workspace = true }

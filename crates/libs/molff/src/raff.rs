@@ -29,28 +29,78 @@ pub struct PortParam { pub k_p: f64, pub l0: f64 }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OrientMode { Dynamic, Adiabatic }
 
-/// Dynamics strategy: force-based MD or position-based (XPBD).
+/// Dynamics strategy: force-based MD or position-based (XPBD/PD).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DynMode { ForceMD, Xpbd }
+
+/// Position-based solver variant (Axis 2 — only used when `dyn_mode == Xpbd`).
+/// All three solve the same proximal problem (§11) with different algorithms;
+/// the benchmark compares which converges in fewer iterations / less wall time.
+/// CPU branch cost is irrelevant — this switch is for experimentation, not perf.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PosSolver {
+    /// PBD with compliance: λ = C/w_total each iteration (no lagged multiplier).
+    /// Simplest; can over-correct/oscillate on stiff bonds. The original `step_xpbd` behavior.
+    PbdCompliance,
+    /// True XPBD (Macklin 2016): lagged λ_acc carried between iterations,
+    /// dλ = -(C + α̃·λ_acc)/w_total. Stiffness-independent, no over-correction.
+    Xpbd,
+    /// Projective Dynamics: nonlinear local projection + fixed global quadratic
+    /// step solved by Jacobi. Best for stiff linear(ized) spring networks.
+    Projective,
+}
+
+/// Harmonic box constraint — confines atoms within an AABB with restoring spring force.
+/// F = k * (limit - x) when x is beyond the limit, 0 inside. Simulates a soft surface boundary.
+#[derive(Copy, Clone, Debug)]
+pub struct BoxCfg {
+    pub enabled: bool,
+    pub min: Vec3d,  // lower corner of the free region
+    pub max: Vec3d,  // upper corner of the free region
+    pub k: f64,      // spring constant (eV/Å²) — restoring force per unit displacement
+}
+
+impl Default for BoxCfg {
+    fn default() -> Self { Self { enabled: false, min: Vec3d::new(-10.0, -10.0, 0.0), max: Vec3d::new(10.0, 10.0, 10.0), k: 50.0 } }
+}
 
 /// Solver configuration. Separated from state and topology (§11).
 #[derive(Copy, Clone, Debug)]
 pub struct RaffConfig {
     pub orient_mode: OrientMode,
     pub dyn_mode: DynMode,
+    pub pos_solver: PosSolver,  // position-based variant (Axis 2)
     pub dt: f64,
-    pub cdamp: f64,       // linear damping (1 = no damping, 0 = full)
-    pub rot_damp: f64,    // rotational damping
+    pub cdamp: f64,       // velocity damping factor applied AFTER corrector (1 = no damping, 0 = kill velocity)
+    pub rot_damp: f64,    // rotational damping (same convention as cdamp)
     pub flim: f64,        // force clamp limit (0 = no clamp)
     pub xpbd_iters: usize,
-    pub xpbd_over_relax: f64, // >1 for over-relaxation Jacobi
+    pub xpbd_over_relax: f64, // >1 for over-relaxation Jacobi (PBD-compliance only)
+    // --- Outer-loop inertia (proper PD two-loop structure) ---
+    /// When true: always predict x += v*dt (even if cdamp=0). When false: skip predict if cdamp=0 (old behavior).
+    /// Should be true for proper Projective Dynamics. False = legacy projection-only mode.
+    pub pd_inertia: bool,
+    /// When true: reset velocity to zero when dot(v,F) < 0 (uphill). Like FIRE/inertial-reset.
+    /// For relaxation with full inertia (cdamp=1 in the retention-factor convention), this prevents energy buildup.
+    pub vel_reset: bool,
+    // --- Heavy-ball momentum for inner Jacobi/GS solver (port from FireCore SmartMixer) ---
+    pub bmix_start: f64,  // momentum mixing at start of ramp (typically 0)
+    pub bmix_end: f64,    // momentum mixing at end of ramp (typically 0.75)
+    pub bmix_istart: usize, // iteration to start ramping (0 = from the beginning)
+    pub bmix_iend: usize,   // iteration to end ramping (after this, bmix_end)
+    // --- Harmonic box constraint (soft AABB confinement) ---
+    pub box_cfg: BoxCfg,
 }
 
 impl Default for RaffConfig {
     fn default() -> Self {
         Self { orient_mode: OrientMode::Dynamic, dyn_mode: DynMode::ForceMD,
+            pos_solver: PosSolver::PbdCompliance,
             dt: 0.01, cdamp: 0.95, rot_damp: 0.95, flim: 100.0,
-            xpbd_iters: 16, xpbd_over_relax: 1.0 }
+            xpbd_iters: 16, xpbd_over_relax: 1.0,
+            pd_inertia: true, vel_reset: false,
+            bmix_start: 0.0, bmix_end: 0.75, bmix_istart: 3, bmix_iend: 10,
+            box_cfg: BoxCfg::default() }
     }
 }
 
@@ -176,6 +226,58 @@ pub struct RaffTopology {
         Vec3d::new(2.0*(x*y+w*z), 1.0 - 2.0*(x*x+z*z), 2.0*(y*z-w*x)),
         Vec3d::new(2.0*(x*z-w*y), 2.0*(y*z+w*x), 1.0 - 2.0*(x*x+y*y)),
     )
+}
+
+/// Dominant eigenvector of a real symmetric 4×4 matrix by cyclic Jacobi diagonalization.
+/// Unlike power iteration this is independent of the initial vector and cannot remain trapped
+/// in a non-dominant eigenvector. `q_ref` is used only to choose the equivalent quaternion sign.
+fn dominant_eigenvector_sym4(mut a: [f64; 16], q_ref: [f64; 4]) -> [f64; 4] {
+    assert!(a.iter().all(|x| x.is_finite()), "dominant_eigenvector_sym4: non-finite matrix {a:?}");
+    let mut v = [0.0f64; 16];
+    for i in 0..4 { v[i*4+i] = 1.0; }
+    for _ in 0..12 {
+        let mut off_max = 0.0f64;
+        for p in 0..3 {
+            for q in (p+1)..4 {
+                let apq = a[p*4+q];
+                off_max = off_max.max(apq.abs());
+                if apq.abs() < 1e-30 { continue; }
+                let app = a[p*4+p];
+                let aqq = a[q*4+q];
+                let tau = (aqq - app) / (2.0 * apq);
+                let t = if tau >= 0.0 { 1.0 / (tau + (1.0 + tau*tau).sqrt()) } else { -1.0 / (-tau + (1.0 + tau*tau).sqrt()) };
+                let c = 1.0 / (1.0 + t*t).sqrt();
+                let s = t * c;
+                for r in 0..4 {
+                    if r == p || r == q { continue; }
+                    let arp = a[r*4+p];
+                    let arq = a[r*4+q];
+                    let nrp = c*arp - s*arq;
+                    let nrq = s*arp + c*arq;
+                    a[r*4+p] = nrp; a[p*4+r] = nrp;
+                    a[r*4+q] = nrq; a[q*4+r] = nrq;
+                }
+                a[p*4+p] = app - t*apq;
+                a[q*4+q] = aqq + t*apq;
+                a[p*4+q] = 0.0; a[q*4+p] = 0.0;
+                for r in 0..4 {
+                    let vrp = v[r*4+p];
+                    let vrq = v[r*4+q];
+                    v[r*4+p] = c*vrp - s*vrq;
+                    v[r*4+q] = s*vrp + c*vrq;
+                }
+            }
+        }
+        let scale = (0..4).map(|i| a[i*4+i].abs()).fold(0.0f64, f64::max);
+        if off_max <= 1e-14 * (1.0 + scale) { break; }
+    }
+    let imax = (1..4).fold(0usize, |best, i| if a[i*4+i] > a[best*4+best] { i } else { best });
+    let mut q = [v[imax], v[4+imax], v[8+imax], v[12+imax]];
+    let n = q.iter().map(|x| x*x).sum::<f64>().sqrt();
+    assert!(n > 1e-30 && n.is_finite(), "dominant_eigenvector_sym4: invalid eigenvector norm {n}");
+    for x in &mut q { *x /= n; }
+    if q.iter().zip(q_ref).map(|(x, y)| x*y).sum::<f64>() < 0.0 { for x in &mut q { *x = -*x; } }
+    q
 }
 
 // ==================================================================
@@ -445,6 +547,28 @@ impl RaffState {
 
 /// Evaluate port forces and energy. Returns total port energy.
 /// Fills fapos and tau (scratch arrays passed by caller).
+/// Evaluate harmonic box constraint forces. Adds F = k*(limit - x) to fapos for atoms outside the AABB.
+/// Returns the total box potential energy (0.5*k*δ² per violated axis per atom).
+/// Atoms inside the box feel no force.
+pub fn eval_box_forces(state: &RaffState, box_cfg: &BoxCfg, fapos: &mut [Vec3d]) -> f64 {
+    if !box_cfg.enabled { return 0.0; }
+    let k = box_cfg.k;
+    let mut e_box = 0.0f64;
+    for i in 0..state.natoms {
+        let p = state.pos[i];
+        // x-axis
+        if p.x < box_cfg.min.x { let d = box_cfg.min.x - p.x; fapos[i].x += k * d; e_box += 0.5 * k * d * d; }
+        else if p.x > box_cfg.max.x { let d = p.x - box_cfg.max.x; fapos[i].x -= k * d; e_box += 0.5 * k * d * d; }
+        // y-axis
+        if p.y < box_cfg.min.y { let d = box_cfg.min.y - p.y; fapos[i].y += k * d; e_box += 0.5 * k * d * d; }
+        else if p.y > box_cfg.max.y { let d = p.y - box_cfg.max.y; fapos[i].y -= k * d; e_box += 0.5 * k * d * d; }
+        // z-axis
+        if p.z < box_cfg.min.z { let d = box_cfg.min.z - p.z; fapos[i].z += k * d; e_box += 0.5 * k * d * d; }
+        else if p.z > box_cfg.max.z { let d = p.z - box_cfg.max.z; fapos[i].z -= k * d; e_box += 0.5 * k * d * d; }
+    }
+    e_box
+}
+
 ///
 /// Convention (§1 corrected): E = k_p/2 |e|², F = k_p · e
 /// where e = x_j - tip_i (port error vector).
@@ -492,9 +616,8 @@ pub fn eval_port_forces(
 /// using the cross-covariance H = Σ k_α d_α r_α^T (NO centroid subtraction).
 /// Returns the optimal quaternion.
 ///
-/// Uses Newton-Schulz polar decomposition: R* = polar(H), then converts to quaternion.
-/// This is more robust than Horn K-matrix power iteration (which can converge to the
-/// wrong eigenvector when the largest-magnitude eigenvalue is negative).
+/// Uses the Davenport/Horn symmetric 4×4 K-matrix with cyclic Jacobi diagonalization.
+/// Solving the full eigenproblem avoids power iteration's dependence on the initial quaternion.
 /// d_α = x_j - x_i (neighbor direction), r_α = l_α · a_α (body-frame port arm).
 pub fn solve_rotation_wahba(
     i: usize, state: &RaffState, topo: &RaffTopology,
@@ -538,45 +661,19 @@ pub fn solve_rotation_wahba(
         h.add_outer(r * k, d);                         // M += k * r * d^T
     }
 
-    // Horn K-matrix method with shifted power iteration.
-    // The K-matrix has eigenvalues summing to 0, so the largest-magnitude eigenvalue
-    // can be negative. We shift K' = K + cI to make all eigenvalues positive,
-    // ensuring power iteration converges to the largest (optimal rotation).
+    // Davenport/Horn K-matrix. The largest algebraic eigenvalue gives the global Wahba optimum.
     let (hxx, hxy, hxz) = (h.a.x, h.a.y, h.a.z);
     let (hyx, hyy, hyz) = (h.b.x, h.b.y, h.b.z);
     let (hzx, hzy, hzz) = (h.c.x, h.c.y, h.c.z);
     let tr = hxx + hyy + hzz;
-    let mut k = [0.0f64; 16];
-    k[0] = tr;                     k[1] = hyz - hzy;          k[2] = hzx - hxz;          k[3] = hxy - hyx;
-    k[4] = hyz - hzy;              k[5] = hxx - hyy - hzz;    k[6] = hxy + hyx;          k[7] = hzx + hxz;
-    k[8] = hzx - hxz;              k[9] = hxy + hyx;          k[10] = hyy - hxx - hzz;   k[11] = hyz + hzy;
-    k[12] = hxy - hyx;             k[13] = hzx + hxz;         k[14] = hyz + hzy;         k[15] = hzz - hxx - hyy;
-    // Shift: c = 2 * Frobenius norm of K (upper bound on |eigenvalues|)
-    let k_frob = k.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let shift = 2.0 * k_frob;
-    for i in 0..4 { k[i*5] += shift; }  // add shift to diagonal
-
-    // Power iteration on shifted K. K-matrix uses [w, x, y, z] ordering (scalar first).
+    let k = [
+        tr,          hyz-hzy,       hzx-hxz,       hxy-hyx,
+        hyz-hzy,     hxx-hyy-hzz,   hxy+hyx,       hzx+hxz,
+        hzx-hxz,     hxy+hyx,       hyy-hxx-hzz,   hyz+hzy,
+        hxy-hyx,     hzx+hxz,       hyz+hzy,       hzz-hxx-hyy,
+    ];
     let q_warm = state.quat[i];
-    let mut q = [q_warm.w, q_warm.x, q_warm.y, q_warm.z];  // [w, x, y, z]
-    { let n = (q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]).sqrt(); if n > 1e-30 { for x in q.iter_mut() { *x /= n; } } }
-    for _ in 0..64 {
-        let mut qnew = [0.0f64; 4];
-        for row in 0..4 {
-            for col in 0..4 { qnew[row] += k[row*4+col] * q[col]; }
-        }
-        let n = (qnew[0]*qnew[0]+qnew[1]*qnew[1]+qnew[2]*qnew[2]+qnew[3]*qnew[3]).sqrt();
-        if n < 1e-30 { break; }
-        let inv = 1.0 / n;
-        let mut max_delta: f64 = 0.0;
-        for idx in 0..4 {
-            qnew[idx] *= inv;
-            max_delta = max_delta.max((qnew[idx] - q[idx]).abs());
-            q[idx] = qnew[idx];
-        }
-        if max_delta < 1e-14 { break; }
-    }
-    // Horn K-matrix eigenvector is [w, x, y, z] (scalar first), but Quat4d is (x, y, z, w)
+    let q = dominant_eigenvector_sym4(k, [q_warm.w, q_warm.x, q_warm.y, q_warm.z]);
     Quat4d::new(q[1], q[2], q[3], q[0])
 }
 
@@ -819,7 +916,8 @@ pub fn step_force_md(
 ) -> (f64, f64, f64) {
     let e_port = eval_port_forces(state, topo, fapos, tau);
     let e_nb = eval_nonbonded(state, topo, nbcfg, fapos);
-    let e = e_port + e_nb;
+    let e_box = eval_box_forces(state, &cfg.box_cfg, fapos);
+    let e = e_port + e_nb + e_box;
     let mut max_f: f64 = 0.0;
     let mut max_t: f64 = 0.0;
     for i in 0..topo.natoms {
@@ -848,6 +946,189 @@ pub fn step_force_md(
             state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
         }
     }
+    (e, max_f, max_t)
+}
+
+/// One inertial relaxation step with velocity reset (simple FIRE variant).
+/// Full inertia (independent of `cdamp`): v += F/m*dt; x += v*dt.
+/// When dot(v,F) < 0 (moving uphill): reset v=0 (kill kinetic energy).
+/// No adaptive dt, no mixing — just plain momentum + velocity reset.
+/// Uses Dynamic orientation (smooth rotation — Adiabatic snaps pump energy).
+pub fn step_inertial_reset(
+    state: &mut RaffState, topo: &RaffTopology, cfg: &RaffConfig,
+    fapos: &mut [Vec3d], tau: &mut [Vec3d],
+    nbcfg: &NbConfig,
+) -> (f64, f64, f64) {
+    let dt = cfg.dt;
+    let np = topo.natoms;
+    let e_port = eval_port_forces(state, topo, fapos, tau);
+    let e_nb = eval_nonbonded(state, topo, nbcfg, fapos);
+    let e_box = eval_box_forces(state, &cfg.box_cfg, fapos);
+    let e = e_port + e_nb + e_box;
+
+    let mut max_f = 0.0f64;
+    let mut max_t = 0.0f64;
+    let mut v_dot_f = 0.0f64;
+
+    // (1) v += F/m*dt, accumulate dot(v_new, F)
+    for i in 0..np {
+        let mut f = fapos[i];
+        let f2 = f.norm2();
+        if cfg.flim > 0.0 && f2 > cfg.flim * cfg.flim { f.mul(cfg.flim / f2.sqrt()); }
+        max_f = max_f.max(f2.sqrt());
+        fapos[i] = f;
+        state.vel[i] = state.vel[i] + f * (dt / topo.mass[i]);
+        v_dot_f += Vec3d::dot(state.vel[i], f);
+        if topo.inv_inertia[i] > 0.0 && topo.nport[i] > 0 {
+            let t = tau[i];
+            max_t = max_t.max(t.norm());
+            state.omega[i] = state.omega[i] + t * (topo.inv_inertia[i] * dt);
+        }
+    }
+
+    // (2) If moving uphill: kill velocity
+    if v_dot_f < 0.0 {
+        for i in 0..np {
+            state.vel[i] = VEC3D_ZERO;
+            state.omega[i] = VEC3D_ZERO;
+        }
+    }
+
+    // (3) x += v*dt
+    for i in 0..np {
+        state.pos[i].add_mul(state.vel[i], dt);
+        if topo.inv_inertia[i] > 0.0 && topo.nport[i] > 0 {
+            let dq = quat_from_omega_dt(state.omega[i], dt);
+            state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
+        }
+    }
+
+    (e, max_f, max_t)
+}
+
+// ==================================================================
+//  FIRE: Fast Inertial Relaxation Engine (Bitzek et al. 2006)
+//  Momentum-based relaxation with adaptive dt + dot(v,F)<0 velocity reset.
+//  Much faster than damped Euler for geometry relaxation — quasi-Newton
+//  behavior near the minimum. The standard algorithm used by real optimizers.
+// ==================================================================
+
+/// FIRE state — carried between steps. Controls adaptive timestep + damping.
+#[derive(Clone, Debug)]
+pub struct FireState {
+    pub dt: f64,           // current timestep (adaptive)
+    pub dt_max: f64,       // max timestep cap
+    pub alpha: f64,        // velocity mixing parameter (0=all force, 1=all velocity)
+    pub n_pos: usize,      // consecutive steps with dot(v,F) > 0
+    // FIRE parameters (defaults from the original paper)
+    pub n_min: usize,      // min positive steps before increasing dt (5)
+    pub f_inc: f64,        // dt increase factor per positive step after n_min (1.1)
+    pub f_dec: f64,        // dt decrease factor on uphill (0.5)
+    pub f_alpha: f64,      // alpha decrease factor (0.99)
+    pub alpha0: f64,       // initial alpha (0.1)
+}
+
+impl Default for FireState {
+    fn default() -> Self { Self { dt: 0.001, dt_max: 0.02, alpha: 0.1, n_pos: 0, n_min: 5, f_inc: 1.1, f_dec: 0.5, f_alpha: 0.99, alpha0: 0.1 } }
+}
+
+impl FireState {
+    pub fn new(dt0: f64, dt_max: f64) -> Self {
+        Self { dt: dt0, dt_max, alpha: 0.1, n_pos: 0,
+            n_min: 5, f_inc: 1.1, f_dec: 0.5, f_alpha: 0.99, alpha0: 0.1 }
+    }
+}
+
+/// One FIRE relaxation step (Bitzek et al. 2006, simplified Euler-like variant).
+/// Order: (1) eval F, (2) v += F/m*dt, (3) check dot(v,F), (4) mix or reset v, (5) x += v*dt.
+/// The mixing happens BEFORE the position update so the position step uses the mixed velocity.
+/// Returns (total_energy, max_force, max_torque).
+/// `fire` carries the adaptive dt/alpha state between steps. `cfg.dt` is ignored.
+pub fn step_fire(
+    state: &mut RaffState, topo: &RaffTopology, cfg: &RaffConfig,
+    fire: &mut FireState,
+    fapos: &mut [Vec3d], tau: &mut [Vec3d],
+    nbcfg: &NbConfig,
+) -> (f64, f64, f64) {
+    let dt = fire.dt;
+    let np = topo.natoms;
+
+    // (1) Evaluate forces at current position
+    let e_port = eval_port_forces(state, topo, fapos, tau);
+    let e_nb = eval_nonbonded(state, topo, nbcfg, fapos);
+    let e_box = eval_box_forces(state, &cfg.box_cfg, fapos);
+    let e = e_port + e_nb + e_box;
+
+    let mut max_f = 0.0f64;
+    let mut max_t = 0.0f64;
+    let mut v_dot_f = 0.0f64;  // dot(v_new, F) — computed AFTER velocity update
+    let mut v_norm2 = 0.0f64;   // |v_new|²
+    let mut f_norm2 = 0.0f64;
+
+    for i in 0..np {
+        let mut f = fapos[i];
+        let f2 = f.norm2();
+        if cfg.flim > 0.0 && f2 > cfg.flim * cfg.flim { f.mul(cfg.flim / f2.sqrt()); }
+        max_f = max_f.max(f2.sqrt());
+        fapos[i] = f;  // store clamped force for mixing step
+        f_norm2 += f2;
+        // (2) Velocity update: v += F/m * dt
+        state.vel[i] = state.vel[i] + f * (dt / topo.mass[i]);
+        // Accumulate dot(v_new, F) and |v_new|² for FIRE steering decision
+        v_dot_f += Vec3d::dot(state.vel[i], f);
+        v_norm2 += state.vel[i].norm2();
+        // Rotation: omega += tau * invI * dt
+        if topo.inv_inertia[i] > 0.0 && topo.nport[i] > 0 {
+            let t = tau[i];
+            max_t = max_t.max(t.norm());
+            state.omega[i] = state.omega[i] + t * (topo.inv_inertia[i] * dt);
+        }
+    }
+
+    // (3) FIRE mixing: if dot(v,F) > 0, steer v toward force direction
+    //     v = (1-alpha)*v + alpha*|v|*F_hat
+    if v_dot_f > 0.0 && f_norm2 > 1e-30 && v_norm2 > 1e-30 {
+        let v_mag = v_norm2.sqrt();
+        let f_mag = f_norm2.sqrt();
+        for i in 0..np {
+            let f = fapos[i];
+            let f_hat = f * (1.0 / f_mag);
+            state.vel[i] = state.vel[i] * (1.0 - fire.alpha) + f_hat * (fire.alpha * v_mag);
+            if topo.inv_inertia[i] > 0.0 && topo.nport[i] > 0 {
+                let t = tau[i];
+                let t_mag = t.norm();
+                if t_mag > 1e-30 {
+                    let t_hat = t * (1.0 / t_mag);
+                    state.omega[i] = state.omega[i] * (1.0 - fire.alpha) + t_hat * (fire.alpha * v_mag);
+                }
+            }
+        }
+        // Adaptive: increase dt, decrease alpha after n_min consecutive positive steps
+        fire.n_pos += 1;
+        if fire.n_pos > fire.n_min {
+            fire.dt = (fire.dt * fire.f_inc).min(fire.dt_max);
+            fire.alpha *= fire.f_alpha;
+        }
+    } else {
+        // (4) Moving uphill — stop! Reset velocity, decrease dt, reset alpha
+        fire.n_pos = 0;
+        fire.dt *= fire.f_dec;
+        fire.alpha = fire.alpha0;
+        for i in 0..np {
+            state.vel[i] = VEC3D_ZERO;
+            state.omega[i] = VEC3D_ZERO;
+        }
+    }
+
+    // (5) Position update: x += v * dt (with mixed/reset velocity)
+    for i in 0..np {
+        state.pos[i].add_mul(state.vel[i], dt);
+        if topo.inv_inertia[i] > 0.0 && topo.nport[i] > 0 {
+            let dq = quat_from_omega_dt(state.omega[i], dt);
+            state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
+        }
+    }
+
     (e, max_f, max_t)
 }
 
@@ -895,31 +1176,140 @@ pub fn solve_collisions(
     }
 }
 
-/// Full XPBD step: (1) predict x ← x + v·dt, (2) solve port constraints, (3) solve collisions,
-/// (4) v ← cdamp·(x_new - x_old)/dt. For relaxation (cdamp=0), pure constraint projection.
+/// Full position-based step: (1) predict x ← x + v·dt, (2) solve port constraints via the
+/// selected `PosSolver`, (3) v ← cdamp·(x_new - x_old)/dt. For relaxation (cdamp=0), pure
+/// constraint projection. Dispatches on `cfg.pos_solver` so all three variants (PBD-compliance,
+/// true XPBD, Projective Dynamics) share the same predict/velocity-update bookkeeping.
 pub fn step_xpbd(
+    state: &mut RaffState, topo: &RaffTopology, cfg: &RaffConfig,
+    nbcfg: &NbConfig,
+) -> f64 {
+    step_position_based(state, topo, cfg, nbcfg)
+}
+
+/// Dispatcher for the position-based solvers (Axis 2). Public so the benchmark can call it
+/// directly with a chosen `PosSolver` without going through `DynMode`/`step_xpbd`.
+///
+/// **Two-loop structure (proper PD, ported from FireCore `run_LinSolve`):**
+/// 1. **Predict** (outer, inertial): `x_pred = x + v·dt`. Always done when `pd_inertia=true`.
+///    For relaxation with `vel_reset=true`, this carries momentum between outer steps.
+/// 2. **Solve** (inner, linear): Jacobi/GS on the constraint system, with optional heavy-ball
+///    momentum. Typically 1-16 inner iterations per outer step.
+/// 3. **Corrector**: `v = (x_new - x_old) / dt`. Always done (not multiplied by cdamp).
+///    Then optional damping and generalized-power reset (`v·F + ω·τ < 0`).
+pub fn step_position_based(
     state: &mut RaffState, topo: &RaffTopology, cfg: &RaffConfig,
     nbcfg: &NbConfig,
 ) -> f64 {
     let dt2 = cfg.dt * cfg.dt;
     let np = topo.natoms;
 
-    // For adiabatic mode: solve rotations first (before any position changes)
+    // Rotational outer step: adiabatic = full Wahba re-solve; dynamic = predict q += ω·dt only.
+    // The inner Jacobi loop then corrects BOTH translation and rotation together (coupled substeps).
+    // No outer torque integration for dynamic Projective — the inner loop handles rotation.
     if cfg.orient_mode == OrientMode::Adiabatic {
         solve_all_rotations(state, topo);
+    } else if cfg.pos_solver == PosSolver::Projective {
+        // Predict rotation only: q_pred = exp(ω·dt/2) ⊗ q. No torque here — inner loop corrects.
+        for i in 0..np {
+            if topo.inv_inertia[i] <= 0.0 || topo.nport[i] == 0 { continue; }
+            state.omega[i].mul(cfg.rot_damp);
+            let dq = quat_from_omega_dt(state.omega[i], cfg.dt);
+            state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
+        }
     }
 
-    // Save old positions for velocity update
+    // Save old positions and quaternions for velocity/omega update
     let pos_old = state.pos.clone();
+    let quat_old = if cfg.orient_mode == OrientMode::Dynamic { state.quat.clone() } else { Vec::new() };
 
-    // (1) Predict: x_pred = x + v·dt (skip if cdamp=0 for pure relaxation)
-    if cfg.cdamp > 0.0 {
+    // (1) Predict: x_pred = x + v·dt
+    //     pd_inertia=true: always predict (proper PD — carries momentum between outer steps)
+    //     pd_inertia=false: skip if cdamp=0 (legacy projection-only mode — NOT real PD)
+    let do_predict = cfg.pd_inertia || cfg.cdamp > 0.0;
+    if do_predict {
         for i in 0..np {
             state.pos[i].add_mul(state.vel[i], cfg.dt);
         }
     }
 
-    // (2) Solve constraints iteratively
+    // (2) Solve constraints with the selected algorithm (inner loop)
+    match cfg.pos_solver {
+        PosSolver::PbdCompliance => solve_pbd_compliance(state, topo, cfg, nbcfg, dt2),
+        PosSolver::Xpbd          => solve_xpbd_lagged(state, topo, cfg, nbcfg, dt2),
+        PosSolver::Projective    => solve_projective_jacobi(state, topo, cfg, nbcfg, dt2),
+    }
+
+    // (2b) Box constraint: explicit position correction (harmonic spring, one Euler step).
+    //      Unilateral — doesn't fit pairwise inner solve, so apply as post-solve nudge.
+    //      δx = F_box * dt² / m = k*(limit - x) * dt² / m
+    if cfg.box_cfg.enabled {
+        let dt2_m: Vec<f64> = (0..np).map(|i| dt2 / topo.mass[i]).collect();
+        for i in 0..np {
+            let p = state.pos[i];
+            let k = cfg.box_cfg.k;
+            let s = dt2_m[i] * k;
+            if p.x < cfg.box_cfg.min.x { state.pos[i].x += s * (cfg.box_cfg.min.x - p.x); }
+            else if p.x > cfg.box_cfg.max.x { state.pos[i].x -= s * (p.x - cfg.box_cfg.max.x); }
+            if p.y < cfg.box_cfg.min.y { state.pos[i].y += s * (cfg.box_cfg.min.y - p.y); }
+            else if p.y > cfg.box_cfg.max.y { state.pos[i].y -= s * (p.y - cfg.box_cfg.max.y); }
+            if p.z < cfg.box_cfg.min.z { state.pos[i].z += s * (cfg.box_cfg.min.z - p.z); }
+            else if p.z > cfg.box_cfg.max.z { state.pos[i].z -= s * (p.z - cfg.box_cfg.max.z); }
+        }
+    }
+
+    // (3) Corrector: v = (x_new - x_old) / dt  (ALWAYS — not multiplied by cdamp)
+    //     This is the key fix: velocity carries momentum from the position change.
+    //     For dynamic mode: ω = (q_new - q_old) / dt  (quaternion difference → angular velocity)
+    for i in 0..np {
+        state.vel[i] = (state.pos[i] - pos_old[i]) * (1.0 / cfg.dt);
+    }
+    if cfg.orient_mode == OrientMode::Dynamic && !quat_old.is_empty() {
+        for i in 0..np {
+            if topo.inv_inertia[i] <= 0.0 || topo.nport[i] == 0 { continue; }
+            // ω from quaternion difference: dq = q_new ⊗ q_old⁻¹ → ω = 2*imag(dq)/dt
+            let dq = quat_mul(state.quat[i], quat_conj(quat_old[i]));
+            // Ensure shortest path (w >= 0)
+            let (wx, wy, wz, ww) = if dq.w < 0.0 { (-dq.x, -dq.y, -dq.z, -dq.w) } else { (dq.x, dq.y, dq.z, dq.w) };
+            let _ = ww;
+            state.omega[i] = Vec3d::new(wx, wy, wz) * (2.0 / cfg.dt);
+        }
+    }
+
+    // (3b) Optional damping: v *= cdamp (cdamp=0 = kill velocity, cdamp=1 = no damping)
+    //     For relaxation with full inertia: set cdamp=1 (no damping) + vel_reset=true.
+    if cfg.cdamp < 1.0 {
+        for i in 0..np {
+            state.vel[i].mul(cfg.cdamp);
+        }
+    }
+
+    // (3c) Evaluate final residual once; reset translational and angular momentum when total
+    // generalized power v·F + ω·τ is negative.
+    let mut fapos = vec![VEC3D_ZERO; np];
+    let mut tau = vec![VEC3D_ZERO; np];
+    let e = eval_port_forces(state, topo, &mut fapos, &mut tau);
+    let e_box = eval_box_forces(state, &cfg.box_cfg, &mut fapos);
+    if cfg.vel_reset {
+        let mut power = 0.0f64;
+        for i in 0..np {
+            power += Vec3d::dot(state.vel[i], fapos[i]);
+            if cfg.orient_mode == OrientMode::Dynamic { power += Vec3d::dot(state.omega[i], tau[i]); }
+        }
+        if power < 0.0 {
+            for i in 0..np { state.vel[i] = VEC3D_ZERO; state.omega[i] = VEC3D_ZERO; }
+        }
+    }
+    e + e_box
+}
+
+/// PBD with compliance (the original `step_xpbd` behavior, kept as a benchmark variant).
+/// λ = C/w_total each iteration (no lagged multiplier); over-relaxation via `xpbd_over_relax`.
+/// Gauss-Seidel (sequential within an iteration). Can over-correct/oscillate on stiff bonds.
+fn solve_pbd_compliance(
+    state: &mut RaffState, topo: &RaffTopology, cfg: &RaffConfig,
+    nbcfg: &NbConfig, dt2: f64,
+) {
     for iter in 0..cfg.xpbd_iters {
         for i in 0..topo.natoms {
             let npi = topo.nport[i] as usize;
@@ -940,9 +1330,9 @@ pub fn step_xpbd(
                 let diff = state.pos[j as usize] - tip;  // e = x_j - tip
                 let r = diff.norm();
                 if r < 1e-12 { continue; }
-                let n = diff * (1.0 / r);  // unit direction
+                let n = diff * (1.0 / r);  // unit direction tip→x_j
 
-                // XPBD denominator (§3.2 corrected): w_total = 1/m_i + 1/m_j + w_ang + α̃
+                // w_total = 1/m_i + 1/m_j + w_ang + α̃;  α̃ = 1/(k_p·dt²)
                 let inv_mi = 1.0 / topo.mass[i];
                 let inv_mj = 1.0 / topo.mass[j as usize];
                 let rxn = Vec3d::cross(r_arm, n);
@@ -953,8 +1343,7 @@ pub fn step_xpbd(
                 let c = r;  // C = |x_j - tip| = 0
                 let lambda = c / w_total * cfg.xpbd_over_relax;
 
-                // Position corrections: n points tip→x_j, so to reduce C:
-                // x_i moves +n (tip follows, toward x_j), x_j moves -n (toward tip)
+                // n points tip→x_j: x_i moves +n (tip follows, toward x_j), x_j moves -n (toward tip)
                 state.pos[i].add_mul(n, lambda * inv_mi);
                 state.pos[j as usize].add_mul(n, -lambda * inv_mj);
 
@@ -970,24 +1359,190 @@ pub fn step_xpbd(
         if cfg.orient_mode == OrientMode::Adiabatic {
             solve_all_rotations(state, topo);
         }
-
         // Collision constraints (position-based, same iteration as ports)
         if nbcfg.enabled && nbcfg.k_coll > 0.0 {
             solve_collisions(state, topo, nbcfg);
         }
         let _ = iter;
     }
+}
 
-    // (3) Velocity update: v = cdamp * (x_new - x_old) / dt
-    // Damping prevents velocity buildup from repeated constraint corrections.
-    for i in 0..np {
-        state.vel[i] = (state.pos[i] - pos_old[i]) * (cfg.cdamp / cfg.dt);
+/// True XPBD (Macklin et al. 2016) with lagged multipliers λ_acc per constraint.
+/// dλ = -(C + α̃·λ_acc)/w_total; λ_acc += dλ; Δx = dλ·w·∇C.
+/// Stiffness-independent: converges in the same number of iterations regardless of K
+/// (unlike PBD-compliance, which needs more iterations for stiffer bonds).
+///
+/// Constraint gradients: ∇_{x_i}C = -n, ∇_{x_j}C = +n (n = unit tip→x_j).
+/// Rotational gradient: ∇_θ C = r_arm × ∇_{x_i}C = -(r_arm × n), |∇_θ C|² = |r_arm×n|² = w_ang/invI.
+fn solve_xpbd_lagged(
+    state: &mut RaffState, topo: &RaffTopology, cfg: &RaffConfig,
+    nbcfg: &NbConfig, dt2: f64,
+) {
+    // Lagged multiplier per directed port slot: index = i*4 + s. Zeroed each macrostep.
+    let mut lambda_acc = vec![0.0f64; topo.natoms * 4];
+    for iter in 0..cfg.xpbd_iters {
+        for i in 0..topo.natoms {
+            let npi = topo.nport[i] as usize;
+            if npi == 0 { continue; }
+            let ns = topo.neighs[i].as_array();
+            let bs = topo.neigh_bs[i].as_array();
+            for s in 0..npi {
+                let j = ns[s];
+                if j < 0 { continue; }
+                let ib = bs[s];
+                if ib < 0 { continue; }
+                let par = topo.bond_params[ib as usize];
+                if par.k_p <= 0.0 { continue; }
+
+                let r0 = topo.port_local[i * 4 + s] * par.l0;
+                let r_arm = quat_rotate(state.quat[i], r0);
+                let tip = state.pos[i] + r_arm;
+                let diff = state.pos[j as usize] - tip;
+                let r = diff.norm();
+                if r < 1e-12 { continue; }
+                let n = diff * (1.0 / r);  // unit tip→x_j
+
+                let inv_mi = 1.0 / topo.mass[i];
+                let inv_mj = 1.0 / topo.mass[j as usize];
+                let rxn = Vec3d::cross(r_arm, n);
+                let w_ang = if cfg.orient_mode == OrientMode::Dynamic { rxn.norm2() * topo.inv_inertia[i] } else { 0.0 };
+                let alpha_tilde = 1.0 / (par.k_p * dt2);
+                let w_total = inv_mi + inv_mj + w_ang + alpha_tilde + 1e-12;
+
+                let c = r;
+                let la = &mut lambda_acc[i * 4 + s];
+                // dλ = -(C + α̃·λ_acc) / w_total
+                let dlambda = -(c + alpha_tilde * *la) / w_total;
+                *la += dlambda;
+
+                // Δx = dλ·w·∇C; ∇_{x_i}C = -n, ∇_{x_j}C = +n
+                // dλ < 0 → x_i moves +n (toward x_j), x_j moves -n (toward tip)
+                state.pos[i].add_mul(n, -dlambda * inv_mi);
+                state.pos[j as usize].add_mul(n, dlambda * inv_mj);
+
+                // Rotation correction (dynamic): Δθ = dλ·invI·(r_arm × ∇_{x_i}C) = -dlambda·invI·(r_arm×n)
+                if cfg.orient_mode == OrientMode::Dynamic && topo.inv_inertia[i] > 0.0 {
+                    let dtheta = rxn * (-dlambda * topo.inv_inertia[i]);
+                    let dq = quat_from_omega_dt(dtheta, 1.0);
+                    state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
+                }
+            }
+        }
+        if cfg.orient_mode == OrientMode::Adiabatic {
+            solve_all_rotations(state, topo);
+        }
+        if nbcfg.enabled && nbcfg.k_coll > 0.0 {
+            solve_collisions(state, topo, nbcfg);
+        }
+        let _ = iter;
     }
+}
 
-    // Report final energy
-    let mut fapos = vec![VEC3D_ZERO; np];
-    let mut tau = vec![VEC3D_ZERO; np];
-    eval_port_forces(state, topo, &mut fapos, &mut tau)
+/// Projective Dynamics (Bouaziz et al. 2014) — nonlinear local projection + fixed global
+/// quadratic step, solved by Jacobi with heavy-ball momentum acceleration.
+/// Ported from FireCore `ProjectiveDynamics_d::updateIterativeMomentum` (line 461-503).
+///
+/// Minimizes the proximal problem (§11.1):
+///   E(x) = 1/(2H²)(x-y)^T M (x-y) + Σ_ports ½ k_p |x_j - (x_i + r_arm_i)|²
+/// with r_arm linearized (held fixed per Jacobi sweep from current quat). The global step is
+/// diagonal (Jacobi): x_i ← b_i / A_ii where
+///   A_ii = M_i/H² + Σ_{ports of i} k_p + Σ_{ports pointing at i} k_p
+///   b_i  = M_i/H²·y_i + Σ_{ports of i} k_p·(x_j - r_arm_i) + Σ_{ports pointing at i} k_p·(x_owner + r_arm_owner)
+/// H = cfg.dt; y_i = predicted position (x_i after the predict step).
+///
+/// Heavy-ball momentum (FireCore SmartMixer): p_{k+1} = p'_k + bmix·d_k
+///   where d_k = p_k - p_{k-1} (stored in momentum buffer), bmix ramps 0→0.75.
+///   bmix=0 on first and last iteration (clean start/stop).
+fn solve_projective_jacobi(
+    state: &mut RaffState, topo: &RaffTopology, cfg: &RaffConfig,
+    nbcfg: &NbConfig, dt2: f64,
+) {
+    let np = topo.natoms;
+    assert!(dt2 > 0.0, "solve_projective_jacobi: dt² must be positive, got {dt2}");
+    assert!(cfg.xpbd_iters > 0, "solve_projective_jacobi: xpbd_iters must be positive");
+    let inv_h2 = 1.0 / dt2;
+    // Predicted target y and constant Jacobi diagonal A_ii = m_i/H² + Σ_owned k + Σ_incoming k.
+    let y = state.pos.clone();
+    let mut inv_diag: Vec<f64> = topo.mass.iter().map(|m| m * inv_h2).collect();
+    for i in 0..np {
+        let ns = topo.neighs[i].as_array();
+        let bs = topo.neigh_bs[i].as_array();
+        for s in 0..topo.nport[i] as usize {
+            let j = ns[s];
+            let ib = bs[s];
+            if j < 0 || ib < 0 { continue; }
+            let k = topo.bond_params[ib as usize].k_p;
+            if k <= 0.0 { continue; }
+            inv_diag[i] += k;
+            inv_diag[j as usize] += k;
+        }
+    }
+    for a in &mut inv_diag { *a = 1.0 / *a; }
+
+    // Scratch allocated once per outer step and reused by all inner iterations.
+    let mut rhs = vec![VEC3D_ZERO; np];
+    let mut tau = vec![VEC3D_ZERO; np];       // torque accumulator (dynamic mode only)
+    let mut k_rot = vec![0.0f64; np];         // rotational stiffness diagonal (dynamic mode only)
+    let mut x_new = vec![VEC3D_ZERO; np];
+    let mut momentum = vec![VEC3D_ZERO; np];
+    let dynamic = cfg.orient_mode == OrientMode::Dynamic;
+    for iter in 0..cfg.xpbd_iters {
+        // --- ONE port traversal: accumulate translational RHS and rotational torque together ---
+        for i in 0..np { rhs[i] = y[i] * (topo.mass[i] * inv_h2); }
+        if dynamic { for t in tau.iter_mut() { *t = VEC3D_ZERO; } for k in k_rot.iter_mut() { *k = 0.0; } }
+        for i in 0..np {
+            let ns = topo.neighs[i].as_array();
+            let bs = topo.neigh_bs[i].as_array();
+            let npi = topo.nport[i] as usize;
+            if npi == 0 { continue; }
+            let qi = state.quat[i];
+            for s in 0..npi {
+                let j = ns[s];
+                let ib = bs[s];
+                if j < 0 || ib < 0 { continue; }
+                let par = topo.bond_params[ib as usize];
+                if par.k_p <= 0.0 { continue; }
+                let r_arm = quat_rotate(qi, topo.port_local[i * 4 + s] * par.l0);
+                rhs[i].add_mul(state.pos[j as usize] - r_arm, par.k_p);
+                rhs[j as usize].add_mul(state.pos[i] + r_arm, par.k_p);
+                if dynamic && topo.inv_inertia[i] > 0.0 {
+                    let e = state.pos[j as usize] - (state.pos[i] + r_arm);  // port residual
+                    tau[i].add_mul(Vec3d::cross(r_arm, e), par.k_p);
+                    k_rot[i] += par.k_p * r_arm.norm2();
+                }
+            }
+        }
+        // --- Update both translation and rotation (cheap; force accumulation was the expensive part) ---
+        for i in 0..np { x_new[i] = rhs[i] * inv_diag[i]; }
+        if dynamic {
+            for i in 0..np {
+                if topo.inv_inertia[i] <= 0.0 || topo.nport[i] == 0 { continue; }
+                // Rotational Jacobi: δθ = τ / (I/dt² + K_rot). Inertia term pulls toward prediction (q_pred).
+                let denom = topo.inv_inertia[i] * inv_h2 + k_rot[i] + 1e-12;
+                let dtheta = tau[i] * (1.0 / denom);
+                let dq = quat_from_omega_dt(dtheta, 1.0);
+                state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
+            }
+        }
+
+        // Heavy-ball momentum: p_{k+1} = x_new + bmix*d_k; first/last iterations are unmixed.
+        let bmix = if iter == 0 || iter >= cfg.xpbd_iters - 1 { 0.0 }
+                   else if iter < cfg.bmix_istart { cfg.bmix_start }
+                   else if iter >= cfg.bmix_iend { cfg.bmix_end }
+                   else { cfg.bmix_start + (cfg.bmix_end - cfg.bmix_start) *
+                          (iter - cfg.bmix_istart) as f64 / (cfg.bmix_iend - cfg.bmix_istart) as f64 };
+        for i in 0..np {
+            let p = x_new[i] + momentum[i] * bmix;
+            momentum[i] = p - state.pos[i];
+            x_new[i] = p;
+        }
+        std::mem::swap(&mut state.pos, &mut x_new);
+        if cfg.orient_mode == OrientMode::Adiabatic { solve_all_rotations(state, topo); }
+    }
+    // Collisions after the global sweeps (PD can't fold a changing active set into the prefactor)
+    if nbcfg.enabled && nbcfg.k_coll > 0.0 {
+        for _ in 0..cfg.xpbd_iters { solve_collisions(state, topo, nbcfg); }
+    }
 }
 
 // ==================================================================
@@ -1227,4 +1782,102 @@ pub fn relax_xpbd(
         last_e = e;
     }
     (last_e, max_steps, false)
+}
+
+/// Relax using the selected position-based solver. Returns
+/// (final_energy, n_macrosteps, converged, n_port_force_evals).
+/// `n_port_force_evals` counts every call to `eval_port_forces` (the expensive O(N·ports) work)
+/// — the theory doc §11.5/§11.7 identifies this, not wall time, as the cross-solver performance
+/// objective. Adiabatic orientation re-solves rotations (which internally evaluates port arms,
+/// not full forces) — those are counted separately if needed; here we count only
+/// `eval_port_forces` calls made by the relax loop for convergence checking.
+pub fn relax_position_based(
+    state: &mut RaffState, topo: &RaffTopology, cfg: &RaffConfig, nbcfg: &NbConfig,
+    max_steps: usize, e_tol: f64,
+) -> (f64, usize, bool, usize) {
+    let np = topo.natoms;
+    let mut last_e = f64::INFINITY;
+    let mut n_evals: usize = 0;
+    let mut fapos = vec![VEC3D_ZERO; np];
+    let mut tau = vec![VEC3D_ZERO; np];
+    for step in 0..max_steps {
+        let e = step_position_based(state, topo, cfg, nbcfg);
+        if step % 100 == 0 {
+            eprintln!("[relax_position_based {:?}] step {} E={:.6e}", cfg.pos_solver, step, e);
+        }
+        n_evals += 1;  // step_position_based reports energy via one eval_port_forces at the end
+        if (last_e - e).abs() < e_tol && step > 10 {
+            return (e, step + 1, true, n_evals);
+        }
+        last_e = e;
+    }
+    // final explicit energy for the caller
+    let e_final = eval_port_forces(state, topo, &mut fapos, &mut tau);
+    n_evals += 1;
+    let _ = (e_final, fapos, tau);
+    (last_e, max_steps, false, n_evals)
+}
+
+// ==================================================================
+//  Geometry comparison: Kabsch rigid-body alignment + RMSD
+//  Used by the convergence-to-same-geometry benchmark (Q2a). Both
+//  force-MD and position-based solvers are translation+rotation
+//  invariant, so absolute frames drift — compare aligned RMSD.
+// ==================================================================
+
+/// Optimal rigid-body alignment RMSD between two equal-length configs `a` and `b`
+/// (uniform masses). Finds the rotation R minimizing Σ|R a'_i − b'_i|² via the Horn
+/// K-matrix method (same as `solve_rotation_wahba` but on centroid-subtracted points),
+/// then returns sqrt( (1/N) Σ |R a'_i − b'_i|² ). Reflects are excluded (proper rotation).
+pub fn kabsch_rmsd(a: &[Vec3d], b: &[Vec3d]) -> f64 {
+    let n = a.len();
+    assert_eq!(n, b.len(), "kabsch_rmsd: len mismatch a={} b={}", n, b.len());
+    assert!(n >= 3, "kabsch_rmsd: need >=3 points for a well-defined rotation, got {}", n);
+    // Centroids
+    let mut ca = VEC3D_ZERO; let mut cb = VEC3D_ZERO;
+    for i in 0..n { ca.add(a[i]); cb.add(b[i]); }
+    ca.mul(1.0 / n as f64); cb.mul(1.0 / n as f64);
+    // Centered cross-covariance H = Σ (a'_i)(b'_i)^T  (we want R: a' → b', so H = Σ a' (b')^T,
+    // matching solve_rotation_wahba's convention H = Σ r d^T → R·r = d, with r=a', d=b')
+    let mut h = Mat3d::zero();
+    for i in 0..n {
+        let ai = a[i] - ca;
+        let bi = b[i] - cb;
+        h.add_outer(ai, bi);  // H += a' (b')^T
+    }
+    // Horn K-matrix (shifted power iteration for robust dominant eigenvector)
+    let (hxx, hxy, hxz) = (h.a.x, h.a.y, h.a.z);
+    let (hyx, hyy, hyz) = (h.b.x, h.b.y, h.b.z);
+    let (hzx, hzy, hzz) = (h.c.x, h.c.y, h.c.z);
+    let tr = hxx + hyy + hzz;
+    let mut k = [0.0f64; 16];
+    k[0]=tr;                k[1]=hyz-hzy;       k[2]=hzx-hxz;       k[3]=hxy-hyx;
+    k[4]=hyz-hzy;           k[5]=hxx-hyy-hzz;   k[6]=hxy+hyx;       k[7]=hzx+hxz;
+    k[8]=hzx-hxz;           k[9]=hxy+hyx;       k[10]=hyy-hxx-hzz;  k[11]=hyz+hzy;
+    k[12]=hxy-hyx;          k[13]=hzx+hxz;      k[14]=hyz+hzy;      k[15]=hzz-hxx-hyy;
+    let k_frob = k.iter().map(|x| x*x).sum::<f64>().sqrt();
+    let shift = 2.0 * k_frob;
+    for i in 0..4 { k[i*5] += shift; }
+    let mut q = [1.0f64, 0.0, 0.0, 0.0]; // [w, x, y, z]
+    for _ in 0..128 {
+        let mut qn = [0.0f64; 4];
+        for row in 0..4 { for col in 0..4 { qn[row] += k[row*4+col]*q[col]; } }
+        let nrm = qn.iter().map(|x| x*x).sum::<f64>().sqrt();
+        if nrm < 1e-30 { break; }
+        let inv = 1.0 / nrm;
+        let mut max_delta = 0.0f64;
+        for idx in 0..4 { qn[idx] *= inv; max_delta = max_delta.max((qn[idx]-q[idx]).abs()); q[idx] = qn[idx]; }
+        if max_delta < 1e-15 { break; }
+    }
+    let qrot = Quat4d::new(q[1], q[2], q[3], q[0]); // (x,y,z,w)
+    // RMSD over aligned centered points
+    let mut sum = 0.0f64;
+    for i in 0..n {
+        let ai = a[i] - ca;
+        let bi = b[i] - cb;
+        let r = quat_rotate(qrot, ai);
+        let d = r - bi;
+        sum += d.norm2();
+    }
+    (sum / n as f64).sqrt()
 }

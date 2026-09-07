@@ -2,6 +2,7 @@ use numtypes::{Quat4d, Quat4i, QUAT4I_MINUS_ONES};
 use numtypes::{Vec3d, VEC3D_ZERO as VEC3_ZERO};
 use numtypes::AlignedVec;
 use moltopo::topology::Topology;
+use moltopo::params::{Params, uff_bond_length, uff_bond_k, uff_angle_sp3, bond_order_from_types, KCAL_TO_EV};
 
 #[derive(Default)]
 pub struct Buckets {
@@ -658,6 +659,230 @@ impl Uff {
         // Inversions: disabled
         for ii in 0..self.ninversions as usize {
             self.inv_params.as_mut_slice()[ii] = [0.0, 1.0, -1.0, 0.0];
+        }
+    }
+
+    // ======================== REAL UFF PARAMETER ASSIGNMENT ========================
+    // Ported from FireCore cpp/common/molecular/UFFbuilder.h:assignUFFparams
+    // Fills bon_params, ang_params, dih_params, inv_params from Params + assigned UFF types.
+
+    /// Hybridization suffix character from UFF atom type name: '1', '2', 'R', or '3'.
+    /// Ported from FireCore UFFbuilder.h:1106 (params->atypes[...].name[2]).
+    #[inline] fn hyb_suffix(tname: &str) -> char {
+        if let Some(i) = tname.rfind('_') {
+            if i + 1 < tname.len() { return tname.chars().nth(i + 1).unwrap_or('3'); }
+        }
+        '3'
+    }
+
+    /// Element symbol from UFF atom type name (everything before '_').
+    #[inline] fn elem_sym(tname: &str) -> &str {
+        if let Some(i) = tname.find('_') { &tname[..i] } else { tname }
+    }
+
+    /// Compute UFF bond length rIJ for a bond between atoms with types ta, tb.
+    /// Ported from FireCore UFFbuilder.h:1043 assignUFFparams_calcrij.
+    fn calc_rij(params: &Params, ta: &str, tb: &str, bo: f64) -> f64 {
+        let (ti, ei) = match (params.get_atom_type(ta), params.element_of_atom_type(ta)) {
+            (Some(t), Some(e)) => (t, e), _ => return 1.5,
+        };
+        let (tj, ej) = match (params.get_atom_type(tb), params.element_of_atom_type(tb)) {
+            (Some(t), Some(e)) => (t, e), _ => return 1.5,
+        };
+        uff_bond_length(ti, tj, ei, ej, bo)
+    }
+
+    /// Assign real UFF parameters from atom types + topology.
+    /// `types` = assigned UFF atom type names (e.g. "C_R", "H_", "O_2").
+    /// `neighs` = per-atom neighbor lists (4 per atom, -1 padded).
+    /// Ported from FireCore UFFbuilder.h:assignUFFparams (lines 1336-1362).
+    pub fn setup_params(&mut self, params: &Params, types: &[String], neighs: &[Quat4i]) {
+        let natoms = self.natoms as usize;
+        assert_eq!(types.len(), natoms, "Uff::setup_params: types.len()={} != natoms={}", types.len(), natoms);
+        assert_eq!(neighs.len(), natoms, "Uff::setup_params: neighs.len()={} != natoms={}", neighs.len(), natoms);
+
+        // --- Bonds (UFFbuilder.h:1068) ---
+        for ib in 0..self.nbonds as usize {
+            let b = self.bon_atoms.as_slice()[ib];
+            let ta = &types[b[0] as usize];
+            let tb = &types[b[1] as usize];
+            let bo = bond_order_from_types(ta, tb);
+            let l0 = Self::calc_rij(params, ta, tb, bo);
+            let (ei, ej) = match (params.element_of_atom_type(ta), params.element_of_atom_type(tb)) {
+                (Some(ei), Some(ej)) => (ei, ej),
+                _ => { self.bon_params.as_mut_slice()[ib] = [100.0, l0]; continue; }
+            };
+            let k = uff_bond_k(ei, ej, l0);
+            self.bon_params.as_mut_slice()[ib] = [k, l0];
+        }
+
+        // --- Angles (UFFbuilder.h:1080) ---
+        // ang_atoms = [i, j, k] where j is the central atom.
+        // kappa = 28.7989 * Qi * Qk / rik^5 * (3*rij*rjk*st2 - rik^2*ct)
+        // Then c0..c3 depend on hybridization of central atom j.
+        let deg2rad = std::f64::consts::PI / 180.0;
+        for ia in 0..self.nangles as usize {
+            let a = self.ang_atoms.as_slice()[ia];
+            let (i, j, k) = (a[0] as usize, a[1] as usize, a[2] as usize);
+            let tj = &types[j];
+            let ti_name = &types[i];
+            let tk_name = &types[k];
+            // Skip if central atom is H (no angle term)
+            if Self::elem_sym(tj) == "H" {
+                self.ang_params.as_mut_slice()[ia] = [0.0, 0.0, 0.0, 0.0, 0.0];
+                continue;
+            }
+            let at_j = match params.get_atom_type(tj) {
+                Some(at) => at, None => { self.ang_params.as_mut_slice()[ia] = [0.0, 0.0, 0.0, 0.0, 0.0]; continue; }
+            };
+            let ei = match params.element_of_atom_type(ti_name) {
+                Some(e) => e, None => { self.ang_params.as_mut_slice()[ia] = [0.0, 0.0, 0.0, 0.0, 0.0]; continue; }
+            };
+            let ek = match params.element_of_atom_type(tk_name) {
+                Some(e) => e, None => { self.ang_params.as_mut_slice()[ia] = [0.0, 0.0, 0.0, 0.0, 0.0]; continue; }
+            };
+            let ct = (at_j.a_ss * deg2rad).cos();
+            let st2 = (at_j.a_ss * deg2rad).sin().powi(2);
+            let bo_ij = bond_order_from_types(ti_name, tj);
+            let bo_jk = bond_order_from_types(tj, tk_name);
+            let rij = Self::calc_rij(params, ti_name, tj, bo_ij);
+            let rjk = Self::calc_rij(params, tj, tk_name, bo_jk);
+            let rik = (rij * rij + rjk * rjk - 2.0 * rij * rjk * ct).sqrt();
+            let kappa = 28.7989689090648 * ei.q_uff * ek.q_uff / (rik.powi(5)) * (3.0 * rij * rjk * st2 - rik * rik * ct);
+            let hyb = Self::hyb_suffix(tj);
+            let (k_ang, c0, c1, c2, c3) = match hyb {
+                '1' => (kappa, 1.0, 1.0, 0.0, 0.0),         // sp1 (UFFbuilder.h:1108-1114)
+                '2' | 'R' => (kappa / 9.0, 1.0, 0.0, 0.0, -1.0), // sp2/aromatic (UFFbuilder.h:1115-1120)
+                '3' => {                                      // sp3 (UFFbuilder.h:1122-1127)
+                    let (c0, c1, c2, c3) = uff_angle_sp3(ct, st2);
+                    (kappa, c0, c1, c2, c3)
+                }
+                _ => (kappa, 1.0, 0.0, 0.0, -1.0),           // fallback: treat as sp2
+            };
+            self.ang_params.as_mut_slice()[ia] = [k_ang, c0, c1, c2, c3];
+        }
+
+        // --- Dihedrals (UFFbuilder.h:1136) ---
+        // dih_atoms = [i1, i2, i3, i4] where i2-i3 is the central bond.
+        // V, d, n depend on hybridization of i2 and i3.
+        // V is divided by 0.5*(nb2-1)*(nb3-1) where nb2, nb3 are neighbor counts of i2, i3.
+        for id in 0..self.ndihedrals as usize {
+            let d = self.dih_atoms.as_slice()[id];
+            let (i1, i2, i3, i4) = (d.x as usize, d.y as usize, d.z as usize, d.w as usize);
+            let t2 = &types[i2];
+            let t3 = &types[i3];
+            // Skip if either central atom is H or sp1 (UFFbuilder.h:1147-1148,1155)
+            if Self::elem_sym(t2) == "H" || Self::elem_sym(t3) == "H" {
+                self.dih_params.as_mut_slice()[id] = [0.0, 1.0, 3.0]; continue;
+            }
+            let h2 = Self::hyb_suffix(t2);
+            let h3 = Self::hyb_suffix(t3);
+            if h2 == '1' || h3 == '1' {
+                self.dih_params.as_mut_slice()[id] = [0.0, 1.0, 3.0]; continue;
+            }
+            let bsp3_2 = h2 == '3';
+            let bsp3_3 = h3 == '3';
+            let e2 = params.element_of_atom_type(t2);
+            let e3 = params.element_of_atom_type(t3);
+            let bo_23 = bond_order_from_types(t2, t3);
+            let (v, d_sign, n): (f64, f64, f64) = if bsp3_2 && bsp3_3 {
+                // * - sp3 - sp3 - * (UFFbuilder.h:1174-1188)
+                let v = (e2.map(|e| e.v_uff).unwrap_or(0.0) * e3.map(|e| e.v_uff).unwrap_or(0.0)).sqrt();
+                // Special case: group 16 sp3 - sp3 (O, S)
+                let el2 = Self::elem_sym(t2);
+                let el3 = Self::elem_sym(t3);
+                if (el2 == "O" || el2 == "S") && (el3 == "O" || el3 == "S") {
+                    let mut k = KCAL_TO_EV; // 1 kcal/mol
+                    if el2 == "O" { k *= 2.0; } else { k *= 6.8; }
+                    if el3 == "O" { k *= 2.0; } else { k *= 6.8; }
+                    (k.sqrt(), 1.0, 2.0)
+                } else {
+                    (v, 1.0, 3.0)
+                }
+            } else if (bsp3_2 && (h3 == '2' || h3 == 'R')) || ((h2 == '2' || h2 == 'R') && bsp3_3) {
+                // * - sp3 - sp2 - * (UFFbuilder.h:1190-1234)
+                let mut v = KCAL_TO_EV; // 1 kcal/mol
+                let mut d_sign = -1.0;
+                let mut n = 6.0;
+                // Special case: group 16 sp3 - sp2 (UFFbuilder.h:1197-1204)
+                let el_sp3 = if bsp3_2 { Self::elem_sym(t2) } else { Self::elem_sym(t3) };
+                if el_sp3 == "O" || el_sp3 == "S" {
+                    v = 5.0 * (e2.map(|e| e.u_uff).unwrap_or(0.0) * e3.map(|e| e.u_uff).unwrap_or(0.0)).sqrt() * (1.0 + 4.18 * bo_23.ln());
+                    d_sign = 1.0;
+                    n = 2.0;
+                }
+                // Special case: sp3 bonded to another sp2 (UFFbuilder.h:1206-1233)
+                let (sp3_idx, sp2_idx) = if bsp3_2 { (i2, i3) } else { (i3, i2) };
+                let sp2_neighs = neighs[sp2_idx].as_array();
+                let has_sp2_neighbor = sp2_neighs.iter().take_while(|&&n| n >= 0).any(|&n| {
+                    if n as usize == sp3_idx { return false; }
+                    let hn = Self::hyb_suffix(&types[n as usize]);
+                    hn == '2' || hn == 'R'
+                });
+                if has_sp2_neighbor {
+                    v = 2.0 * KCAL_TO_EV; // 2 kcal/mol
+                    d_sign = 1.0;
+                    n = 3.0;
+                }
+                (v, d_sign, n)
+            } else if (h2 == '2' || h2 == 'R') && (h3 == '2' || h3 == 'R') {
+                // * - sp2 - sp2 - * (UFFbuilder.h:1236-1243)
+                let v = 5.0 * (e2.map(|e| e.u_uff).unwrap_or(0.0) * e3.map(|e| e.u_uff).unwrap_or(0.0)).sqrt() * (1.0 + 4.18 * bo_23.ln());
+                (v, -1.0, 2.0)
+            } else {
+                // Unknown case — disable (should not happen for well-typed molecules)
+                eprintln!("WARNING: Uff::setup_params: dihedral case not found for {}-{}-{}-{} (types {} {} {} {})",
+                    i1, i2, i3, i4, types[i1], types[i2], types[i3], types[i4]);
+                (0.0, 1.0, 3.0)
+            };
+            // Divide by 0.5*(nb2-1)*(nb3-1) (UFFbuilder.h:1249)
+            let nb2 = neighs[i2].as_array().iter().take_while(|&&n| n >= 0).count() as f64;
+            let nb3 = neighs[i3].as_array().iter().take_while(|&&n| n >= 0).count() as f64;
+            let denom = 0.5 * (nb2 - 1.0) * (nb3 - 1.0);
+            let v_final = if denom > 0.0 { v / denom } else { v };
+            self.dih_params.as_mut_slice()[id] = [v_final, d_sign, n];
+        }
+
+        // --- Inversions (UFFbuilder.h:1260-1334) ---
+        // inv_atoms = [i1, i2, i3, i4] where i1 is the central trigonal atom.
+        // 3 inversions per center (generated by build_inversions_from_bonds).
+        // K is divided by 3 to avoid triple-counting.
+        for ii in 0..self.ninversions as usize {
+            let inv = self.inv_atoms.as_slice()[ii];
+            let i1 = inv.x as usize;
+            let t1 = &types[i1];
+            let el1 = Self::elem_sym(t1);
+            let h1 = Self::hyb_suffix(t1);
+            let (k_inv, c0, c1, c2) = if el1 == "C" && (h1 == '2' || h1 == 'R') {
+                // sp2 carbon (UFFbuilder.h:1276-1285)
+                // Check for carbonyl (C=O neighbor)
+                let neighbors = neighs[i1].as_array();
+                let is_carbonyl = neighbors.iter().take_while(|&&n| n >= 0).any(|&n| {
+                    let tn = &types[n as usize];
+                    Self::elem_sym(tn) == "O" && Self::hyb_suffix(tn) == '2'
+                });
+                let k = if is_carbonyl { 50.0 * KCAL_TO_EV } else { 6.0 * KCAL_TO_EV };
+                (k, 1.0, -1.0, 0.0)
+            } else if el1 == "N" && (h1 == '2' || h1 == 'R') {
+                // sp2 nitrogen (UFFbuilder.h:1288-1292)
+                (6.0 * KCAL_TO_EV, 1.0, -1.0, 0.0)
+            } else if el1 == "N" && h1 == '3' {
+                // sp3 nitrogen — no inversion (UFFbuilder.h:1295-1299)
+                (0.0, 0.0, 0.0, 0.0)
+            } else if el1 == "P" {
+                // Group 15 (UFFbuilder.h:1302-1307)
+                let omega0 = 84.4339 * deg2rad;
+                let c0 = 4.0 * omega0.cos().powi(2) - (2.0 * omega0).cos();
+                let c1 = -4.0 * omega0.cos();
+                let c2 = 1.0;
+                let k = 22.0 * KCAL_TO_EV / (c0 + c1 + c2);
+                (k, c0, c1, c2)
+            } else {
+                // No inversion for this atom type — disable
+                (0.0, 0.0, 0.0, 0.0)
+            };
+            // Divide K by 3 (UFFbuilder.h:1313) — 3 inversions per center
+            self.inv_params.as_mut_slice()[ii] = [k_inv / 3.0, c0, c1, c2];
         }
     }
 

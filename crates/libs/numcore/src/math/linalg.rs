@@ -89,6 +89,74 @@ fn atan2_safe(y: f32, x: f32) -> f32 {
     y.atan2(x)
 }
 
+// ============================================================================
+// Dense f64 linear algebra for small matrices (multigrid coarse-space solves).
+// Coarse space is ≤ a few hundred DOF, so dense is fine. Row-major layout.
+// ============================================================================
+
+/// Cholesky factorization of a dense SPD matrix A (n×n, row-major) into L (lower triangular,
+/// row-major) with A = L·Lᵀ. Returns L packed into n² (full n×n, upper triangle zeroed).
+/// Fails loud (per AGENTS.md Fail Fast) if A is not SPD: diagonal ≤ 0 or negative sqrt.
+/// Ported conceptually from NumericalMathPlayground/LinarElasticity/MultiGrid.galerkin_coarse_operator
+/// which uses scipy.linalg.lu_factor; Cholesky is preferred for SPD coarse operators.
+pub fn cholesky_factor_f64(a: &[f64], n: usize) -> Vec<f64> {
+    assert_eq!(a.len(), n * n, "cholesky_factor_f64: input len {} != n²={}", a.len(), n * n);
+    let mut l = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            let mut s = a[i * n + j];
+            for k in 0..j { s -= l[i * n + k] * l[j * n + k]; }
+            if i == j {
+                assert!(s > 0.0, "cholesky_factor_f64: matrix not SPD at diag[{i}]={s:.3e} (≤0). A may be singular — check Galerkin operator regularization or prolongation rank.");
+                l[i * n + j] = s.sqrt();
+            } else {
+                let ljj = l[j * n + j];
+                assert!(ljj > 0.0, "cholesky_factor_f64: zero pivot L[{j},{j}] during factor at i={i}");
+                l[i * n + j] = s / ljj;
+            }
+        }
+    }
+    l
+}
+
+/// Solve A·x = b given Cholesky factor L (from cholesky_factor_f64). A = L·Lᵀ.
+/// Forward solve L·y = b, then back solve Lᵀ·x = y. Returns x (length n).
+pub fn cholesky_solve_f64(l: &[f64], b: &[f64], n: usize) -> Vec<f64> {
+    assert_eq!(l.len(), n * n, "cholesky_solve_f64: L len {} != n²={}", l.len(), n * n);
+    assert_eq!(b.len(), n, "cholesky_solve_f64: b len {} != n={}", b.len(), n);
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        let mut s = b[i];
+        for k in 0..i { s -= l[i * n + k] * y[k]; }
+        let lii = l[i * n + i];
+        assert!(lii > 0.0, "cholesky_solve_f64: zero diagonal L[{i},{i}]={lii}");
+        y[i] = s / lii;
+    }
+    let mut x = vec![0.0f64; n];
+    for ii in 0..n {
+        let i = n - 1 - ii;
+        let mut s = y[i];
+        for k in (i + 1)..n { s -= l[k * n + i] * x[k]; }   // Lᵀ[i,k] = L[k,i]
+        let lii = l[i * n + i];
+        x[i] = s / lii;
+    }
+    x
+}
+
+/// Dense matvec y = A·x for row-major n×n A. (Used by Galerkin coarse operator application.)
+#[inline(always)]
+pub fn dense_matvec_f64(a: &[f64], x: &[f64], n: usize) -> Vec<f64> {
+    assert_eq!(a.len(), n * n);
+    assert_eq!(x.len(), n);
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        let mut s = 0.0;
+        for j in 0..n { s += a[i * n + j] * x[j]; }
+        y[i] = s;
+    }
+    y
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +231,48 @@ mod tests {
         // eigenvector for smallest should be ~[1,0,0]
         let (_, v) = &eig[0];
         assert!(v[0].abs() > 0.99, "expected x-axis eigenvector, got [{},{},{}]", v[0], v[1], v[2]);
+    }
+
+    #[test]
+    fn test_cholesky_identity() {
+        let n = 3;
+        let a = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let l = cholesky_factor_f64(&a, n);
+        // L should be identity
+        for i in 0..n { for j in 0..n { let exp = if i == j { 1.0 } else { 0.0 }; assert!((l[i*n+j] - exp).abs() < 1e-12, "L[{},{}]={}", i, j, l[i*n+j]); } }
+        let b = vec![1.0, 2.0, 3.0];
+        let x = cholesky_solve_f64(&l, &b, n);
+        for i in 0..n { assert!((x[i] - b[i]).abs() < 1e-12, "x[{}]={} expected {}", i, x[i], b[i]); }
+    }
+
+    #[test]
+    fn test_cholesky_spd_solve() {
+        // A = [[4, 2], [2, 3]] — SPD (eigenvalues 1, 5). Solve A x = [1, 1].
+        // x = A⁻¹ b = (1/8) [[3,-2],[-2,4]] [1,1] = [1/8, 2/8] = [0.125, 0.25]
+        let n = 2;
+        let a = vec![4.0, 2.0, 2.0, 3.0];
+        let l = cholesky_factor_f64(&a, n);
+        let b = vec![1.0, 1.0];
+        let x = cholesky_solve_f64(&l, &b, n);
+        assert!((x[0] - 0.125).abs() < 1e-12, "x[0]={} expected 0.125", x[0]);
+        assert!((x[1] - 0.25).abs() < 1e-12, "x[1]={} expected 0.25", x[1]);
+        // Verify residual A x - b ≈ 0
+        let ax = dense_matvec_f64(&a, &x, n);
+        for i in 0..n { assert!((ax[i] - b[i]).abs() < 1e-12, "residual[{}]={}", i, ax[i] - b[i]); }
+    }
+
+    #[test]
+    fn test_cholesky_4x4() {
+        // A = L0 L0ᵀ with known L0, then check factor recovers it (up to signs)
+        let n = 4;
+        let l0 = vec![2.0, 0.0, 0.0, 0.0,  1.0, 3.0, 0.0, 0.0,  0.5, 1.0, 2.0, 0.0,  1.0, 0.0, 1.0, 4.0];
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n { for j in 0..n { for k in 0..n { a[i*n+j] += l0[i*n+k] * l0[j*n+k]; } } } // A = L0 L0ᵀ
+        let l = cholesky_factor_f64(&a, n);
+        for i in 0..n { for j in 0..=i { assert!((l[i*n+j] - l0[i*n+j]).abs() < 1e-9, "L[{},{}]={} expected {}", i, j, l[i*n+j], l0[i*n+j]); } }
+        let b = vec![3.0, 5.0, 7.0, 11.0];
+        let x = cholesky_solve_f64(&l, &b, n);
+        let ax = dense_matvec_f64(&a, &x, n);
+        for i in 0..n { assert!((ax[i] - b[i]).abs() < 1e-9, "residual[{}]={}", i, ax[i] - b[i]); }
     }
 }
