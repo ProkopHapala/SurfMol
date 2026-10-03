@@ -112,8 +112,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- load_topology: returns SimulationEngine with UFF + elements cached ---
     engine.register_fn("load_topology", |path: &str| -> Dynamic {
         match load_topology_from_json(path) {
-            Ok((ff, elements)) => {
-                let world = MolWorld::from_uff(ff);
+            Ok((ff, elements, apos)) => {
+                let mut world = MolWorld::from_uff(ff);
+                world.dyn_atoms.atoms.apos.as_mut_slice().copy_from_slice(&apos);  // from_uff does not carry positions
                 Dynamic::from(SimulationEngine::new(world, elements))
             }
             Err(e) => { eprintln!("Error loading topology: {}", e); Dynamic::from(()) }
@@ -126,17 +127,154 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (eb, ea, ed, ei, enb, es) = world.eval_forces();
         eb + ea + ed + ei + enb + es
     });
+    engine.register_fn("eval_forces_detail", |sim: &mut SimulationEngine| -> Array {
+        let mut world = sim.world.lock().unwrap();
+        let (eb, ea, ed, ei, enb, es) = world.eval_forces();
+        let mut arr = Array::new();
+        for e in [eb, ea, ed, ei, enb, es] { arr.push(e.into()); }
+        arr
+    });
+
+    // --- uff_diag: count + locate non-finite bonded params (NaN locators) ---
+    engine.register_fn("uff_diag", |sim: &mut SimulationEngine| -> String {
+        let world = sim.world.lock().unwrap();
+        let u = &world.uff;
+        let mut out = String::new();
+        for (i, p) in u.bon_params.as_slice().iter().enumerate().filter(|(_, p)| p.iter().any(|v| !v.is_finite())).take(5) {
+            out.push_str(&format!("  bond[{}] atoms={:?} params={:?}\n", i, u.bon_atoms.as_slice()[i], p));
+        }
+        for (i, p) in u.ang_params.as_slice().iter().enumerate().filter(|(_, p)| p.iter().any(|v| !v.is_finite())).take(5) {
+            out.push_str(&format!("  ang[{}] atoms={:?} params={:?}\n", i, u.ang_atoms.as_slice()[i], p));
+        }
+        for (i, p) in u.dih_params.as_slice().iter().enumerate().filter(|(_, p)| p.iter().any(|v| !v.is_finite())).take(5) {
+            out.push_str(&format!("  dih[{}] atoms={:?} params={:?}\n", i, u.dih_atoms.as_slice()[i].as_array(), p));
+        }
+        for (i, p) in u.inv_params.as_slice().iter().enumerate().filter(|(_, p)| p.iter().any(|v| !v.is_finite())).take(5) {
+            out.push_str(&format!("  inv[{}] atoms={:?} params={:?}\n", i, u.inv_atoms.as_slice()[i].as_array(), p));
+        }
+        if out.is_empty() { out.push_str("all bonded params finite\n"); }
+        out
+    });
+
+    // --- uff_nan_scan: eval each angle/dihedral/inversion kernel one at a
+    // time; report first non-finite energy with atom indices + positions. ---
+    engine.register_fn("uff_nan_scan", |sim: &mut SimulationEngine| -> String {
+        let mut world = sim.world.lock().unwrap();
+        let mut out = String::new();
+        let apos = world.dyn_atoms.atoms.apos.as_slice().to_vec();
+        let neighs = world.dyn_atoms.atoms.neighs.as_slice().to_vec();
+        let neigh_bs = world.dyn_atoms.atoms.neigh_bs.as_slice().to_vec();
+        let na = world.natoms();
+        let mut fapos = vec![numtypes::Vec3d::new(0.0, 0.0, 0.0); na];
+        // need hneigh filled: run bond eval first (updates hneigh)
+        for ia in 0..na { world.uff.eval_atom_bonds(ia, &apos, &mut fapos, &neighs, &neigh_bs); }
+        for ia in 0..world.uff.nangles as usize {
+            let e = world.uff.eval_angle_prokop(ia);
+            if !e.is_finite() {
+                let a = world.uff.ang_atoms.as_slice()[ia];
+                out.push_str(&format!("ANG[{}] atoms={:?} ngs={:?} pos={:?}\n", ia, a,
+                    world.uff.ang_ngs.as_slice()[ia], [apos[a[0] as usize], apos[a[1] as usize], apos[a[2] as usize]]));
+            }
+        }
+        for id in 0..world.uff.ndihedrals as usize {
+            let e = world.uff.eval_dihedral_prokop(id);
+            if !e.is_finite() {
+                let a = world.uff.dih_atoms.as_slice()[id].as_array();
+                out.push_str(&format!("DIH[{}] atoms={:?} ngs={:?} pos={:?}\n", id, a,
+                    world.uff.dih_ngs.as_slice()[id], [apos[a[0] as usize], apos[a[1] as usize], apos[a[2] as usize], apos[a[3] as usize]]));
+            }
+        }
+        for ii in 0..world.uff.ninversions as usize {
+            let e = world.uff.eval_inversion_prokop(ii);
+            if !e.is_finite() {
+                let a = world.uff.inv_atoms.as_slice()[ii].as_array();
+                out.push_str(&format!("INV[{}] atoms={:?} ngs={:?} pos={:?}\n", ii, a,
+                    world.uff.inv_ngs.as_slice()[ii], [apos[a[0] as usize], apos[a[1] as usize], apos[a[2] as usize], apos[a[3] as usize]]));
+            }
+        }
+        if out.is_empty() { out.push_str("no NaN in per-term eval\n"); }
+        out
+    });
     engine.register_fn("step_md", |sim: &mut SimulationEngine, dt: f64, flim: f64, damping: f64| {
         let mut world = sim.world.lock().unwrap();
         let cdamp = { let c = 1.0 - damping; if c < 0.0 { 0.0 } else { c } };
         for ia in 0..world.natoms() { world.move_atom_md(ia, dt, flim, cdamp); }
     });
-    engine.register_fn("relax", |sim: &mut SimulationEngine, niter: i32, dt: f64, fconv: f64, flim: f64, damping: f64| -> i32 {
+    engine.register_fn("relax", |sim: &mut SimulationEngine, niter: i64, dt: f64, fconv: f64, flim: f64, damping: f64| -> i64 {
         let mut world = sim.world.lock().unwrap();
-        world.run_md(niter, dt, fconv, flim, damping)
+        world.run_md(niter as i32, dt, fconv, flim, damping) as i64
     });
     engine.register_fn("get_natoms", |sim: &mut SimulationEngine| -> i32 {
         sim.world.lock().unwrap().natoms() as i32
+    });
+
+    // --- get_pos: current UFF-world positions as flat array [x0,y0,z0, ...] ---
+    engine.register_fn("get_pos", |sim: &mut SimulationEngine| -> Array {
+        let world = sim.world.lock().unwrap();
+        let mut arr = Array::new();
+        for p in world.dyn_atoms.atoms.apos.as_slice().iter().take(world.natoms()) {
+            arr.push(p.x.into()); arr.push(p.y.into()); arr.push(p.z.into());
+        }
+        arr
+    });
+
+    // --- save_xyz: write current UFF-world positions to an XYZ file ---
+    engine.register_fn("save_xyz", |sim: &mut SimulationEngine, path: &str| {
+        let world = sim.world.lock().unwrap();
+        let elements = sim.elements.lock().unwrap();
+        let n = world.natoms();
+        let mut s = format!("{}\nrelaxed structure\n", n);
+        for (i, p) in world.dyn_atoms.atoms.apos.as_slice().iter().take(n).enumerate() {
+            let el = elements.get(i).map(|s| s.as_str()).unwrap_or("C");
+            s.push_str(&format!("{} {:.6} {:.6} {:.6}\n", el, p.x, p.y, p.z));
+        }
+        std::fs::write(path, s).expect("save_xyz: write failed");
+    });
+
+    // --- relax_fire: FIRE minimizer on the UFF world (ported from surfmol test
+    // relax_pentacene_uff.rs — converges to fmax < fconv; the damped-MD `relax`
+    // does not converge on strained molecules). Returns steps used. ---
+    engine.register_fn("relax_fire", |sim: &mut SimulationEngine, niter: i64, dt0: f64, dt_max: f64, fconv: f64| -> i64 {
+        let mut world = sim.world.lock().unwrap();
+        let mut fire = FireState::new(dt0, dt_max);
+        let na = world.natoms();
+        let mut steps_done = 0i64;
+        for itr in 0..niter {
+            world.eval_forces();
+            let dt = fire.dt;
+            let mut v_dot_f = 0.0; let mut v_norm2 = 0.0; let mut f_norm2 = 0.0; let mut f2max = 0.0f64;
+            for ia in 0..na {
+                let f = world.dyn_atoms.fapos.as_slice()[ia];
+                let f2 = f.norm2();
+                if f2 > f2max { f2max = f2; }
+                f_norm2 += f2;
+                let mut v_new = world.dyn_atoms.vapos.as_slice()[ia];
+                v_new.add_mul(f, dt);
+                world.dyn_atoms.vapos.as_mut_slice()[ia] = v_new;
+                v_dot_f += Vec3d::dot(v_new, f);
+                v_norm2 += v_new.norm2();
+            }
+            if v_dot_f > 0.0 && f_norm2 > 1e-30 && v_norm2 > 1e-30 {
+                let v_mag = v_norm2.sqrt(); let f_mag = f_norm2.sqrt();
+                for ia in 0..na {
+                    let f_hat = Vec3d::set_mul(world.dyn_atoms.fapos.as_slice()[ia], 1.0 / f_mag);
+                    let v = world.dyn_atoms.vapos.as_slice()[ia];
+                    world.dyn_atoms.vapos.as_mut_slice()[ia] = Vec3d::set_lincomb(1.0 - fire.alpha, v, fire.alpha * v_mag, f_hat);
+                }
+                fire.n_pos += 1;
+                if fire.n_pos > fire.n_min { fire.dt = (fire.dt * fire.f_inc).min(fire.dt_max); fire.alpha *= fire.f_alpha; }
+            } else {
+                fire.n_pos = 0; fire.dt *= fire.f_dec; fire.alpha = fire.alpha0;
+                for v in world.dyn_atoms.vapos.as_mut_slice() { *v = Vec3d::new(0.0, 0.0, 0.0); }
+            }
+            for ia in 0..na {
+                let v = world.dyn_atoms.vapos.as_slice()[ia];
+                world.dyn_atoms.atoms.apos.as_mut_slice()[ia].add_mul(v, dt);
+            }
+            steps_done = (itr + 1) as i64;
+            if f2max.sqrt() < fconv { break; }
+        }
+        steps_done
     });
 
     // --- setup_uff_params: load .dat files and fill UFF parameter arrays ---
@@ -153,15 +291,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         params.load_bond_types(dir.join("BondTypes.dat"));
         params.load_angle_types(dir.join("AngleTypes.dat"));
         params.load_dihedral_types(dir.join("DihedralTypes.dat"));
-        let types = sim.elements.lock().unwrap().clone();
-        world.setup_uff_params(&params, &types);
+        // Assign real UFF types (C_R, N_3, O_2, H_, ...) from elements+topology.
+        // Passing raw element names to setup_uff_params yields zero params —
+        // mirrors relax_pentacene_uff.rs test.
+        let elements = sim.elements.lock().unwrap().clone();
         world.make_neigh_bs();
+        let neighs_arr: Vec<[i32; 4]> = world.dyn_atoms.neighs().iter().map(|q| q.as_array()).collect();
+        let types = moltopo::assign_uff::assign_uff_types(&elements, &neighs_arr);
+        world.setup_uff_params(&params, &types);
+        world.bonded_mode = surfmol::mol_world::BondedFFMode::Uff;   // actually USE UFF in eval_forces/relax (from_uff leaves RigidSp3 default)
         world.bake_angle_neighs();
         world.bake_dihedral_neighs();
         world.bake_inversion_neighs();
         world.map_atom_interactions();
         world.update_hneigh();
-        println!("[setup_uff_params] Loaded params from {} for {} atoms", data_dir, types.len());
+        println!("[setup_uff_params] Loaded params from {} for {} atoms; types: {}", data_dir, types.len(), types.join(" "));
+    });
+
+    // --- setup_nonbonded(sim, data_dir, cutoff): REQH LJ+Coulomb per-atom
+    // params from UFF types + 1-2/1-3 exclusion list (same wiring as editor) ---
+    engine.register_fn("setup_nonbonded", |sim: &mut SimulationEngine, data_dir: &str, cutoff: f64| {
+        use moltopo::params::Params;
+        let mut params = Params::new();
+        let dir = std::path::Path::new(data_dir);
+        params.load_element_types(dir.join("ElementTypes.dat"));
+        params.load_atom_types(dir.join("AtomTypes.dat"));
+        let elements = sim.elements.lock().unwrap().clone();
+        let mut world = sim.world.lock().unwrap();
+        world.make_neigh_bs();
+        let neighs_arr: Vec<[i32; 4]> = world.dyn_atoms.neighs().iter().map(|q| q.as_array()).collect();
+        let types = moltopo::assign_uff::assign_uff_types(&elements, &neighs_arr);
+        let na = world.natoms();
+        let mut nb = molff::nonbonded::NonBondedFF::new(na);
+        nb.set_cutoff(cutoff);
+        for i in 0..na {
+            nb.reqs.as_mut_slice()[i] = moltopo::params::get_reqh(&params, &types[i]);
+        }
+        nb.make_plqs(2.0);
+        nb.make_second_neighs(world.dyn_atoms.neighs(), na);
+        world.nonbonded = Some(nb);
+        println!("[setup_nonbonded] {} atoms, cutoff {} A", na, cutoff);
     });
 
     // === RAFF API ===
