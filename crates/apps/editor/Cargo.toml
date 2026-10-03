@@ -25,3 +25,4 @@ egui-winit = { workspace = true }
 egui-wgpu = { workspace = true }
 glam = { workspace = true }
 arboard = { workspace = true }
+rhai = { workspace = true }

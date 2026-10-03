@@ -26,6 +26,8 @@ Spatial acceleration is a separate concern from both graph data (`numtypes::grap
 | `crates/apps/editor/src/main.rs` | active | Editor integration: `--nmols N`, `--layout lattice\|random`, `--show-aabb` CLI flags. BroadPhase rebuilt each relaxation step. AABB visualization (green tight + red expanded by rcut). |
 | `crates/libs/molff/src/uff.rs` | active | Legacy: private `Buckets` struct for force-assembly spatial partition. Not using `spacc`. |
 | `crates/libs/molff/tests/test_broad_phase.rs` | active | **3 parity tests**: `test_broad_phase_parity_nonbonded` (2 molecules near), `test_broad_phase_parity_far_molecules` (2 molecules far, 0 BP pairs), `test_broad_phase_parity_raff` (RAFF non-bonded broad vs O(N²)). All passing. |
+| `crates/libs/molff/src/rarff2d.rs` `Grid2d` | active | **Cell-pair neighbor grid over `Buckets`** (reactive FF — topology-free): dx=rcut → strict 3×3 stencil; per non-empty cell intra-pairs + forward-halo gathered into contiguous scratch (RRsp3 ghost-list; preallocated, no hot allocs) + zero-skip scatter. Parity vs O(N²) exact (dE~1e-13). Benchmark `rarff2d_bench`: **14× at N≈3000, 66% of packed-baseline efficiency** at molecular density. |
+| `crates/libs/molff/src/rarff2d.rs` `Groups2d` | active | **Topology-free COG collision groups**: atoms join nearest group COG within `r_join` (spawn otherwise) — the `cluster_aabb_collision.md` pattern for a reactive FF with no fixed bonds. Per-group position-fit AABB + O(G²) overlap prune. Wins only on fragmented scenes; a contiguous sheet merges into few giant overlapping AABBs (no culling). Parity vs O(N²) exact. |
 | FireCore `cpp/common/dataStructures/Buckets.h` | reference | C++ reference: count→prefix→scatter spatial hashing. Same pattern as `spacc::Buckets`. |
 | FireCore `cpp/common/molecular/NBFF.h` | reference | C++ reference: `initBBsFromGroups()` — group AABB fitting dataflow. `evalSortRange_BBs()` — bucket-pair broad phase loop (mirrored by `broad_phase_pairs`). |
 | FireCore `cpp/common/molecular/MMFFBuilder.h` | reference | C++ reference: fragment/group bounding for collision. |
@@ -45,7 +47,7 @@ Spatial acceleration is a separate concern from both graph data (`numtypes::grap
 | **Broad-phase non-bonded eval** (`eval_broad`) | `molff::nonbonded` | `NBFF.h` | **Parity verified** — `eval_broad` produces identical forces/energy as `eval` (O(N²)). 3 tests in `test_broad_phase.rs`. Energy doubled to match `eval`'s double-counted convention. |
 | Force assembly buckets | `molff::uff::Buckets` (private) | `UFF.h` | `molff` has its own `Buckets` not using `spacc`. Should migrate. |
 
-Tests: 8 tests in `spacc` (aabb contains/fit/range-fit/broad-phase-pairs, buckets basic/empty/skip-unassigned). 3 parity tests in `molff/tests/test_broad_phase.rs`. 5 tests in `numtypes` (aabb basic/overlap/overlap-margin/sphere-overlap, sym3).
+Tests: 8 tests in `spacc` (aabb contains/fit/range-fit/broad-phase-pairs, buckets basic/empty/skip-unassigned). 3 parity tests in `molff/tests/test_broad_phase.rs`. 5 tests in `numtypes` (aabb basic/overlap/overlap-margin/sphere-overlap, sym3). `test_rarff2d.rs::test_grid_parity` covers grid AND COG-group parity vs O(N²) (E/F/τ/eatom ~1e-13).
 
 ## Open Issues
 

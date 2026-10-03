@@ -39,6 +39,8 @@ When implementing or debugging a topic (e.g. "UFF bond evaluation", "AABB collis
 - **`multigrid.md`** — Multigrid V-cycle solver for truss-elasticity (bond-stretch Hessian). Parity with NumericalMathPlayground `LinarElasticity/`. Rust CPU implemented + tested; OpenCL kernels copied but not wired; molecule benchmarks underperforming (debugging in progress). **Populated 2026-08-29.**
 - **`gridff_faf.md`** — GridFF and FAF OpenCL macro fragment architecture: build/eval split, `//>>>function`/`//>>>macro` conventions, macro-injection contract for sharing NBFF primitives across UFF/SPFF/RAFF/RigidMolFF. Documents the macro-variant principle (N+M fragments instead of N×M kernel files) and the **3-axis NB kernel template** (`getNonBond_generic.cl`: pairwise × exclusion × surface injection). **Populated 2026-08-29.**
 
+- **`rarff2d.md`** — RARFF-2D cross-implementation map: rod-free orientation-gated reactive pair potential (gated Morse + ring entities + polynomial exp), repair/assembly demos, interactive viewer. Notes gate phase pitfalls, open issues (w tuning, mutual-gate verification, 1 A grid acceleration). **Populated 2026-10-03.**
+
 ## Status
 
-Six topics populated (`uff`, `graph_algorithms`, `spatial_acceleration`, `raff`, `multigrid`, `gridff_faf`). Remaining topics are placeholders — populate per topic as implementations are ported. Cross-reference `Import_other_Repos.md` for source locations in reference repos.
+Seven topics populated (`uff`, `graph_algorithms`, `spatial_acceleration`, `raff`, `multigrid`, `gridff_faf`, `rarff2d`). Remaining topics are placeholders — populate per topic as implementations are ported. Cross-reference `Import_other_Repos.md` for source locations in reference repos.

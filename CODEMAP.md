@@ -71,7 +71,7 @@ crates/apps/   (4 binary crates)
 Apps depend on libs:
 - `buildff` → moltopo, numcore
 - `molengine` → surfmol, molff, moltopo, numcore
-- `editor` → surfmol, molff, surfff, moltopo, numcore, molgui, molrender, **spacc** (for `aabb_edges` visualization)
+- `editor` → surfmol, molff, surfff, moltopo, numcore, molgui, molrender, **spacc** (for `aabb_edges` visualization). Second bin **`src/bin/rarff2d_view.rs`** — interactive rarff2d sandbox (drag atoms + live probe-potential E-map).
 - `molbrowser` → moltopo, numcore, molgui, molrender
 
 **Note:** `molff` now depends on `spacc` (for `BroadPhase` struct using `broad_phase_pairs` + `fit_range_aabbs`).
@@ -177,13 +177,18 @@ Ported from `blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_
 | `src/rigid_sp3.rs` | 237 | `RigidSp3FF` — **legacy** port-based rigid body FF (single variant: Dynamic+ForceMD). Superseded by `raff.rs`. |
 | `src/raff.rs` | 1550 | **RAFF** — multi-variant port-based rigid-atom FF. `RaffTopology`/`RaffState`/`RaffConfig`/`NbConfig`/`BoxCfg`/`PosSolver`/`FireState`. Port forces, Wahba/Horn rotation solver, `step_force_md`, `step_inertial_reset`, `step_fire`, `step_position_based` (dispatches to `PbdCompliance`/`Xpbd`/`Projective`), `step_proximal`, `solve_collisions`, `eval_nonbonded`, **`eval_nonbonded_broad`**, **`eval_box_forces`** (harmonic AABB constraint), `kabsch_rmsd`, FD checks. See `/doc/topical_audit/raff.md` and `/userguide/raff.md`. |
 | `src/multigrid.rs` | ~500 | **Multigrid V-cycle solver** for truss-elasticity (bond-stretch Hessian). `TrussOp` (matrix-free matvec, diagonal blocks), `jacobi_smooth` (damped block Jacobi), `select_pivots_maximin` + `build_pivot_prolongation` (geometric coarse basis), `galerkin_coarse` + `solve_two_grid`/`solve_multigrid` (V-cycle), `dense_solve` (test reference). Parity with NumericalMathPlayground `LinarElasticity/`. See `/doc/topical_audit/multigrid.md`. |
+| `src/rarff2d.rs` | ~750 | **RARFF-2D** — rod-free orientation-gated reactive pair FF (2D CPU prototype for invAFM geometry repair). `E = a(e²−2e·g_i·g_j)` gated Morse (`pex` poly-exp, **transcendental-free** `pair_math`: `r2`-early-exit, `phase_half`/`gate_cs` complex-power gates — no atan2/sin/cos), `Ring2d` hexagon/pentagon entities (site bump + poly-Morse core), `step_md`/`step_gd` (trust-region GD repair), `fd_check`, `field_at` (probe E-map), `arena` confinement, per-atom `eatom` consistency map. **Broad-phase**: `Grid2d` (Buckets-backed cell-pair loop + halo-gather scratch) & `Groups2d` (topology-free COG + AABB) — parity-exact, 14× @ N≈3000. `dbg_*` counters/pass-timers. See `/doc/topical_audit/rarff2d.md`. |
 | `src/bin/raff_bench.rs` | 185 | **Benchmark binary** — parameter sweep of all 3 position-based solvers + force-MD. Reports n_steps, n_port_evals, t_wall_us. Run: `cargo run --release -p molff --bin raff_bench`. |
+| `src/bin/rarff2d_demo.rs` | ~100 | **Repair demo** — corrupted naphthalene + 2 ring entities, displaced atom ± spurious atom; GD relax + FD checks + CSV/XYZ dumps → `debug/rarff2d_dyn/`. |
+| `src/bin/rarff2d_assemble.rs` | ~100 | **Self-assembly demo** — N random sp2 atoms in soft arena → damped MD → bonded graph (hexagons emerge); `--seed/--n/--arena/--out`; traj.xyz + bond detection → `debug/rarff2d_assemble*/`. |
+| `src/bin/rarff2d_bench.rs` | ~170 | **Accel benchmark** — O(N²) vs `Grid2d` (dx sweep) vs COG `Groups2d` on a hexagonal lattice (a=1.3, 70% fill, non-commensurate); packed-baseline efficiency, pair/ninside counters, per-pass timers; `--n/--reps`; dumps `debug/rarff2d_bench/{scenario,groups}.csv` → `scripts/plot_rarff2d_bench.py`. |
 | `tests/test_rigid_sp3.rs` | 110 | Tetrahedral sp3 center (CH4-like) + water test. |
 | `tests/test_raff.rs` | 607 | 22 tests: port forces, rotation convergence, energy/momentum conservation, XPBD constraints, collisions, adiabatic torque residual. All passing. |
 | `tests/test_raff_convergence.rs` | 216 | 4 tests: force-MD + all 3 position-based solvers converge to same geometry (Kabsch RMSD < 1e-3). Kabsch invariants. chain4 dihedral null space. All passing. |
 | `tests/test_broad_phase.rs` | 177 | **3 parity tests**: broad-phase vs O(N²) for `NonBondedFF::eval_broad` and `raff::eval_nonbonded_broad`. Near/far molecule configurations. All passing. |
 | `tests/test_multigrid.rs` | ~200 | **4 tests**: T1 matvec parity (vs dense), T2 diagonal-block parity, T3 direct-solve parity (MG vs Gaussian elimination), T4 convergence vs Jacobi (8×8 grid, 3.9× fewer smoothing steps: 144 vs 561). All passing. See `/doc/topical_audit/multigrid.md`. |
 | `tests/test_multigrid_molecules.rs` | ~165 | **3 cantilever benchmarks**: pentacene (rigid stick), n-hexadecane (flexible rope), DiTriptyceno-helicene (branching I-beam). Compares direct vs Jacobi vs MG (manual + automatic pivots). All passing. Linear V-cycle retained as diagnostic; modal approach is the primary strategy — see `/notes/reports/2026-08-29_multigrid_consolidated_report.md`. |
+| `tests/test_rarff2d.rs` | ~200 | **9 tests**: pair equilibrium, FD parity (forces+torques), anti-node/off-axis repulsion, bend3 → ~120°, hexagon relax, ring+pair hexagon, ring pulls atoms to sites, grid+COG-groups parity vs O(N²). All passing. |
 
 ### `surfff` (`crates/libs/surfff/`, 512 LOC)
 *Surface interaction forcefield — CPU reference for FAF (folded atomic forcefield).*
@@ -382,6 +387,7 @@ cargo clippy --workspace                 # lints
 | `TrussOp` | molff | Matrix-free truss operator for multigrid: bonds (ei, ej, k_eff, n_dirs) + mass_dt2. `matvec`, `diagonal_blocks`, `assemble_dense`. See `/doc/topical_audit/multigrid.md`. |
 | `SurfaceFolded` | surfff | Separable Fourier basis surface potential |
 | `MolWorld` | surfmol | Coordinator: DynamicAtoms + Uff + RigidSp3FF + optional NonBondedFF/SurfaceFolded |
+| `Rarff2d` | molff | **RARFF-2D** rod-free reactive pair FF: gated Morse `E=a(e²−2e·g_i·g_j)`, `Ring2d` entities, `step_md`/`step_gd`, `fd_check`, `field_at`, `arena`, `eatom` consistency map. 2D CPU prototype for invAFM repair. See `/doc/topical_audit/rarff2d.md`. |
 | `Buckets` | spacc | Spatial hashing (count→prefix→scatter); replaces `molff::uff::Buckets` long-term |
 | `AtomInstance`, `CameraData` | molrender | GPU vertex/uniform layouts (match WGSL structs) |
 | `ImpostorRenderer`, `LineRenderer`, `SurfaceRenderer` | molrender | wgpu render pipelines |

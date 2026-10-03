@@ -18,6 +18,7 @@ Source modules of the `molff` crate. See [`../README.md`](../README.md) for the 
 - **`nonbonded.rs`** — `NonBondedFF`: LJ 12-6 + Coulomb + H-bond with 1-2/1-3 exclusion, PBC, force clamping. `BroadPhase` struct + `eval_broad` for AABB-culled eval
 - **`rigid_sp3.rs`** — `RigidSp3FF`: **legacy** single-variant rigid body (Dynamic+ForceMD only). Superseded by `raff.rs`
 - **`multigrid.rs`** — Multigrid V-cycle solver for linearized molecular elasticity. `LinearOp` trait, `TrussOp` (bond-only), `UffHessianOp` (full UFF Hessian), `GalerkinLevel`, `ModalQuadratic`. See [`/doc/topical_audit/multigrid.md`](/doc/topical_audit/multigrid.md)
+- **`rarff2d.rs`** — **RARFF-2D**: rod-free orientation-gated reactive pair potential (2D CPU prototype for invAFM geometry repair). Gated Morse `E = a(e² − 2e·g_i·g_j)` with V4 sine-Lorentzian gate and `pex` polynomial-exp; `Ring2d` hexagon/pentagon entities (site bump + repulsive core); `step_md`/`step_gd` (trust-region GD); `arena` confinement; per-atom `eatom` consistency map; `fd_check`; `field_at` probe field for E-map. See [`/doc/topical_audit/rarff2d.md`](/doc/topical_audit/rarff2d.md)
 
 ## See also
 

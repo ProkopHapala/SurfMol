@@ -19,6 +19,7 @@ Integration tests for the `molff` crate. Run with `cargo test -p molff`.
 - **`test_multigrid_molecules.rs`** (~165 LOC) — 4 molecule benchmarks: pentacene/hexadecane/DiTriptyceno with bond-only `TrussOp`, pentacene with full UFF `UffHessianOp`. All passing
 - **`test_benzene_diag.rs`** (178 LOC) — regression test: per-atom ARAP port geometry gives E_port=0 and stable benzene. Documents the bug where idealized sp2 ports caused geometrically inconsistent port-to-neighbor assignment
 - **`test_rigid_sp3.rs`** (110 LOC) — tetrahedral sp3 center (CH4-like) + water test for the legacy `RigidSp3FF`
+- **`test_rarff2d.rs`** (~160 LOC) — 8 tests for RARFF-2D rod-free reactive pair FF: pair equilibrium, FD parity (forces+torques), anti-node/off-axis repulsion, bend3 → ~120°, hexagon relax, ring+pair hexagon, ring pulls atoms to sites. All passing
 
 ## Running
 
