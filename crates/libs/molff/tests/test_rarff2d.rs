@@ -1,7 +1,7 @@
 //! RARFF-2D tests: FD parity, pair equilibrium, anti-node repulsion, relaxation.
 //! Diagnostic tests — print actual numbers, assert on physical invariants.
 
-use molff::rarff2d::{Rarff2d, Ring2d, TYPE_SP2, TYPE_SP3};
+use molff::rarff2d::{Bond2d, Rarff2d, Ring2d, TYPE_SP2, TYPE_SP3};
 use numtypes::Vec2d;
 use std::f64::consts::PI;
 
@@ -26,6 +26,9 @@ fn test_fd_parity() {
     ff.set_rings(vec![
         Ring2d { pos: Vec2d::new(0.7, 0.9), zc: Vec2d::new((0.3f64).cos(), (0.3f64).sin()), nfold: 6, radius: 1.3, a: 2.0, h: 0.5, a_core: 1.0, r0_core: 0.9, b_core: 3.0 },
         Ring2d { pos: Vec2d::new(2.3, 0.6), zc: Vec2d::new(1.0, 0.0), nfold: 5, radius: 1.1, a: 2.0, h: 0.5, a_core: 1.0, r0_core: 0.8, b_core: 3.0 }]);
+    ff.set_bonds(vec![
+        Bond2d::from_ends(Vec2d::new(0.4, 0.2), Vec2d::new(1.6, 0.9), 1.0, 0.9, 0.3),  // near atoms 0,1 — nonzero on all DOFs
+        Bond2d { pos: Vec2d::new(-1.8, 1.6), zc: Vec2d::new((0.9f64).cos(), (0.9f64).sin()), half: 0.7, half0: 0.7, a: 1.0, b: 0.9, w: 0.3 }]);
     let (f_err, t_err) = ff.fd_check(1e-5);
     println!("FD parity: max|F_err|={f_err:.3e} max|T_err|={t_err:.3e}");
     assert!(f_err < 1e-5, "force FD err {f_err}");
@@ -159,6 +162,12 @@ fn test_ring_plus_pairs_hexagon() {
     assert!(conv, "ring+pairs relax did not converge");
     assert!(e < -12.0, "combined energy too high: {e}");
 }
+
+// NOTE: bond-entity behavior tests live in Python (invPPAFM
+// export_invAFM/scripts/test_rarff2d_bond.py) — they drive the FFI, which is
+// the interface invAFM actually calls. Kept here: fd_parity (engine-internal
+// FD-vs-analytic check, covers bond/ring DOFs via the scene below) plus the
+// pre-existing atom/ring/grid tests.
 
 #[test]
 fn test_grid_parity() {

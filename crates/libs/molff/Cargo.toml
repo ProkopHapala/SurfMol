@@ -4,12 +4,17 @@ version = "0.1.0"
 edition = "2021"
 description = "Intra-molecular forcefields: UFF, RigidSp3, NonBonded"
 
+# cdylib → libmolff.so: ctypes FFI surface (ffi_rarff2d, ffi_uff) for invPPAFM.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 numtypes = { workspace = true }
 numcore = { workspace = true }
 moltopo = { workspace = true }
 spacc = { workspace = true }
 ndarray = { workspace = true }
+bytemuck = { workspace = true }
 
 [dev-dependencies]
 surfmol = { workspace = true }
