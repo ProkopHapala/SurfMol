@@ -588,7 +588,7 @@ impl Rarff2d {
         const K_BB: f64 = 0.8660254037844386;               // sin(60°) -> 120° contact
         let (bi, bj) = (self.bonds[i], self.bonds[j]);
         let a = bi.a * bj.a;
-        let rbb = K_BB * (bi.half + bj.half);
+        let rbb = K_BB * (bi.half0 + bj.half0);                 // wall radius from REST lengths: no half-coupling -> bond_fh stays exact; wall fans rods apart without fighting the half-length DOF
         let d = bi.pos - bj.pos;
         let r2 = d.norm2();
         if r2 > rbb * rbb || r2 < 1e-12 { return 0.0; }
@@ -597,8 +597,8 @@ impl Rarff2d {
         let dedr = 2.0 * a * (r - rbb);                      // dE/dr (<0 inside wall)
         self.bond_f[i].x -= dedr * hij.x; self.bond_f[i].y -= dedr * hij.y;   // F_i = -∇E
         self.bond_f[j].x += dedr * hij.x; self.bond_f[j].y += dedr * hij.y;
-        // no bond_fh coupling: overlap stress must fan the rods apart, not
-        // shrink their half-lengths (bond length is a predicted DOF to keep)
+        // no bond_fh coupling: rbb uses half0 -> overlap stress fans the rods
+        // apart, never fights the half-length DOF (see rbb line above)
         a * (r - rbb) * (r - rbb)
     }
 

@@ -166,6 +166,20 @@ pub extern "C" fn rarff2d_add_ring(h: *mut Rarff2d, x: f64, y: f64, nfold: i32, 
     idx
 }
 
+/// Parameterized ring: explicit site well depth `a`, radial bump half-width
+/// `h`, and core repulsion `a_core` — for soft-coupling / hypothesis tests
+/// (penta-vs-hexa selection, gentle ring guides). r0_core/b_core follow the
+/// default scheme (r0_core = r-0.6, b_core = 2.5).
+#[no_mangle]
+pub extern "C" fn rarff2d_add_ring_p(h: *mut Rarff2d, x: f64, y: f64, nfold: i32, r: f64, a: f64, hwidth: f64, a_core: f64) -> i32 {
+    let ff = unsafe { hf(h) };
+    let mut rings = ff.rings.clone();
+    rings.push(Ring2d { pos: Vec2d::new(x, y), zc: Vec2d::new(1.0, 0.0), nfold: nfold as u32, radius: r, a, h: hwidth, a_core, r0_core: r - 0.6, b_core: 2.5 });
+    let idx = rings.len() as i32 - 1;
+    ff.set_rings(rings);
+    idx
+}
+
 /// Append a bond entity from an endpoint pair (img2mol codec convention:
     /// endpoints e1,e2; internally midpoint/axis/half). a,b,w = Morse depth,
 /// steepness, axis-gate width of the atom–bond potential. Returns bond index.

@@ -59,6 +59,7 @@ Pair energy (per atom pair i,j, distance r, unit bond direction h):
 4. **Weak long-range tail** — recapture atoms ejected outside the b=1.8 Morse tail (basin problem). Options: LJ-like tail, ring-site pull, or gentle attraction ramp.
 5. `field_at` currently uses probe gate ≡ 1 (optimally-oriented probe); add option for actual dragged-atom orientation.
 6. Later: batch relaxation API for invPPAFM refiner loop; pentagon sites already supported via `nfold`; 3D port-template version and OpenCL batching only after 2D is tuned.
+7. **Ring nfold selection caveat (measured by invPPAFM 2026-10-08):** total E cannot pick ring topology — `eval_oriented` freezes ring zc, so a misaligned candidate ring scores the same mean angular gate for every nfold; coincident wrong-nfold sites can even bind atoms *deeper* than correct sites. Wrong nfold deforms more (drift 0.38 Å) than wrong radius (0.24 Å); softening `a` does not help. Working selector = angular coherence `|mean_k e^{i·n·φ_k}|` + Kasa circle fit on member atoms (invPPAFM `testplot_pic_v3_ffcheck.py`). FFI gap: `add_ring`/`add_ring_p` seed `zc=(1,0)` — a phase arg would seed `φc* = arg(Σe^{inφ_k})/n`.
 
 ## See also
 
