@@ -439,10 +439,13 @@ impl App {
             for i in 0..self.topo.natoms {
                 let np = self.topo.nport[i] as usize;
                 for s in 0..np {
-                    let p = pv(self.state.pos[i]);
-                    let h = self.rx.h_world[i * 4 + s] * 0.5 + self.state.pos[i];
-                    let q = pv(h);
-                    lines.push(lv(p[0], p[1], p[2], [0.2, 1.0, 0.4, 0.9])); lines.push(lv(q[0], q[1], q[2], [0.2, 1.0, 0.4, 0.9]));
+                    // tick from just under the sphere surface to 0.9 Å out —
+                    // the old 0.5-from-center stub (0.15 past the 0.35 sphere)
+                    // was ~invisible, and bonded H's port hid inside the partner
+                    let h = self.rx.h_world[i * 4 + s];
+                    let p = pv(self.state.pos[i] + h * 0.30);
+                    let q = pv(self.state.pos[i] + h * 0.90);
+                    lines.push(lv(p[0], p[1], p[2], [0.2, 1.0, 0.4, 0.95])); lines.push(lv(q[0], q[1], q[2], [0.2, 1.0, 0.4, 0.95]));
                 }
                 if self.pinned[i] {   // pinned marker: dark cross
                     let p = pv(self.state.pos[i]);
@@ -453,7 +456,7 @@ impl App {
         }
         if self.show_grid {
             if let Some(g) = self.rx.grid.as_ref() {   // PIC viz: cell wireframes + domain box
-                for c in 0..g.buckets.ncells { cell_box(&mut lines, g, c, [0.35, 0.35, 0.45, 0.18]); }   // all cells faint
+                for c in 0..g.buckets.ncells { cell_box(&mut lines, g, c, [0.35, 0.35, 0.45, 0.035]); }  // all cells barely-there (context only)
                 for &c in g.cell_of.iter().collect::<std::collections::HashSet<_>>() {   // occupied cells stronger blue
                     cell_box(&mut lines, g, c as usize, [0.2, 0.5, 0.9, 0.8]);
                 }
