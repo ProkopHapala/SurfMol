@@ -4,3 +4,4 @@
 
 pub mod aabb;
 pub mod buckets;
+pub mod uniform_grid;

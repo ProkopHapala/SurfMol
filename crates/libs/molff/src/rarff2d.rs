@@ -327,12 +327,18 @@ pub struct Rarff2d {
 /// Max pair support over the unique (r_cov, b) type pairs: r0 + 2^m/(b_i+b_j).
 /// This IS the interaction cutoff — the potential is identically 0 beyond it.
 fn pair_support_max(types: &[Rarff2dType], m: u32) -> f64 {
-    let nsup = (1u64 << m) as f64;
     let mut ubt: Vec<(f64, f64)> = Vec::new();              // unique (r_cov, b)
     for t in types { let k = (t.r_cov, t.b); if !ubt.contains(&k) { ubt.push(k); } }
+    support_max(&ubt, m)
+}
+
+/// Same computation over (r_cov, b) pairs directly — shared with raff_reactive
+/// (ReactParams carries the same r_cov/b fields without nfold/w).
+pub(crate) fn support_max(rb: &[(f64, f64)], m: u32) -> f64 {
+    let nsup = (1u64 << m) as f64;
     let mut rcut: f64 = 0.0;
-    for &(ri, bi) in &ubt { for &(rj, bj) in &ubt { rcut = rcut.max(ri + rj + nsup / (bi + bj)); } }
-    assert!(rcut > 0.0, "pair_support_max: no types / degenerate b");
+    for &(ri, bi) in rb { for &(rj, bj) in rb { rcut = rcut.max(ri + rj + nsup / (bi + bj)); } }
+    assert!(rcut > 0.0, "support_max: no types / degenerate b");
     rcut
 }
 

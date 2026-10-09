@@ -179,7 +179,7 @@ pub struct RaffTopology {
 
 #[inline(always)] pub fn quat_conj(q: Quat4d) -> Quat4d { Quat4d::new(-q.x, -q.y, -q.z, q.w) }
 
-#[inline(always)] fn quat_rotate(q: Quat4d, v: Vec3d) -> Vec3d {
+#[inline(always)] pub(crate) fn quat_rotate(q: Quat4d, v: Vec3d) -> Vec3d {
     let qv = Quat4d::new(v.x, v.y, v.z, 0.0);
     let r = quat_mul(quat_mul(q, qv), quat_conj(q));
     Vec3d::new(r.x, r.y, r.z)
@@ -329,9 +329,18 @@ impl RaffTopology {
         self.port_local[o+1] = Vec3d::new(-1.0, 0.0, 0.0);
     }
 
-    /// Set point atom (no ports, e.g. terminal H).
+    /// Set point atom (no ports — true point = probe/particle).
     pub fn set_point(&mut self, i: usize) {
         self.nport[i] = 0;
+    }
+
+    /// Set 1-port atom (single directed port — e.g. reactive H). `dir` is the
+    /// body-frame port direction, stored normalized; fails loud on degenerate.
+    pub fn set_1port(&mut self, i: usize, dir: Vec3d) {
+        let n = dir.norm();
+        assert!(n > 1e-12, "set_1port: degenerate port dir {dir:?} for atom {i}");
+        self.nport[i] = 1;
+        self.port_local[i * 4] = dir * (1.0 / n);
     }
 
     /// Set port geometry for all atoms from UFF type strings.
@@ -437,7 +446,7 @@ impl RaffTopology {
         for i in 0..self.natoms {
             match self.nport[i] {
                 0 => self.set_point(i),
-                1 => { self.port_local[i*4] = Vec3d::new(1.0,0.0,0.0); }
+                1 => self.set_1port(i, Vec3d::new(1.0,0.0,0.0)),
                 2 => self.set_sp1(i),
                 3 => self.set_sp2(i),
                 _ => self.set_sp3(i),
@@ -918,6 +927,19 @@ pub fn step_force_md(
     let e_nb = eval_nonbonded(state, topo, nbcfg, fapos);
     let e_box = eval_box_forces(state, &cfg.box_cfg, fapos);
     let e = e_port + e_nb + e_box;
+    let (max_f, max_t) = integrate_md(state, topo, cfg, fapos, tau);
+    (e, max_f, max_t)
+}
+
+/// Per-atom symplectic-Euler integration (factored out of `step_force_md` so other
+/// evaluators — e.g. `raff_reactive::eval_reactive` — can reuse the same integrator):
+/// v = cdamp·v + F·dt/m (flim-clamped); x += v·dt.
+/// Rotation (nport>0 && inv_inertia>0): ω = rot_damp·ω + I⁻¹·τ·dt; q = normalize(dq(ω·dt) ⊗ q).
+/// Returns (max|F|, max|τ|).
+pub fn integrate_md(
+    state: &mut RaffState, topo: &RaffTopology, cfg: &RaffConfig,
+    fapos: &[Vec3d], tau: &[Vec3d],
+) -> (f64, f64) {
     let mut max_f: f64 = 0.0;
     let mut max_t: f64 = 0.0;
     for i in 0..topo.natoms {
@@ -946,7 +968,7 @@ pub fn step_force_md(
             state.quat[i] = quat_normalize(quat_mul(dq, state.quat[i]));
         }
     }
-    (e, max_f, max_t)
+    (max_f, max_t)
 }
 
 /// One inertial relaxation step with velocity reset (simple FIRE variant).
@@ -1604,13 +1626,23 @@ pub fn step_proximal(
 /// Finite-difference check: compare analytic force to (E(x+ε) - E(x-ε)) / (2ε).
 /// Returns max relative error over all atoms and directions.
 /// Tests §1 corrected force convention: F = k_p · e.
+/// `eval` is the energy/force evaluator under test; it must ZERO and fill fapos/tau
+/// (same contract as `eval_port_forces`) and return total energy.
 pub fn fd_check_forces(
     state: &RaffState, topo: &RaffTopology, eps: f64,
+) -> (f64, Vec<(usize, Vec3d, Vec3d)>) {
+    fd_check_forces_with(state, topo, eps, &|s, f, t| eval_port_forces(s, topo, f, t))
+}
+
+/// `fd_check_forces` generalized to an arbitrary evaluator closure (e.g. reactive pair term).
+pub fn fd_check_forces_with(
+    state: &RaffState, topo: &RaffTopology, eps: f64,
+    eval: &dyn Fn(&RaffState, &mut [Vec3d], &mut [Vec3d]) -> f64,
 ) -> (f64, Vec<(usize, Vec3d, Vec3d)>) {
     let np = topo.natoms;
     let mut fapos = vec![VEC3D_ZERO; np];
     let mut tau = vec![VEC3D_ZERO; np];
-    let e0 = eval_port_forces(state, topo, &mut fapos, &mut tau);
+    let e0 = eval(state, &mut fapos, &mut tau);
 
     let mut max_err: f64 = 0.0;
     let mut details: Vec<(usize, Vec3d, Vec3d)> = Vec::new();
@@ -1631,8 +1663,8 @@ pub fn fd_check_forces(
             let mut tp = vec![VEC3D_ZERO; np];
             let mut fm = vec![VEC3D_ZERO; np];
             let mut tm = vec![VEC3D_ZERO; np];
-            let e_plus = eval_port_forces(&st_plus, topo, &mut fp, &mut tp);
-            let e_minus = eval_port_forces(&st_minus, topo, &mut fm, &mut tm);
+            let e_plus = eval(&st_plus, &mut fp, &mut tp);
+            let e_minus = eval(&st_minus, &mut fm, &mut tm);
             let fd_force = -(e_plus - e_minus) / (2.0 * eps);  // F = -dE/dx
             let analytic = match d { 0 => fapos[i].x, 1 => fapos[i].y, _ => fapos[i].z };
             let rel_err = if analytic.abs() > 1e-10 { (fd_force - analytic).abs() / analytic.abs() }
@@ -1653,10 +1685,18 @@ pub fn fd_check_forces(
 pub fn fd_check_torques(
     state: &RaffState, topo: &RaffTopology, eps: f64,
 ) -> f64 {
+    fd_check_torques_with(state, topo, eps, &|s, f, t| eval_port_forces(s, topo, f, t))
+}
+
+/// `fd_check_torques` generalized to an arbitrary evaluator closure (same contract as above).
+pub fn fd_check_torques_with(
+    state: &RaffState, topo: &RaffTopology, eps: f64,
+    eval: &dyn Fn(&RaffState, &mut [Vec3d], &mut [Vec3d]) -> f64,
+) -> f64 {
     let np = topo.natoms;
     let mut fapos = vec![VEC3D_ZERO; np];
     let mut tau = vec![VEC3D_ZERO; np];
-    eval_port_forces(state, topo, &mut fapos, &mut tau);
+    eval(state, &mut fapos, &mut tau);
 
     let mut max_err: f64 = 0.0;
     for i in 0..np {
@@ -1675,8 +1715,8 @@ pub fn fd_check_torques(
             let mut tp = vec![VEC3D_ZERO; np];
             let mut fm = vec![VEC3D_ZERO; np];
             let mut tm = vec![VEC3D_ZERO; np];
-            let e_plus = eval_port_forces(&st_plus, topo, &mut fp, &mut tp);
-            let e_minus = eval_port_forces(&st_minus, topo, &mut fm, &mut tm);
+            let e_plus = eval(&st_plus, &mut fp, &mut tp);
+            let e_minus = eval(&st_minus, &mut fm, &mut tm);
             // dE/dθ = -τ (torque drives rotation, energy decreases). FD: -dE/dθ = +τ.
             let fd_dedtheta = -(e_plus - e_minus) / (2.0 * eps);
             let analytic = match axis { 0 => tau[i].x, 1 => tau[i].y, _ => tau[i].z };
@@ -1693,10 +1733,18 @@ pub fn fd_check_torques(
 pub fn check_translation_invariance(
     state: &RaffState, topo: &RaffTopology,
 ) -> f64 {
+    check_translation_invariance_with(state, topo, &|s, f, t| eval_port_forces(s, topo, f, t))
+}
+
+/// `check_translation_invariance` generalized to an arbitrary evaluator closure.
+pub fn check_translation_invariance_with(
+    state: &RaffState, topo: &RaffTopology,
+    eval: &dyn Fn(&RaffState, &mut [Vec3d], &mut [Vec3d]) -> f64,
+) -> f64 {
     let np = topo.natoms;
     let mut fapos = vec![VEC3D_ZERO; np];
     let mut tau = vec![VEC3D_ZERO; np];
-    eval_port_forces(state, topo, &mut fapos, &mut tau);
+    eval(state, &mut fapos, &mut tau);
     let mut sum = VEC3D_ZERO;
     for f in &fapos { sum.add(*f); }
     sum.norm()
@@ -1706,10 +1754,18 @@ pub fn check_translation_invariance(
 pub fn check_rotation_invariance(
     state: &RaffState, topo: &RaffTopology,
 ) -> f64 {
+    check_rotation_invariance_with(state, topo, &|s, f, t| eval_port_forces(s, topo, f, t))
+}
+
+/// `check_rotation_invariance` generalized to an arbitrary evaluator closure.
+pub fn check_rotation_invariance_with(
+    state: &RaffState, topo: &RaffTopology,
+    eval: &dyn Fn(&RaffState, &mut [Vec3d], &mut [Vec3d]) -> f64,
+) -> f64 {
     let np = topo.natoms;
     let mut fapos = vec![VEC3D_ZERO; np];
     let mut tau = vec![VEC3D_ZERO; np];
-    eval_port_forces(state, topo, &mut fapos, &mut tau);
+    eval(state, &mut fapos, &mut tau);
     let mut sum = VEC3D_ZERO;
     for i in 0..np {
         sum.add(Vec3d::cross(state.pos[i], fapos[i]));

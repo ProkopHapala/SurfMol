@@ -14,10 +14,10 @@ Rebuildable spatial acceleration structures with no molecular semantics. Operate
 
 - **`aabb.rs`** — `fit_aabb(pos, ids)` fits an `Aabb3d` to selected positions. `fit_group_aabbs(pos, groups, out)` fits AABBs for multiple `RaggedIndex` groups. `fit_range_aabbs(pos, ranges, out)` fits AABBs for contiguous `[i0, i1)` ranges — the cache-optimal path for packed fragments. **`broad_phase_pairs(cluster_aabbs, margin)`** — O(N²) over clusters, returns sorted overlapping `(i,j)` pairs using margin-expanded AABB overlap (mirrors FireCore `NBFF::evalSortRange_BBs`). **`aabb_edges(bb)`** — 12 edge segments as `[f32;3]` pairs for line rendering of bounding boxes. All use `numtypes::aabb_*` intrinsic functions.
 - **`buckets.rs`** — `Buckets`: spatial hashing via count→prefix→scatter (FireCore/SSE `Buckets.h` pattern). One-shot `build(cell_of_obj)`; `cell_objects(c)` returns packed item list per cell. Items with `cell = -1` are skipped. A single `counts` buffer doubles as the per-cell cursor, so no extra allocation happens during rebuild.
+- **`uniform_grid.rs`** — `Grid3`: uniform 3D cell grid over `Buckets`. `cell_at(p)` clamps positions into the domain (every object is always gridded), `rebuild(pos)`, `unravel(c)`, and **`forward_cells(c, s, out)`** — the FireCore `Buckets3D::getForwardNeighbors` forward half-stencil (≤13 cells for s=1); enumerates every unordered cell pair with Chebyshev distance ≤ s exactly once (unit-tested on 3×3×3, 4×3×2, and s=2 grids).
 
 ## Not yet implemented (P1/P2)
 
-- **`uniform_grid.rs`** — uniform spatial grid with `build_uniform_grid(pos, cell_size)`
 - **`morton.rs`** — Morton codes (Z-order curve) for locality-preserving indexing
 
 ## Planned API
@@ -29,7 +29,7 @@ fit_range_aabbs(pos, &[[Index;2]], out)
 broad_phase_pairs(cluster_aabbs, margin) -> Vec<(u32, u32)>
 aabb_edges(bb) -> [[f32; 3]; 24]
 Buckets::build(cell_of_item)
-build_uniform_grid(pos, cell_size) -> UniformGrid
+Grid3::{new, cell_at, rebuild, unravel, forward_cells}
 ```
 
 ## Design principles

@@ -20,6 +20,7 @@ Integration tests for the `molff` crate. Run with `cargo test -p molff`.
 - **`test_benzene_diag.rs`** (178 LOC) — regression test: per-atom ARAP port geometry gives E_port=0 and stable benzene. Documents the bug where idealized sp2 ports caused geometrically inconsistent port-to-neighbor assignment
 - **`test_rigid_sp3.rs`** (110 LOC) — tetrahedral sp3 center (CH4-like) + water test for the legacy `RigidSp3FF`
 - **`test_rarff2d.rs`** (~160 LOC) — 8 tests for RARFF-2D rod-free reactive pair FF: pair equilibrium, FD parity (forces+torques), anti-node/off-axis repulsion, bend3 → ~120°, hexagon relax, ring+pair hexagon, ring pulls atoms to sites. All passing
+- **`test_raff_reactive.rs`** (~245 LOC) — 5 tests for `raff_reactive` (3D reactive RAFF): FD parity forces+torques (~1e-9 rel), facing-sp3 E(r) well (E=−a at r0=1.54, anti-facing repels, restoring-torque sign), `Grid3` vs O(N²) parity (~1e-13 on clamped domain), translation/rotation invariance (~1e-13), methane self-assembly (writes `debug/raff_reactive/` traj + E tsv)
 
 ## Running
 
